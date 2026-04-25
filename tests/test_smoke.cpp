@@ -3,6 +3,7 @@
 #include <cstdlib>
 #include <iostream>
 #include <string>
+#include <vector>
 
 #include <polycpp/event_loop.hpp>
 #include <polycpp/mysql2/mysql2.hpp>
@@ -54,7 +55,7 @@ TEST(connection_options, charset_name_sets_charset_number) {
 
 TEST(connection_options, parse_connection_uri) {
     const auto options = mysql2::parse_connection_uri(
-        "mysql://ada:p%40ss@db.example.test:3307/app?compress=true&ssl=true&multipleStatements=true&charset=latin1&maxPreparedStatements=7");
+        "mysql://ada:p%40ss@db.example.test:3307/app?compress=true&ssl=true&sslProfile=Amazon%20RDS&multipleStatements=true&charset=latin1&maxPreparedStatements=7");
     EXPECT_EQ(options.host, "db.example.test");
     EXPECT_EQ(options.port, 3307);
     EXPECT_EQ(options.user, "ada");
@@ -62,9 +63,72 @@ TEST(connection_options, parse_connection_uri) {
     EXPECT_EQ(options.database, "app");
     EXPECT_TRUE(options.compress);
     EXPECT_TRUE(options.ssl.enabled);
+    EXPECT_EQ(options.ssl.profile, "Amazon RDS");
     EXPECT_TRUE(options.multiple_statements);
     EXPECT_EQ(options.charset_number, 8);
     EXPECT_EQ(options.max_prepared_statements, 7u);
+}
+
+TEST(connection_options, ssl_profiles_and_parser_cache_controls) {
+    const auto names = mysql2::ssl_profile_names();
+    ASSERT_FALSE(names.empty());
+    EXPECT_EQ(names[0], "Amazon RDS");
+    const auto ca_pems = mysql2::ssl_profile_ca_pems("Amazon RDS");
+    ASSERT_GT(ca_pems.size(), 1u);
+    EXPECT_NE(ca_pems.front().find("-----BEGIN CERTIFICATE-----"), std::string::npos);
+    EXPECT_THROW(mysql2::ssl_profile_ca_pems("unknown"), mysql2::Error);
+
+    mysql2::set_max_parser_cache(32);
+    EXPECT_EQ(mysql2::max_parser_cache(), 32u);
+    mysql2::clear_parser_cache();
+    EXPECT_EQ(mysql2::max_parser_cache(), 32u);
+}
+
+TEST(binlog, parse_query_event_packet) {
+    std::vector<uint8_t> payload;
+    auto append_u8 = [&](uint8_t value) { payload.push_back(value); };
+    auto append_u16 = [&](uint16_t value) {
+        payload.push_back(static_cast<uint8_t>(value & 0xff));
+        payload.push_back(static_cast<uint8_t>((value >> 8) & 0xff));
+    };
+    auto append_u32 = [&](uint32_t value) {
+        payload.push_back(static_cast<uint8_t>(value & 0xff));
+        payload.push_back(static_cast<uint8_t>((value >> 8) & 0xff));
+        payload.push_back(static_cast<uint8_t>((value >> 16) & 0xff));
+        payload.push_back(static_cast<uint8_t>((value >> 24) & 0xff));
+    };
+    auto append_string = [&](const std::string& value) {
+        payload.insert(payload.end(), value.begin(), value.end());
+    };
+
+    const std::string schema = "test";
+    const std::string query = "CREATE TABLE t(id INT)";
+    const uint32_t body_size = 4 + 4 + 1 + 2 + 2 + static_cast<uint32_t>(schema.size()) + 1 +
+        static_cast<uint32_t>(query.size());
+
+    append_u8(0x00);
+    append_u32(1);
+    append_u8(2);
+    append_u32(99);
+    append_u32(19 + body_size);
+    append_u32(1234);
+    append_u16(0);
+    append_u32(42);
+    append_u32(0);
+    append_u8(static_cast<uint8_t>(schema.size()));
+    append_u16(0);
+    append_u16(0);
+    append_string(schema);
+    append_u8(0);
+    append_string(query);
+
+    const auto event = mysql2::parse_binlog_event_packet(mysql2::Buffer::from(payload.data(), payload.size()));
+    EXPECT_EQ(event.name, "QueryEvent");
+    EXPECT_EQ(event.header.event_type, 2);
+    EXPECT_EQ(event.header.server_id, 99u);
+    EXPECT_EQ(event.header.log_position, 1234u);
+    EXPECT_EQ(event.schema, schema);
+    EXPECT_EQ(event.query, query);
 }
 
 TEST(sql_escape, identifiers_and_format) {
@@ -100,6 +164,16 @@ TEST(rows, json_helpers_and_event_emitter_surface) {
     });
     connection.emit(mysql2::event::Error_, mysql2::Error("synthetic"));
     EXPECT_TRUE(saw_error);
+
+    bool saw_trace = false;
+    connection.on(mysql2::event::Trace, [&](const mysql2::TraceEvent& event) {
+        saw_trace = event.operation == "query" && event.phase == "start";
+    });
+    mysql2::TraceEvent event;
+    event.operation = "query";
+    event.phase = "start";
+    connection.emit(mysql2::event::Trace, event);
+    EXPECT_TRUE(saw_trace);
 }
 
 TEST(mysql2_integration, query_against_real_database_when_configured) {
@@ -129,13 +203,24 @@ TEST(mysql2_integration, query_against_real_database_when_configured) {
 
     mysql2::Connection connection(options);
     bool connect_event_seen = false;
+    bool connect_trace_seen = false;
+    bool query_trace_seen = false;
     connection.on(mysql2::event::Connect, [&](const mysql2::ConnectionInfo& info) {
         connect_event_seen = info.connection_id > 0 && !info.server_version.empty();
+    });
+    connection.on(mysql2::event::Trace, [&](const mysql2::TraceEvent& event) {
+        if (event.operation == "connect" && event.phase == "success" && event.server_address == options.host) {
+            connect_trace_seen = true;
+        }
+        if (event.operation == "query" && event.phase == "success" && event.sql.find("SELECT 1 AS one") != std::string::npos) {
+            query_trace_seen = true;
+        }
     });
     trace_step("connect");
     connection.connect();
     EXPECT_TRUE(connection.connected());
     EXPECT_TRUE(connect_event_seen);
+    EXPECT_TRUE(connect_trace_seen);
     EXPECT_EQ(connection.encrypted(), options.ssl.enabled);
     EXPECT_GT(connection.connection_id(), 0u);
     EXPECT_FALSE(connection.server_version().empty());
@@ -152,6 +237,7 @@ TEST(mysql2_integration, query_against_real_database_when_configured) {
     EXPECT_EQ(std::get<int64_t>(result.rows[0].at("one")), 1);
     EXPECT_EQ(std::get<std::string>(result.rows[0].at("two")), "two");
     EXPECT_TRUE(std::holds_alternative<std::monostate>(result.rows[0].at("none")));
+    EXPECT_TRUE(query_trace_seen);
 
     constexpr uint32_t client_query_attributes = 0x08000000;
     if ((connection.server_capability_flags() & client_query_attributes) != 0) {

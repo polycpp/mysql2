@@ -7,10 +7,13 @@
 - Prepared statements are explicit C++ objects. `execute(sql, values)` also uses a bounded connection-local statement cache for upstream compatibility.
 - Pools are synchronous RAII pools rather than async command queues.
 - Pool clusters are synchronous typed objects rather than JavaScript EventEmitter command queues, but they keep named pools, wildcard matching, RR/RANDOM/ORDER selection, retry/offline/remove policy, and typed events.
-- TLS is implemented through polycpp TLS primitives. Named SSL profiles from `aws-ssl-profiles` are not bundled.
+- TLS is implemented through polycpp TLS primitives. The upstream `"Amazon RDS"` SSL profile is bundled as CA PEM data generated from `aws-ssl-profiles@1.1.2`.
 - Single-result `query` and `execute` calls drain unexpected additional result sets and throw; callers that expect multiple result sets must use `query_all` or `execute_all`.
 - Native MySQL/MariaDB client SDKs are not linked, even if installed on the system.
 - JavaScript parser code generation is replaced with static C++ parsing.
+- Parser-cache controls are exposed as compatibility/audit hooks, but they do not clear generated parser code because no generated parser cache exists.
+- Node diagnostic channels are adapted to typed `event::Trace` events on `Connection` for connect/query/execute start, success, and error phases.
+- Replication commands are bounded synchronous operations. `COM_REGISTER_SLAVE` and `COM_BINLOG_DUMP` are available, with typed parsing for Query, Rotate, FormatDescription, and Xid events and raw-byte fallback for unknown binlog event types.
 - Node object-mode row streams are adapted to newline-delimited JSON byte streams via `polycpp::stream::Readable`, because current polycpp stream chunks are `Buffer`/text rather than arbitrary row objects.
 - LOCAL INFILE never opens a path by default. The caller must provide `ConnectionOptions::local_infile_handler`, which receives the server-requested path and returns explicit `polycpp::Buffer` chunks.
 - Query attributes use `QueryAttributes`, an `std::unordered_map<std::string, Value>`. Attribute ordering on the wire is intentionally not a C++ API guarantee.
@@ -20,11 +23,9 @@
 
 ## Deferred Features
 
-- Server mode, replication, and binlog commands are deferred.
-- Named TLS profile data from `aws-ssl-profiles` is deferred.
-- Diagnostic channel tracing is deferred.
+- Server mode is deferred because it requires a separate server-side connection object, handshake/auth dispatcher, and response-writing API rather than extending the client `Connection`.
+- GTID binlog dump, continuous replication stream abstraction, and full row/table-map event decoding are deferred.
 - Native object-mode row stream chunks are deferred until polycpp stream supports arbitrary typed payload chunks.
-- Parser code-generation/cache controls are omitted because they are JavaScript runtime optimization hooks.
 
 ## Security-Driven Behavior Changes
 
@@ -35,6 +36,6 @@
 
 ## Unsupported Runtime-Specific Features
 
-- Node.js process tick timing and diagnostic channel hooks are not modeled.
+- Node.js process tick timing is not modeled.
 - Node Buffer pooling behavior is not replicated; the port uses `polycpp::Buffer`.
-- Connection timeout option is recorded but not fully enforced until a polycpp deadline wrapper is available.
+- Per-command query/execute inactivity timeout objects are not modeled. The initial TCP `connect_timeout_ms` is enforced with `polycpp::io::Timer`.

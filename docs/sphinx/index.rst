@@ -15,17 +15,20 @@ Supported scope
 - Typed rows using ``std::variant`` values.
 - Transactions, ping, reset, change-user, graceful shutdown, synchronous RAII pools, and pool clusters.
 - Callback overloads, ``polycpp::Promise`` wrappers, typed events, connection URI parsing, compression, and LOCAL INFILE handler hooks.
+- Trace events, connect timeout enforcement, AWS RDS TLS profile CA data, and parser-cache compatibility hooks.
+- Bounded register-slave/binlog-dump commands with typed parsing for common binlog event records.
 - Query stream adaptation through newline-delimited JSON ``Buffer`` chunks.
 - SQL escaping, identifier escaping, positional formatting, and named formatting helpers.
 
 Not full upstream parity
 ------------------------
 
-The JavaScript server, binlog/replication, diagnostics, parser cache controls,
-and native object-mode row stream APIs are intentionally not part of the current
-C++ surface. Callback, Promise, EventEmitter, query attributes, cursor fetch,
-compression, LOCAL INFILE, URI, and pool-cluster surfaces are implemented with
-C++ adaptations. See
+The JavaScript server, GTID replication, continuous binlog object streams, full
+row-event decoding, and native object-mode row stream APIs are intentionally not
+part of the current C++ surface. Callback, Promise, EventEmitter, trace, query
+attributes, cursor fetch, compression, LOCAL INFILE, URI, parser-cache
+compatibility, and pool-cluster surfaces are implemented with C++ adaptations.
+See
 ``docs/divergences.md`` in the repository for the detailed list.
 
 .. code-block:: cpp

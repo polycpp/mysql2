@@ -30,27 +30,32 @@ Implemented:
 - MySQL charset/collation id mapping with non-core string conversion delegated to the existing `iconv-lite` companion.
 - SQL `escape`, `escape_id`, positional `format`, and named placeholder formatting helpers.
 - Connection URI parsing through `polycpp::url`.
+- Connect timeout enforcement through `polycpp::io::Timer`.
 - Connection attributes in the initial handshake and `COM_CHANGE_USER`.
-- Callback overloads, `polycpp::Promise` wrappers, typed `polycpp::events::EventEmitter` integration, and JSON line `polycpp::stream::Readable` query output.
+- Callback overloads, `polycpp::Promise` wrappers, typed `polycpp::events::EventEmitter` integration, trace events, and JSON line `polycpp::stream::Readable` query output.
 - MySQL compressed protocol using `polycpp::zlib`.
 - Explicit-policy LOCAL INFILE uploads through `ConnectionOptions::local_infile_handler`.
 - `COM_CHANGE_USER`, transaction helpers, ping, reset, graceful end, synchronous RAII pools, and pool clusters.
+- AWS RDS TLS profile CA data from `aws-ssl-profiles@1.1.2` via `SslOptions::profile = "Amazon RDS"`.
+- Parser-cache compatibility controls as no-op/static-parser audit hooks.
+- Bounded `COM_REGISTER_SLAVE` and `COM_BINLOG_DUMP` support with typed parsing for Query, Rotate, FormatDescription, and Xid events, plus raw payload retention for unknown event types.
 - Optional real MariaDB/MySQL e2e tests controlled by `MYSQL2_TEST_*` environment variables.
 
 Deferred:
 
-- Server mode and replication/binlog APIs.
-- Named TLS profile data from `aws-ssl-profiles`.
+- Server mode.
+- GTID binlog dump, continuous replication stream abstraction, and full row/table-map event decoding.
 - Native object-mode row streams. `query_stream_json()` intentionally exposes byte chunks containing newline-delimited JSON because polycpp streams currently emit `Buffer` chunks, not arbitrary row objects.
-- Diagnostic-channel tracing.
-- Parser code-generation/cache controls, which are JavaScript optimization hooks rather than required C++ API.
 
 Known divergences:
 
 - C++ API shape is synchronous and typed first; callback and Promise wrappers execute the same typed operations and settle through polycpp primitives.
 - Native MySQL/MariaDB client SDKs are intentionally not linked.
+- Node diagnostic channels are adapted to typed `event::Trace` events.
 - Node object-mode row streaming is adapted to JSON line byte streams for auditability and `polycpp::stream` compatibility.
+- Parser cache controls are compatibility no-ops because C++ uses static parsers.
 - Query attributes use `std::unordered_map`, so attribute wire order is not a public contract.
+- Bounded binlog dump closes the connection if `max_events` is reached before EOF, because the connection is otherwise left in the replication command stream.
 
 ## Prerequisites
 
@@ -140,6 +145,22 @@ while (cursor.open()) {
 conn.close_statement(cursor.statement);
 ```
 
+Bounded binlog dump:
+
+```cpp
+polycpp::mysql2::BinlogDumpOptions dump;
+dump.flags = polycpp::mysql2::constants::binlog_dump_flags::NON_BLOCK;
+dump.server_id = 12345;
+dump.max_events = 1000;
+
+auto events = conn.binlog_dump(dump);
+for (const auto& event : events) {
+    if (event.name == "QueryEvent") {
+        (void)event.query;
+    }
+}
+```
+
 TLS:
 
 ```cpp
@@ -151,6 +172,15 @@ options.ssl.enabled = true;
 options.ssl.ca_file = "/etc/ssl/certs/db-ca.pem";
 
 auto conn = polycpp::mysql2::create_connection(options);
+```
+
+AWS RDS TLS profile:
+
+```cpp
+polycpp::mysql2::ConnectionOptions options;
+options.host = "db.example.com";
+options.ssl.enabled = true;
+options.ssl.profile = "Amazon RDS";
 ```
 
 Pool:
@@ -167,7 +197,10 @@ auto result = pool.query("SELECT 1 AS one");
 Callback, Promise, event, and stream adapters:
 
 ```cpp
-conn.on(polycpp::mysql2::events::Connect, [] {});
+conn.on(polycpp::mysql2::event::Connect, [](const polycpp::mysql2::ConnectionInfo&) {});
+conn.on(polycpp::mysql2::event::Trace, [](const polycpp::mysql2::TraceEvent& event) {
+    (void)event;
+});
 
 conn.query("SELECT 1 AS one", [](std::exception_ptr err, polycpp::mysql2::QueryResult result) {
     if (err) return;

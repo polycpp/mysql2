@@ -32,7 +32,7 @@ python3 /data/work/libgen/scripts/analyze-upstream-js.py /data/work/lib/mysql2 /
 | Package | Kind | Requested | Installed | License | License evidence | License impact | License strategy | Affects repo license | Deps | Source files | Node API calls | JS API calls | Recommendation | Rationale |
 |---|---|---|---|---|---|---|---|---|---:|---:|---:|---:|---|---|
 | @types/node | peer | >= 8 | not installed | MIT | npm package metadata license field | dev/test-only | dev/test-only, not shipped | no-dev-only | 0 | 0 | 0 | 0 | omit from C++ port | Type-only package for upstream TypeScript declarations. |
-| aws-ssl-profiles | hard | ^1.1.2 | 1.1.2 | MIT | package.json license field | permissive | permissive dependency ok with notice | no | 0 | 8 | 0 | 0 | deferred or unsupported feature | Only needed for named TLS profile data. TLS itself is implemented through polycpp TLS options. |
+| aws-ssl-profiles | hard | ^1.1.2 | 1.1.2 | MIT | package.json license field | permissive | permissive dependency ok with notice | no | 0 | 8 | 0 | 0 | vendor generated data in this repo | Provides named AWS RDS TLS profile CA PEM data. The port generates `src/aws_rds_ca.inc` from the package artifact, consumes it through `src/aws_rds_ca.cpp`, and records the MIT notice. |
 | denque | hard | ^2.1.0 | 2.1.0 | Apache-2.0 | package.json license field | permissive | permissive dependency ok with notice | no | 0 | 2 | 0 | 13 | implement private helper in this repo | Upstream uses it for command queues; this synchronous port uses standard containers and an RAII pool. |
 | generate-function | hard | ^2.3.1 | 2.3.1 | MIT | package.json license field | permissive | permissive dependency ok with notice | no | 1 | 3 | 2 | 13 | deferred or unsupported feature | Upstream uses generated JS parsers for V8 speed. C++ uses static parsers. |
 | iconv-lite | hard | ^0.7.2 | 0.7.2 | MIT | package.json license field and existing companion license | permissive | use existing companion license | no | 1 | 16 | 38 | 55 | use existing polycpp companion | Existing `/data/work/lib/iconv-lite` companion is linked for charset decoding. |
@@ -50,7 +50,7 @@ python3 /data/work/libgen/scripts/analyze-upstream-js.py /data/work/lib/mysql2 /
 - `sql-escaper`: implement local SQL escaping utilities and test edge bytes.
 - `lru.min`: implement the required prepared-statement cache semantics locally with standard containers; create a separate companion only if multiple ports need a reusable LRU type.
 - `generate-function`: omit because C++ parser generation is not needed.
-- `aws-ssl-profiles`: defer named TLS profile support; direct TLS options are implemented.
+- `aws-ssl-profiles`: generate AWS RDS CA PEM data into `src/aws_rds_ca.inc` and isolate it in `src/aws_rds_ca.cpp`; direct TLS file/PEM options remain supported.
 - `@types/node`: omit as type-only upstream metadata.
 
 ## License impact summary
@@ -105,7 +105,7 @@ python3 /data/work/libgen/scripts/analyze-upstream-js.py /data/work/lib/mysql2 /
 - EventEmitter APIs: implemented through typed `polycpp::events::EventEmitter` forwarding on connections, pools, and pool clusters.
 - streams: adapted to `polycpp::stream::Readable` newline-delimited JSON `Buffer` chunks.
 - Buffer and binary data: mapped to `polycpp::Buffer` for packets, binary SQL values, result columns, and LOCAL INFILE chunks.
-- URL/timer/process/filesystem APIs: URI parsing uses `polycpp::url`; wait timeouts use C++ chrono; process APIs are not public; filesystem access is limited to explicit TLS file options and caller-provided LOCAL INFILE buffers.
+- URL/timer/process/filesystem APIs: URI parsing uses `polycpp::url`; connect timeout uses `polycpp::io::Timer`; pool wait timeouts use C++ chrono; process APIs are not public; filesystem access is limited to explicit TLS file options and caller-provided LOCAL INFILE buffers.
 - crypto/compression/TLS/network/HTTP APIs: crypto uses `polycpp::crypto`; compression uses `polycpp::zlib`; TCP/TLS uses `polycpp::io` and `polycpp::ssl`; HTTP APIs are not relevant to this protocol driver.
 
 ### JavaScript API usage
@@ -128,9 +128,10 @@ python3 /data/work/libgen/scripts/analyze-upstream-js.py /data/work/lib/mysql2 /
 - Fail closed on unsupported auth plugins, LOCAL INFILE without an explicit handler, TLS-only cleartext auth, malformed packets, unexpected multi-results in single-result APIs, and server ERR packets.
 - Record deferred features explicitly rather than implying upstream parity.
 - Reuse `iconv-lite` companion for charset decoding and keep upstream mysql2 charset/collation id mappings in this repo.
+- Vendor dependency data only when the upstream package is data-oriented and a runtime dependency would otherwise be required. `aws-ssl-profiles` is handled this way; its generated CA bundle has a third-party MIT notice and must be regenerated when the upstream basis changes.
 
 ## Analyzer warnings
 
-- `aws-ssl-profiles: no entry points found for aws-ssl-profiles`: accepted because named TLS profiles are deferred while direct TLS options are implemented.
+- `aws-ssl-profiles: no entry points found for aws-ssl-profiles`: accepted for static analysis because the package is data-oriented; CA entries were manually generated from the npm artifact.
 - `is-property: no entry points found for is-property`: accepted because `generate-function` is omitted.
 - `safer-buffer: no entry points found for safer-buffer`: accepted because `iconv-lite` companion owns its own dependency strategy.

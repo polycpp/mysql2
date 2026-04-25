@@ -45,6 +45,7 @@ endif()
 FetchContent_MakeAvailable(polycpp_iconv_lite)
 
 add_library(polycpp_mysql2
+    src/aws_rds_ca.cpp
     src/mysql2.cpp
 )
 target_link_libraries(polycpp_mysql2 PUBLIC polycpp polycpp_iconv_lite)

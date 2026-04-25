@@ -12,11 +12,14 @@
 - Packet cursor fixtures for length-coded integers and malformed packet failures should be added before expanding protocol scope.
 - Prepared-statement parameter encoding fixtures should cover NULL, signed/unsigned integers, double, string, and Buffer.
 - Binary row parser fixtures should cover numeric, decimal, date/time/datetime, binary string/blob, JSON text, and NULL bitmap behavior.
+- SSL profile helper coverage verifies the generated AWS RDS CA bundle is loadable as PEM strings.
+- Parser-cache compatibility hooks are covered as no-op static-parser controls.
+- Binlog packet parser coverage includes QueryEvent fixtures; Rotate, FormatDescription, Xid, and unknown-event fixtures should be added.
 
 ## Integration Tests
 
 - Environment-driven MariaDB/MySQL test using `MYSQL2_TEST_HOST`, `MYSQL2_TEST_PORT`, `MYSQL2_TEST_USER`, `MYSQL2_TEST_PASSWORD`, and `MYSQL2_TEST_DATABASE`.
-- Current e2e coverage connects to MariaDB/MySQL, runs ping, selects scalar values, sends query attributes when supported, preserves empty binary values as Buffer, creates a temporary table, inserts rows, selects them back, uses prepared statements, prepared-statement query attributes, server-side cursor fetch, and cached execute, tests transactions, resets the connection, changes user state, tests multi-result queries, exercises callback/Promise wrappers, consumes a JSON line stream, verifies compression when enabled, optionally uploads LOCAL INFILE data when the server allows it, exercises the RAII pool, and exercises a single-node pool cluster.
+- Current e2e coverage connects to MariaDB/MySQL, runs ping, checks typed trace events, selects scalar values, sends query attributes when supported, preserves empty binary values as Buffer, creates a temporary table, inserts rows, selects them back, uses prepared statements, prepared-statement query attributes, server-side cursor fetch, and cached execute, tests transactions, resets the connection, changes user state, tests multi-result queries, exercises callback/Promise wrappers, consumes a JSON line stream, verifies compression when enabled, optionally uploads LOCAL INFILE data when the server allows it, exercises the RAII pool, and exercises a single-node pool cluster.
 - TLS e2e is controlled by `MYSQL2_TEST_SSL`, `MYSQL2_TEST_SSL_REJECT_UNAUTHORIZED`, `MYSQL2_TEST_SSL_VERIFY_IDENTITY`, and `MYSQL2_TEST_SSL_CA_FILE`.
 - MySQL 8 coverage runs against a Dockerized MySQL 8.4 server and validates the default `caching_sha2_password` path.
 - MySQL 8 coverage validates `CLIENT_QUERY_ATTRIBUTES` for both `COM_QUERY` and `COM_STMT_EXECUTE`.
@@ -25,6 +28,7 @@
 - Add charset coverage for utf8mb4, latin1, binary, and representative non-UTF encodings through `iconv-lite`.
 - Add pool contention and wait-timeout coverage.
 - Add multi-result stored procedure coverage.
+- Add replication e2e coverage against a server configured with binary logging and a replication-capable user.
 
 ## Compatibility Tests Adapted From Upstream
 
@@ -45,6 +49,7 @@
 - Non-finite floating values escape as `NULL`.
 - RSA auth path uses OAEP SHA1 to match upstream caching_sha2_password behavior.
 - Single-result APIs drain additional result sets before throwing so the connection is reusable.
+- Bounded binlog dump closes the connection if `max_events` is reached before EOF, so callers do not accidentally reuse a connection that is still inside a replication stream.
 
 ## Release-Blocking Behaviors
 
@@ -52,7 +57,7 @@
 - Real MariaDB e2e passes without TLS.
 - Real MariaDB e2e passes with verified TLS.
 - Real MySQL 8 e2e passes before claiming MySQL 8 auth parity.
-- Stream adaptation, compression, LOCAL INFILE policy, callback/Promise wrappers, and EventEmitter behavior remain documented with exact C++ semantics.
+- Stream adaptation, compression, LOCAL INFILE policy, callback/Promise wrappers, EventEmitter/trace behavior, bounded binlog behavior, parser-cache compatibility hooks, and SSL profile data remain documented with exact C++ semantics.
 - Third-party license notices are complete.
 - Documentation builds with `python3 docs/build.py`.
 - GitHub repo remains private until production-grade quality and public docs are ready.
@@ -66,9 +71,9 @@ cmake --build build -j2
 ctest --test-dir build --output-on-failure
 python3 docs/build.py
 docker run -d --name polycpp-mysql2-e2e -e MYSQL_ROOT_PASSWORD=polycpp -e MYSQL_DATABASE=polycpp_test -p 43307:3306 mysql:8.4 --local-infile=1 --mysqlx=0
-docker run --rm --network container:polycpp-mysql2-e2e -v /data/work/lib/mysql2:/work -w /work ubuntu:22.04 bash -lc 'apt-get update >/dev/null && apt-get install -y libicu70 libssl3 >/dev/null && MYSQL2_TEST_HOST=127.0.0.1 MYSQL2_TEST_PORT=3306 MYSQL2_TEST_USER=root MYSQL2_TEST_PASSWORD=polycpp MYSQL2_TEST_DATABASE=polycpp_test build/test_smoke --gtest_filter=mysql2_integration.query_against_real_database_when_configured'
+docker run --rm --network container:polycpp-mysql2-e2e -v /data/work/lib/mysql2:/work -w /work ubuntu:22.04 bash -lc 'apt-get update >/dev/null && apt-get install -y libicu70 libssl3 >/dev/null && MYSQL2_TEST_HOST=127.0.0.1 MYSQL2_TEST_PORT=3306 MYSQL2_TEST_USER=root MYSQL2_TEST_PASSWORD=polycpp MYSQL2_TEST_DATABASE=polycpp_test MYSQL2_TEST_TRACE=1 build/test_smoke --gtest_filter=mysql2_integration.query_against_real_database_when_configured'
 docker run -d --name polycpp-mysql2-mariadb-e2e -e MARIADB_ROOT_PASSWORD=polycpp -e MARIADB_DATABASE=polycpp_test mariadb:10.6 --local-infile=1
-docker run --rm --network container:polycpp-mysql2-mariadb-e2e -v /data/work/lib/mysql2:/work -w /work ubuntu:22.04 bash -lc 'apt-get update >/dev/null && apt-get install -y libicu70 libssl3 >/dev/null && MYSQL2_TEST_HOST=127.0.0.1 MYSQL2_TEST_PORT=3306 MYSQL2_TEST_USER=root MYSQL2_TEST_PASSWORD=polycpp MYSQL2_TEST_DATABASE=polycpp_test build/test_smoke --gtest_filter=mysql2_integration.query_against_real_database_when_configured'
+docker run --rm --network container:polycpp-mysql2-mariadb-e2e -v /data/work/lib/mysql2:/work -w /work ubuntu:22.04 bash -lc 'apt-get update >/dev/null && apt-get install -y libicu70 libssl3 >/dev/null && MYSQL2_TEST_HOST=127.0.0.1 MYSQL2_TEST_PORT=3306 MYSQL2_TEST_USER=root MYSQL2_TEST_PASSWORD=polycpp MYSQL2_TEST_DATABASE=polycpp_test MYSQL2_TEST_TRACE=1 build/test_smoke --gtest_filter=mysql2_integration.query_against_real_database_when_configured'
 docker run -d --name polycpp-mysql2-mariadb-tls-e2e -e MARIADB_ROOT_PASSWORD=polycpp -e MARIADB_DATABASE=polycpp_test -v /data/work/lib/mysql2/build/mariadb-tls:/certs:ro mariadb:10.6 --local-infile=1 --ssl-ca=/certs/ca.pem --ssl-cert=/certs/server-cert.pem --ssl-key=/certs/server-key.pem --require-secure-transport=ON
 docker run --rm --network container:polycpp-mysql2-mariadb-tls-e2e -v /data/work/lib/mysql2:/work -w /work ubuntu:22.04 bash -lc 'apt-get update >/dev/null && apt-get install -y libicu70 libssl3 >/dev/null && MYSQL2_TEST_HOST=127.0.0.1 MYSQL2_TEST_PORT=3306 MYSQL2_TEST_USER=root MYSQL2_TEST_PASSWORD=polycpp MYSQL2_TEST_DATABASE=polycpp_test MYSQL2_TEST_SSL=1 MYSQL2_TEST_SSL_REJECT_UNAUTHORIZED=1 MYSQL2_TEST_SSL_VERIFY_IDENTITY=1 MYSQL2_TEST_SSL_CA_FILE=/work/build/mariadb-tls/ca.pem build/test_smoke --gtest_filter=mysql2_integration.query_against_real_database_when_configured'
 ```

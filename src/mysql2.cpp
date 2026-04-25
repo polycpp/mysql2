@@ -1,9 +1,12 @@
 #include <polycpp/mysql2/mysql2.hpp>
 
+#include "aws_rds_ca.hpp"
+
 #include <polycpp/crypto.hpp>
 #include <polycpp/iconv_lite/iconv_lite.hpp>
 #include <polycpp/io/event_context.hpp>
 #include <polycpp/io/tcp_socket.hpp>
+#include <polycpp/io/timer.hpp>
 #include <polycpp/io/tls_context.hpp>
 #include <polycpp/io/tls_stream.hpp>
 #include <polycpp/ssl/x509_cert.hpp>
@@ -12,6 +15,7 @@
 
 #include <algorithm>
 #include <any>
+#include <atomic>
 #include <cctype>
 #include <cstdlib>
 #include <array>
@@ -29,6 +33,7 @@
 #include <random>
 #include <sstream>
 #include <system_error>
+#include <type_traits>
 #include <utility>
 
 namespace polycpp::mysql2 {
@@ -65,6 +70,8 @@ namespace command_code {
 constexpr uint8_t QUIT = 0x01;
 constexpr uint8_t QUERY = 0x03;
 constexpr uint8_t CHANGE_USER = 0x11;
+constexpr uint8_t BINLOG_DUMP = 0x12;
+constexpr uint8_t REGISTER_SLAVE = 0x15;
 constexpr uint8_t PING = 0x0e;
 constexpr uint8_t STMT_PREPARE = 0x16;
 constexpr uint8_t STMT_EXECUTE = 0x17;
@@ -91,6 +98,9 @@ constexpr std::size_t kPacketHeaderLength = 4;
 constexpr std::size_t kCompressedPacketHeaderLength = 7;
 constexpr std::size_t kMaxPacketPayloadLength = 0x00ffffff;
 constexpr std::size_t kMaxCompressedPayloadInputLength = 16777210;
+constexpr uint16_t kBinlogDumpNonBlock = 0x01;
+
+std::atomic<std::size_t> g_parser_cache_max{0};
 
 std::size_t normal_packet_count_for_payload(std::size_t payload_length) {
     auto count = payload_length / kMaxPacketPayloadLength + 1;
@@ -1971,6 +1981,119 @@ Buffer build_query_payload(const std::string& sql,
     return buffer_from_bytes(payload);
 }
 
+void append_u8_length_encoded_string(std::vector<uint8_t>& out, std::string_view value, const std::string& encoding) {
+    const auto encoded = encode_string_for_mysql(value, encoding);
+    if (encoded.length() > 255) {
+        throw Error("COM_REGISTER_SLAVE length-prefixed field exceeds 255 bytes");
+    }
+    append_u8(out, static_cast<uint8_t>(encoded.length()));
+    append_bytes(out, encoded);
+}
+
+Buffer build_register_slave_payload(const RegisterSlaveOptions& options, const std::string& encoding) {
+    std::vector<uint8_t> payload;
+    payload.reserve(32 + options.slave_hostname.size() + options.slave_user.size() + options.slave_password.size());
+    append_u8(payload, command_code::REGISTER_SLAVE);
+    append_u32_le(payload, options.server_id);
+    append_u8_length_encoded_string(payload, options.slave_hostname, encoding);
+    append_u8_length_encoded_string(payload, options.slave_user, encoding);
+    append_u8_length_encoded_string(payload, options.slave_password, encoding);
+    append_u16_le(payload, options.slave_port);
+    append_u32_le(payload, options.replication_rank);
+    append_u32_le(payload, options.master_id);
+    return buffer_from_bytes(payload);
+}
+
+Buffer build_binlog_dump_payload(const BinlogDumpOptions& options) {
+    std::vector<uint8_t> payload;
+    payload.reserve(11 + options.filename.size());
+    append_u8(payload, command_code::BINLOG_DUMP);
+    append_u32_le(payload, options.binlog_position);
+    append_u16_le(payload, options.flags);
+    append_u32_le(payload, options.server_id);
+    append_string(payload, options.filename);
+    return buffer_from_bytes(payload);
+}
+
+std::string strip_at_nul(std::string value) {
+    const auto pos = value.find('\0');
+    if (pos != std::string::npos) {
+        value.resize(pos);
+    }
+    return value;
+}
+
+std::string binlog_event_name(uint8_t event_type) {
+    switch (event_type) {
+        case 2: return "QueryEvent";
+        case 4: return "RotateEvent";
+        case 15: return "FormatDescriptionEvent";
+        case 16: return "XidEvent";
+        default: return "UnknownEvent";
+    }
+}
+
+BinlogEvent parse_binlog_event_packet_impl(const Buffer& payload) {
+    if (payload.length() == 0) {
+        throw Error("empty binlog event packet");
+    }
+    PacketCursor cursor(payload);
+    const auto marker_byte = cursor.read_u8();
+    if (marker_byte != marker::OK) {
+        throw Error("unexpected binlog event packet marker");
+    }
+
+    BinlogEvent event;
+    event.raw = payload;
+    event.header.timestamp = cursor.read_u32_le();
+    event.header.event_type = cursor.read_u8();
+    event.header.server_id = cursor.read_u32_le();
+    event.header.event_size = cursor.read_u32_le();
+    event.header.log_position = cursor.read_u32_le();
+    event.header.flags = cursor.read_u16_le();
+    event.name = binlog_event_name(event.header.event_type);
+
+    PacketCursor body_cursor(cursor.read_rest_buffer());
+    switch (event.header.event_type) {
+        case 2: {
+            body_cursor.read_u32_le(); // slave proxy id
+            body_cursor.read_u32_le(); // execution time
+            const auto schema_length = body_cursor.read_u8();
+            body_cursor.read_u16_le(); // error code
+            const auto status_vars_length = body_cursor.read_u16_le();
+            event.status_vars = body_cursor.read_buffer(status_vars_length);
+            event.schema = body_cursor.read_ascii(schema_length);
+            if (body_cursor.has_more()) {
+                body_cursor.read_u8(); // schema terminator
+            }
+            event.query = body_cursor.read_ascii(body_cursor.length() - body_cursor.offset());
+            break;
+        }
+        case 4: {
+            const auto low = body_cursor.read_u32_le();
+            const auto high = body_cursor.read_u32_le();
+            event.next_position = (static_cast<uint64_t>(high) << 32) | low;
+            event.next_binlog = body_cursor.read_ascii(body_cursor.length() - body_cursor.offset());
+            break;
+        }
+        case 15: {
+            event.binlog_version = body_cursor.read_u16_le();
+            event.server_version = strip_at_nul(body_cursor.read_ascii(50));
+            event.create_timestamp = body_cursor.read_u32_le();
+            event.event_header_length = body_cursor.read_u8();
+            event.event_type_header_lengths = body_cursor.read_rest_buffer();
+            break;
+        }
+        case 16: {
+            event.xid = body_cursor.read_u64_le();
+            break;
+        }
+        default:
+            break;
+    }
+    return event;
+}
+
 std::string value_to_string(const Value& value) {
     struct Visitor {
         std::string operator()(std::monostate) const { return "NULL"; }
@@ -2003,13 +2126,8 @@ public:
         if (connected_) {
             return;
         }
-        ctx_.restart();
+        connect_socket();
         std::error_code ec;
-        socket_.asyncConnect(options_.host, options_.port, [&](std::error_code error) { ec = error; });
-        ctx_.run();
-        if (ec) {
-            throw Error("connect failed: " + ec.message());
-        }
         socket_.setNoDelay(true, ec);
         if (ec) {
             throw Error("failed to set TCP_NODELAY: " + ec.message());
@@ -2266,6 +2384,47 @@ public:
         return result;
     }
 
+    OkPacket register_slave(const RegisterSlaveOptions& options) {
+        ensure_connected();
+        write_packet(build_register_slave_payload(options, client_encoding_), 0);
+        const auto frame = read_packet();
+        if (is_err_packet(frame.payload)) {
+            throw parse_error_packet(frame.payload);
+        }
+        if (!is_ok_packet(frame.payload)) {
+            throw Error("unexpected packet for COM_REGISTER_SLAVE");
+        }
+        return parse_ok_packet(frame.payload, server_capability_flags_);
+    }
+
+    std::vector<BinlogEvent> binlog_dump(const BinlogDumpOptions& options) {
+        ensure_connected();
+        if ((options.flags & kBinlogDumpNonBlock) == 0 && options.max_events == 0) {
+            throw Error("blocking COM_BINLOG_DUMP requires max_events to avoid an unbounded synchronous read");
+        }
+
+        write_packet(build_binlog_dump_payload(options), 0);
+        std::vector<BinlogEvent> events;
+        while (true) {
+            const auto frame = read_packet();
+            if (is_err_packet(frame.payload)) {
+                throw parse_error_packet(frame.payload);
+            }
+            if (is_eof_packet(frame.payload)) {
+                break;
+            }
+            events.push_back(parse_binlog_event_packet(frame.payload));
+            if (options.max_events != 0 && events.size() >= options.max_events) {
+                close_transport();
+                connected_ = false;
+                tls_active_ = false;
+                compression_active_ = false;
+                break;
+            }
+        }
+        return events;
+    }
+
     void close_statement(const PreparedStatement& statement) {
         ensure_connected();
         if (statement.id == 0) {
@@ -2413,6 +2572,40 @@ public:
     uint32_t server_capability_flags() const noexcept { return server_capability_flags_; }
     events::EventEmitter& emitter() noexcept { return emitter_; }
 
+    template <typename Fn>
+    std::invoke_result_t<Fn> traced(const std::string& operation, const std::string& sql, Fn&& fn) {
+        using Result = std::invoke_result_t<Fn>;
+        const bool has_trace_listener = emitter_.listenerCount(event::Trace) > 0;
+        const auto start = std::chrono::steady_clock::now();
+        if (has_trace_listener) {
+            emit_trace(operation, "start", sql, start, {});
+        }
+        try {
+            if constexpr (std::is_void_v<Result>) {
+                std::forward<Fn>(fn)();
+                if (has_trace_listener) {
+                    emit_trace(operation, "success", sql, start, {});
+                }
+            } else {
+                auto result = std::forward<Fn>(fn)();
+                if (has_trace_listener) {
+                    emit_trace(operation, "success", sql, start, {});
+                }
+                return result;
+            }
+        } catch (const std::exception& error) {
+            if (has_trace_listener) {
+                emit_trace(operation, "error", sql, start, error.what());
+            }
+            throw;
+        } catch (...) {
+            if (has_trace_listener) {
+                emit_trace(operation, "error", sql, start, "unknown exception");
+            }
+            throw;
+        }
+    }
+
     ConnectionInfo connection_info() const {
         return ConnectionInfo{
             .connection_id = connection_id_,
@@ -2428,13 +2621,70 @@ public:
         }
     }
 
+    void emit_trace(const std::string& operation,
+                    const std::string& phase,
+                    const std::string& sql,
+                    std::chrono::steady_clock::time_point start,
+                    const std::string& error) {
+        if (emitter_.listenerCount(event::Trace) == 0) {
+            return;
+        }
+        TraceEvent event;
+        event.operation = operation;
+        event.phase = phase;
+        event.sql = sql;
+        event.database = options_.database;
+        event.user = options_.user;
+        event.server_address = options_.host;
+        event.server_port = options_.port;
+        event.duration = std::chrono::duration_cast<std::chrono::microseconds>(
+            std::chrono::steady_clock::now() - start);
+        event.error = error;
+        emitter_.emit(event::Trace, event);
+    }
+
     void pause() noexcept { paused_ = true; }
     void resume() noexcept { paused_ = false; }
 
 private:
     void ensure_connected() {
         if (!connected_) {
-            connect();
+            traced("connect", "", [this] { connect(); });
+        }
+    }
+
+    void connect_socket() {
+        ctx_.restart();
+        std::error_code ec;
+        bool completed = false;
+        bool timed_out = false;
+        io::Timer timer(ctx_);
+
+        socket_.asyncConnect(options_.host, options_.port, [&](std::error_code error) {
+            completed = true;
+            ec = error;
+            if (options_.connect_timeout_ms != 0) {
+                timer.cancel();
+            }
+        });
+
+        if (options_.connect_timeout_ms != 0) {
+            timer.expiresAfter(std::chrono::milliseconds(options_.connect_timeout_ms));
+            timer.asyncWait([&](std::error_code error) {
+                if (!error && !completed) {
+                    timed_out = true;
+                    std::error_code ignored;
+                    socket_.close(ignored);
+                }
+            });
+        }
+
+        ctx_.run();
+        if (timed_out) {
+            throw Error("connect timed out after " + std::to_string(options_.connect_timeout_ms) + "ms");
+        }
+        if (ec) {
+            throw Error("connect failed: " + ec.message());
         }
     }
 
@@ -2448,6 +2698,11 @@ private:
             tls_context.setVerifyMode(1);
             if (options_.ssl.load_default_verify_paths) {
                 tls_context.loadDefaultVerifyPaths();
+            }
+            if (!options_.ssl.profile.empty()) {
+                for (const auto& ca_pem : ssl_profile_ca_pems(options_.ssl.profile)) {
+                    tls_context.addCertificateAuthorityPem(ca_pem);
+                }
             }
             if (!options_.ssl.ca_pem.empty()) {
                 tls_context.addCertificateAuthorityPem(options_.ssl.ca_pem);
@@ -3265,6 +3520,10 @@ ConnectionOptions parse_connection_uri(const std::string& uri) {
         else if (key == "enableCleartextPlugin" || key == "enable_cleartext_plugin") options.enable_cleartext_plugin = parse_bool_option(value);
         else if (key == "compress") options.compress = parse_bool_option(value);
         else if (key == "ssl") options.ssl.enabled = parse_bool_option(value);
+        else if (key == "sslProfile" || key == "ssl.profile") {
+            options.ssl.enabled = true;
+            options.ssl.profile = value;
+        }
         else if (key == "rejectUnauthorized" || key == "ssl.rejectUnauthorized") options.ssl.reject_unauthorized = parse_bool_option(value);
         else if (key == "verifyIdentity" || key == "ssl.verifyIdentity") options.ssl.verify_identity = parse_bool_option(value);
         else if (key == "ssl.ca" || key == "ssl_ca_file") options.ssl.ca_file = value;
@@ -3281,6 +3540,37 @@ uint16_t get_charset_number(const std::string& charset) {
 
 std::string get_charset_encoding(uint16_t charset_number) {
     return charset_encoding(charset_number);
+}
+
+std::vector<std::string> ssl_profile_names() {
+    return {"Amazon RDS"};
+}
+
+std::vector<std::string> ssl_profile_ca_pems(const std::string& profile) {
+    if (profile.empty()) {
+        return {};
+    }
+    if (profile != "Amazon RDS") {
+        throw Error("unsupported mysql2 SSL profile: " + profile);
+    }
+    const auto& certs = detail::aws_rds_ca_certificates();
+    return std::vector<std::string>(certs.begin(), certs.end());
+}
+
+void set_max_parser_cache(std::size_t max) noexcept {
+    g_parser_cache_max.store(max, std::memory_order_relaxed);
+}
+
+std::size_t max_parser_cache() noexcept {
+    return g_parser_cache_max.load(std::memory_order_relaxed);
+}
+
+void clear_parser_cache() noexcept {
+    // JavaScript parser generation caches do not exist in this static C++ parser.
+}
+
+BinlogEvent parse_binlog_event_packet(const Buffer& payload) {
+    return parse_binlog_event_packet_impl(payload);
 }
 
 template <typename T, typename F>
@@ -3347,7 +3637,7 @@ Connection& Connection::operator=(Connection&& other) noexcept {
 
 void Connection::connect() {
     try {
-        impl_->connect();
+        impl_->traced("connect", "", [this] { impl_->connect(); });
     } catch (const Error& error) {
         impl_->emit_error(error);
         throw;
@@ -3367,7 +3657,7 @@ Promise<void> Connection::connect_promise() { return promise_void_from([this] { 
 
 QueryResult Connection::query(const std::string& sql) {
     try {
-        return impl_->query(sql);
+        return impl_->traced("query", sql, [this, &sql] { return impl_->query(sql); });
     } catch (const Error& error) {
         impl_->emit_error(error);
         throw;
@@ -3376,7 +3666,7 @@ QueryResult Connection::query(const std::string& sql) {
 
 QueryResult Connection::query(const std::string& sql, const QueryAttributes& attributes) {
     try {
-        return impl_->query(sql, attributes);
+        return impl_->traced("query", sql, [this, &sql, &attributes] { return impl_->query(sql, attributes); });
     } catch (const Error& error) {
         impl_->emit_error(error);
         throw;
@@ -3411,7 +3701,7 @@ Promise<QueryResult> Connection::query_promise(const std::string& sql, const Que
 
 std::vector<QueryResult> Connection::query_all(const std::string& sql) {
     try {
-        return impl_->query_all(sql);
+        return impl_->traced("query", sql, [this, &sql] { return impl_->query_all(sql); });
     } catch (const Error& error) {
         impl_->emit_error(error);
         throw;
@@ -3420,7 +3710,7 @@ std::vector<QueryResult> Connection::query_all(const std::string& sql) {
 
 std::vector<QueryResult> Connection::query_all(const std::string& sql, const QueryAttributes& attributes) {
     try {
-        return impl_->query_all(sql, attributes);
+        return impl_->traced("query", sql, [this, &sql, &attributes] { return impl_->query_all(sql, attributes); });
     } catch (const Error& error) {
         impl_->emit_error(error);
         throw;
@@ -3487,7 +3777,9 @@ Promise<PreparedStatement> Connection::prepare_promise(const std::string& sql) {
 
 QueryResult Connection::execute(const PreparedStatement& statement, const std::vector<Value>& values) {
     try {
-        return impl_->execute(statement, values);
+        return impl_->traced("execute", statement.query, [this, &statement, &values] {
+            return impl_->execute(statement, values);
+        });
     } catch (const Error& error) {
         impl_->emit_error(error);
         throw;
@@ -3498,7 +3790,9 @@ QueryResult Connection::execute(const PreparedStatement& statement,
                                 const std::vector<Value>& values,
                                 const QueryAttributes& attributes) {
     try {
-        return impl_->execute(statement, values, attributes);
+        return impl_->traced("execute", statement.query, [this, &statement, &values, &attributes] {
+            return impl_->execute(statement, values, attributes);
+        });
     } catch (const Error& error) {
         impl_->emit_error(error);
         throw;
@@ -3538,7 +3832,9 @@ Promise<QueryResult> Connection::execute_promise(const PreparedStatement& statem
 
 std::vector<QueryResult> Connection::execute_all(const PreparedStatement& statement, const std::vector<Value>& values) {
     try {
-        return impl_->execute_all(statement, values);
+        return impl_->traced("execute", statement.query, [this, &statement, &values] {
+            return impl_->execute_all(statement, values);
+        });
     } catch (const Error& error) {
         impl_->emit_error(error);
         throw;
@@ -3549,7 +3845,9 @@ std::vector<QueryResult> Connection::execute_all(const PreparedStatement& statem
                                                  const std::vector<Value>& values,
                                                  const QueryAttributes& attributes) {
     try {
-        return impl_->execute_all(statement, values, attributes);
+        return impl_->traced("execute", statement.query, [this, &statement, &values, &attributes] {
+            return impl_->execute_all(statement, values, attributes);
+        });
     } catch (const Error& error) {
         impl_->emit_error(error);
         throw;
@@ -3591,7 +3889,7 @@ Promise<std::vector<QueryResult>> Connection::execute_all_promise(const Prepared
 
 QueryResult Connection::execute(const std::string& sql, const std::vector<Value>& values) {
     try {
-        return impl_->execute(sql, values);
+        return impl_->traced("execute", sql, [this, &sql, &values] { return impl_->execute(sql, values); });
     } catch (const Error& error) {
         impl_->emit_error(error);
         throw;
@@ -3602,7 +3900,9 @@ QueryResult Connection::execute(const std::string& sql,
                                 const std::vector<Value>& values,
                                 const QueryAttributes& attributes) {
     try {
-        return impl_->execute(sql, values, attributes);
+        return impl_->traced("execute", sql, [this, &sql, &values, &attributes] {
+            return impl_->execute(sql, values, attributes);
+        });
     } catch (const Error& error) {
         impl_->emit_error(error);
         throw;
@@ -3642,7 +3942,7 @@ Promise<QueryResult> Connection::execute_promise(const std::string& sql,
 
 std::vector<QueryResult> Connection::execute_all(const std::string& sql, const std::vector<Value>& values) {
     try {
-        return impl_->execute_all(sql, values);
+        return impl_->traced("execute", sql, [this, &sql, &values] { return impl_->execute_all(sql, values); });
     } catch (const Error& error) {
         impl_->emit_error(error);
         throw;
@@ -3653,7 +3953,9 @@ std::vector<QueryResult> Connection::execute_all(const std::string& sql,
                                                  const std::vector<Value>& values,
                                                  const QueryAttributes& attributes) {
     try {
-        return impl_->execute_all(sql, values, attributes);
+        return impl_->traced("execute", sql, [this, &sql, &values, &attributes] {
+            return impl_->execute_all(sql, values, attributes);
+        });
     } catch (const Error& error) {
         impl_->emit_error(error);
         throw;
@@ -3698,7 +4000,9 @@ StatementCursor Connection::execute_cursor(const PreparedStatement& statement,
                                            const QueryAttributes& attributes,
                                            CursorType cursor_type) {
     try {
-        return impl_->execute_cursor(statement, values, attributes, cursor_type);
+        return impl_->traced("execute", statement.query, [this, &statement, &values, &attributes, cursor_type] {
+            return impl_->execute_cursor(statement, values, attributes, cursor_type);
+        });
     } catch (const Error& error) {
         impl_->emit_error(error);
         throw;
@@ -3710,7 +4014,9 @@ StatementCursor Connection::execute_cursor(const std::string& sql,
                                            const QueryAttributes& attributes,
                                            CursorType cursor_type) {
     try {
-        return impl_->execute_cursor(sql, values, attributes, cursor_type);
+        return impl_->traced("execute", sql, [this, &sql, &values, &attributes, cursor_type] {
+            return impl_->execute_cursor(sql, values, attributes, cursor_type);
+        });
     } catch (const Error& error) {
         impl_->emit_error(error);
         throw;
@@ -3724,6 +4030,51 @@ QueryResult Connection::fetch(StatementCursor& cursor, uint32_t row_count) {
         impl_->emit_error(error);
         throw;
     }
+}
+
+OkPacket Connection::register_slave(const RegisterSlaveOptions& options) {
+    try {
+        return impl_->register_slave(options);
+    } catch (const Error& error) {
+        impl_->emit_error(error);
+        throw;
+    }
+}
+
+void Connection::register_slave(const RegisterSlaveOptions& options, OkCallback callback) {
+    try {
+        auto ok = register_slave(options);
+        if (callback) callback(nullptr, ok);
+    } catch (...) {
+        if (callback) callback(std::current_exception(), OkPacket{});
+    }
+}
+
+Promise<OkPacket> Connection::register_slave_promise(RegisterSlaveOptions options) {
+    return promise_from<OkPacket>([this, options = std::move(options)] { return register_slave(options); });
+}
+
+std::vector<BinlogEvent> Connection::binlog_dump(const BinlogDumpOptions& options) {
+    try {
+        return impl_->binlog_dump(options);
+    } catch (const Error& error) {
+        impl_->emit_error(error);
+        throw;
+    }
+}
+
+void Connection::binlog_dump(const BinlogDumpOptions& options, BinlogEventsCallback callback) {
+    try {
+        auto events = binlog_dump(options);
+        if (callback) callback(nullptr, std::move(events));
+    } catch (...) {
+        if (callback) callback(std::current_exception(), {});
+    }
+}
+
+Promise<std::vector<BinlogEvent>> Connection::binlog_dump_promise(BinlogDumpOptions options) {
+    return promise_from<std::vector<BinlogEvent>>(
+        [this, options = std::move(options)] { return binlog_dump(options); });
 }
 
 void Connection::close_statement(const PreparedStatement& statement) { impl_->close_statement(statement); }

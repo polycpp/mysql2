@@ -28,7 +28,7 @@
 | `Connection#end()` | `Connection::end()` | adapted | Sends COM_QUIT when connected, then closes transport. |
 | `Connection#destroy()` | `Connection::destroy()` | adapted | Closes the transport through the same safe shutdown path as `end()`. |
 | `Connection#pause()` / `resume()` | `Connection::pause()` / `resume()` | adapted | Records paused state for API compatibility. The current command execution path is synchronous, so there is no background packet pump to pause. |
-| `ssl` option object | `ConnectionOptions::ssl` | adapted | Supports TLS enablement, CA/cert/key files or PEM, default trust store loading, certificate verification, and host/IP identity checks. Named AWS SSL profiles are not implemented. |
+| `ssl` option object | `ConnectionOptions::ssl` | adapted | Supports TLS enablement, CA/cert/key files or PEM, default trust store loading, certificate verification, host/IP identity checks, and `SslOptions::profile = "Amazon RDS"` CA data from `aws-ssl-profiles@1.1.2`. |
 | `enableCleartextPlugin` | `ConnectionOptions::enable_cleartext_plugin` | adapted | Requires TLS before `mysql_clear_password` can be used. |
 | `compress` option | `ConnectionOptions::compress` | adapted | Implements the MySQL compressed packet protocol using `polycpp::zlib`. |
 | `infileStreamFactory` | `ConnectionOptions::local_infile_handler` | adapted | Requires an explicit caller-provided callback returning `polycpp::Buffer` chunks; no filesystem path is opened implicitly. |
@@ -38,6 +38,7 @@
 | `mysql.raw(sql)` | `polycpp::mysql2::raw(sql)` | adapted | Explicit raw SQL variant bypasses escaping. |
 | `namedPlaceholders` option | `polycpp::mysql2::format_named(sql, map)` | adapted | Separate helper rather than connection option. |
 | `connectAttributes` | `ConnectionOptions::connect_attributes` | adapted | Merged with default client name/version attributes and sent during handshake and `COM_CHANGE_USER`. |
+| `connectTimeout` | `ConnectionOptions::connect_timeout_ms` | adapted | Enforced around the initial TCP connect using `polycpp::io::Timer`. Per-command inactivity timeout options are not modeled as query objects. |
 | `charset`, `charsetNumber` | `ConnectionOptions::charset`, `charset_number`, `get_charset_number`, `get_charset_encoding` | adapted | Uses upstream mysql2 charset/collation ids and `iconv-lite` companion encoding support for non-core string conversions. |
 | `ConnectionConfig` | `ConnectionOptions` | adapted | Typed subset of host, port, user, password, database, charset, auth key, SSL, connect attributes, and flags. |
 | `PoolConfig` | `PoolOptions` | adapted | Connection options plus connection limit and wait timeout. |
@@ -46,8 +47,10 @@
 | `Query#stream()` object-mode rows | `Connection::query_stream_json(sql)` | adapted | `polycpp::stream::Readable` emits `Buffer` chunks containing newline-delimited JSON rows. Native object-mode row chunks are not meaningful until polycpp streams support arbitrary chunk payloads. |
 | `ResultSetHeader` / OK packet | `OkPacket` | adapted | Affected rows, insert id, status, warnings, info. |
 | `Types`, `FieldFlags` constants | `polycpp::mysql2::constants::*` | direct | Protocol constants exposed for result interpretation. |
-| server/binlog APIs | none | deferred | Not part of the client query/execute production slice. |
-| parser cache controls | none | omitted | JavaScript parser-generation optimization is not needed in C++. |
+| `createBinlogStream`, `_registerSlave`, `_binlogDump` | `Connection::register_slave(...)`, `Connection::binlog_dump(...)`, `parse_binlog_event_packet(...)` | adapted | Provides bounded synchronous replication command support. Query, Rotate, FormatDescription, and Xid events are typed; unknown events retain raw bytes. GTID dump and continuous stream abstraction remain deferred. |
+| server APIs | none | deferred | Server-side protocol mode is separate from the client connection surface and remains deferred. |
+| parser cache controls | `set_max_parser_cache(...)`, `max_parser_cache()`, `clear_parser_cache()` | adapted | Compatibility hooks only. The static C++ parser has no generated parser cache to clear. |
+| `node:diagnostics_channel` tracing | `event::Trace` / `TraceEvent` | adapted | Emits typed start/success/error events for connect/query/execute through the existing `polycpp::events::EventEmitter` surface. |
 
 ## Framework Object Boundary Review
 
@@ -62,10 +65,10 @@ No polycpp HTTP request, response, or header type should be introduced for this 
 ## Node parity surface review
 
 - Callback APIs: supported as `std::function` overloads for public connection, pool, and cluster operations; callbacks receive `std::exception_ptr` plus typed result values.
-- Promise APIs: supported through `polycpp::Promise` wrappers for connect, query, execute, prepare, transaction helpers, ping, reset, change-user, end, pool queries, and cluster queries.
+- Promise APIs: supported through `polycpp::Promise` wrappers for connect, query, execute, prepare, transaction helpers, ping, reset, change-user, end, register-slave/binlog-dump, pool queries, and cluster queries.
 - EventEmitter APIs: supported through typed `polycpp::events::EventEmitter` forwarding on `Connection`, `Pool`, and `PoolCluster`; event names are exposed as constants.
 - Stream APIs: `Query#stream()` is adapted to `Connection::query_stream_json(sql)`, a `polycpp::stream::Readable` of newline-delimited JSON `Buffer` chunks.
 - Buffer and binary APIs: mapped to `polycpp::Buffer` for wire packets, binary SQL values, binary result columns, and LOCAL INFILE chunk uploads.
-- URL, timer, process, and filesystem APIs: URI parsing maps to `polycpp::url`; pool wait settings use C++ chrono; process APIs are not public; filesystem access is limited to explicit TLS file options and caller-provided LOCAL INFILE data.
+- URL, timer, process, and filesystem APIs: URI parsing maps to `polycpp::url`; connect deadlines use `polycpp::io::Timer`; pool wait settings use C++ chrono; process APIs are not public; filesystem access is limited to explicit TLS file options and caller-provided LOCAL INFILE data.
 - Crypto, compression, TLS, network, and HTTP APIs: auth crypto maps to `polycpp::crypto`; compression maps to `polycpp::zlib`; TCP/TLS maps to `polycpp::io`/`polycpp::ssl`; HTTP is not part of this driver boundary.
-- Unsupported or non-meaningful Node-specific APIs and audit reason: native object-mode row chunks, diagnostic channels, parser cache controls, and server/binlog APIs remain deferred or omitted as documented in `docs/divergences.md`.
+- Unsupported or non-meaningful Node-specific APIs and audit reason: native object-mode row chunks, server mode, GTID replication, continuous binlog object streams, and full row-event decoding remain deferred as documented in `docs/divergences.md`.

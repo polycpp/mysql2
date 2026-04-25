@@ -2,6 +2,7 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <chrono>
 #include <exception>
 #include <functional>
 #include <memory>
@@ -47,6 +48,7 @@ struct SslOptions {
     std::string key_pem;
     std::string key_file;
     std::string key_passphrase;
+    std::string profile;
 };
 
 struct ConnectionOptions {
@@ -177,11 +179,68 @@ struct ConnectionInfo {
     bool encrypted = false;
 };
 
+struct TraceEvent {
+    std::string operation;
+    std::string phase;
+    std::string sql;
+    std::string database;
+    std::string user;
+    std::string server_address;
+    uint16_t server_port = 0;
+    std::chrono::microseconds duration{0};
+    std::string error;
+};
+
+struct RegisterSlaveOptions {
+    uint32_t server_id = 0;
+    std::string slave_hostname;
+    std::string slave_user;
+    std::string slave_password;
+    uint16_t slave_port = 0;
+    uint32_t replication_rank = 0;
+    uint32_t master_id = 0;
+};
+
+struct BinlogDumpOptions {
+    uint32_t binlog_position = 4;
+    uint16_t flags = 0x01;
+    uint32_t server_id = 0;
+    std::string filename;
+    std::size_t max_events = 1024;
+};
+
+struct BinlogEventHeader {
+    uint32_t timestamp = 0;
+    uint8_t event_type = 0;
+    uint32_t server_id = 0;
+    uint32_t event_size = 0;
+    uint32_t log_position = 0;
+    uint16_t flags = 0;
+};
+
+struct BinlogEvent {
+    std::string name;
+    BinlogEventHeader header;
+    Buffer raw;
+    Buffer status_vars;
+    std::string schema;
+    std::string query;
+    std::string next_binlog;
+    uint64_t next_position = 0;
+    uint16_t binlog_version = 0;
+    std::string server_version;
+    uint32_t create_timestamp = 0;
+    uint8_t event_header_length = 0;
+    Buffer event_type_header_lengths;
+    uint64_t xid = 0;
+};
+
 using VoidCallback = std::function<void(std::exception_ptr)>;
 using OkCallback = std::function<void(std::exception_ptr, OkPacket)>;
 using QueryCallback = std::function<void(std::exception_ptr, QueryResult)>;
 using QueryAllCallback = std::function<void(std::exception_ptr, std::vector<QueryResult>)>;
 using PrepareCallback = std::function<void(std::exception_ptr, PreparedStatement)>;
+using BinlogEventsCallback = std::function<void(std::exception_ptr, std::vector<BinlogEvent>)>;
 
 RawSql raw(std::string sql);
 std::string escape(const Value& value);
@@ -200,6 +259,12 @@ std::string row_to_json_line(const Row& row, const std::vector<Field>& fields);
 ConnectionOptions parse_connection_uri(const std::string& uri);
 uint16_t get_charset_number(const std::string& charset);
 std::string get_charset_encoding(uint16_t charset_number);
+std::vector<std::string> ssl_profile_names();
+std::vector<std::string> ssl_profile_ca_pems(const std::string& profile);
+void set_max_parser_cache(std::size_t max) noexcept;
+std::size_t max_parser_cache() noexcept;
+void clear_parser_cache() noexcept;
+BinlogEvent parse_binlog_event_packet(const Buffer& payload);
 
 class Connection : public events::EventEmitterForwarder {
 public:
@@ -265,6 +330,12 @@ public:
                                    const QueryAttributes& attributes = {},
                                    CursorType cursor_type = CursorType::ReadOnly);
     QueryResult fetch(StatementCursor& cursor, uint32_t row_count);
+    OkPacket register_slave(const RegisterSlaveOptions& options);
+    void register_slave(const RegisterSlaveOptions& options, OkCallback callback);
+    Promise<OkPacket> register_slave_promise(RegisterSlaveOptions options);
+    std::vector<BinlogEvent> binlog_dump(const BinlogDumpOptions& options = {});
+    void binlog_dump(const BinlogDumpOptions& options, BinlogEventsCallback callback);
+    Promise<std::vector<BinlogEvent>> binlog_dump_promise(BinlogDumpOptions options = {});
     void close_statement(const PreparedStatement& statement);
     void close_statement(const std::string& sql);
     OkPacket begin_transaction();
@@ -431,6 +502,7 @@ Promise<QueryResult> query_promise(ConnectionOptions options, const std::string&
 namespace event {
 inline constexpr events::TypedEvent<"connect", const ConnectionInfo&> Connect{};
 inline constexpr events::TypedEvent<"error", const Error&> Error_{};
+inline constexpr events::TypedEvent<"trace", const TraceEvent&> Trace{};
 inline constexpr events::TypedEvent<"end"> End{};
 inline constexpr events::TypedEvent<"close"> Close{};
 inline constexpr events::TypedEvent<"enqueue"> Enqueue{};
@@ -493,6 +565,10 @@ inline constexpr uint16_t NO_DEFAULT_VALUE = 4096;
 inline constexpr uint16_t ON_UPDATE_NOW = 8192;
 inline constexpr uint16_t NUM = 32768;
 }  // namespace field_flags
+
+namespace binlog_dump_flags {
+inline constexpr uint16_t NON_BLOCK = 0x01;
+}  // namespace binlog_dump_flags
 }  // namespace constants
 
 }  // namespace polycpp::mysql2
