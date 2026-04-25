@@ -11,10 +11,10 @@ Legend:
 ## Intake
 
 - [ ] target repo scaffolded
-- [ ] GitHub repo created under `polycpp`
-- [ ] GitHub repo visibility verified private
-- GitHub repo URL:
-- GitHub repo private: no
+- [x] GitHub repo created under `polycpp`
+- [x] GitHub repo visibility verified private
+- GitHub repo URL: https://github.com/polycpp/mysql2
+- GitHub repo private: yes
 - [ ] baseline readiness passed
 - [ ] upstream repo cloned or updated locally
 - [ ] upstream revision recorded in `docs/research.md`
