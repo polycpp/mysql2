@@ -1,0 +1,45 @@
+# Doxygen configuration for polycpp companion library documentation.
+# Extracts @brief/@param/@return/@code blocks from public headers into XML that
+# Breathe consumes. HTML is disabled - Sphinx renders the final site.
+
+PROJECT_NAME           = "mysql2"
+PROJECT_BRIEF          = "C++ companion port of mysql2"
+PROJECT_NUMBER         = 0.1.0
+
+OUTPUT_DIRECTORY       = build/doxygen
+INPUT                  = ../include
+RECURSIVE              = YES
+FILE_PATTERNS          = *.hpp *.h
+EXCLUDE_PATTERNS       = */detail/* */internal/*
+
+STRIP_FROM_PATH        = ../include
+
+# Favor public symbols; pick up everything declared in headers.
+EXTRACT_ALL            = NO
+EXTRACT_PRIVATE        = NO
+EXTRACT_STATIC         = YES
+EXTRACT_LOCAL_CLASSES  = NO
+HIDE_UNDOC_MEMBERS     = NO
+HIDE_UNDOC_CLASSES     = NO
+INTERNAL_DOCS          = NO
+
+# Output: Breathe wants XML; HTML is produced by Sphinx.
+GENERATE_HTML          = NO
+GENERATE_LATEX         = NO
+GENERATE_XML           = YES
+
+# Macro handling - POLYCPP_IMPL wraps inline definitions; expand it away.
+MACRO_EXPANSION        = YES
+EXPAND_ONLY_PREDEF     = YES
+PREDEFINED             = POLYCPP_IMPL= \
+                         POLYCPP_HAVE_ICU=1 \
+                         DOXYGEN=1
+
+# Don't chase polycpp-core headers into the companion's XML - we only want
+# this library's public surface. Callers cross-link to polycpp's own docs.
+SEARCH_INCLUDES        = NO
+INCLUDE_PATH           =
+
+QUIET                  = YES
+WARN_IF_UNDOCUMENTED   = NO
+WARN_AS_ERROR          = NO

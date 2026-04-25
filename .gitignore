@@ -1,0 +1,9 @@
+build/
+cmake-build-*/
+CMakeFiles/
+CMakeCache.txt
+Testing/
+compile_commands.json
+*.log
+.tmp/
+docs/build/

@@ -1,0 +1,8 @@
+/* Brand overrides for Furo */
+.sig-name {
+    font-weight: 700;
+}
+
+code.literal {
+    font-size: 0.85rem;
+}
