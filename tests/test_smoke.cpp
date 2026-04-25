@@ -1,8 +1,11 @@
 #include <gtest/gtest.h>
 
+#include <atomic>
+#include <chrono>
 #include <cstdlib>
 #include <iostream>
 #include <string>
+#include <thread>
 #include <vector>
 
 #include <polycpp/event_loop.hpp>
@@ -185,6 +188,119 @@ TEST(rows, json_helpers_and_event_emitter_surface) {
     event.phase = "start";
     connection.emit(mysql2::event::Trace, event);
     EXPECT_TRUE(saw_trace);
+}
+
+TEST(server_mode, loopback_query_uses_adapted_server_api) {
+    mysql2::ServerOptions server_options;
+    server_options.handshake.server_version = "polycpp-mysql2-test";
+
+    std::atomic<bool> auth_seen{false};
+    std::atomic<bool> connection_seen{false};
+    std::atomic<bool> query_seen{false};
+    std::atomic<bool> ping_seen{false};
+    std::atomic<bool> quit_seen{false};
+    std::atomic<bool> stmt_prepare_seen{false};
+    std::atomic<bool> stmt_execute_seen{false};
+
+    server_options.handshake.auth_callback = [&](const mysql2::ServerAuthInfo& auth) -> std::optional<mysql2::Error> {
+        const auto attr = auth.connect_attributes.find("polycpp_test");
+        auth_seen = auth.user == "polycpp" &&
+                    attr != auth.connect_attributes.end() &&
+                    attr->second == "server-mode";
+        return std::nullopt;
+    };
+
+    auto server = mysql2::create_server(server_options);
+    server.on(mysql2::event::ServerConnectionAccepted, [&](mysql2::ServerConnection& connection) {
+        connection_seen = true;
+        connection.on(mysql2::event::ServerQuery, [&](mysql2::ServerConnection& conn, const std::string& sql) {
+            query_seen = sql == "SELECT 42 AS answer";
+
+            mysql2::Field answer;
+            answer.name = "answer";
+            answer.column_type = mysql2::constants::column_type::LONG;
+            answer.character_set = 224;
+            answer.encoding = "utf8";
+
+            mysql2::Row row;
+            row.values = {int64_t{42}};
+            conn.write_text_result(std::vector<mysql2::Row>{row}, std::vector<mysql2::Field>{answer});
+        });
+        connection.on(mysql2::event::ServerPing, [&](mysql2::ServerConnection& conn) {
+            ping_seen = true;
+            conn.write_ok();
+        });
+        connection.on(mysql2::event::ServerStatementPrepare, [&](mysql2::ServerConnection& conn, const std::string& sql) {
+            stmt_prepare_seen = sql.rfind("PREPARE ", 0) == 0;
+            conn.write_ok();
+        });
+        connection.on(mysql2::event::ServerStatementExecute,
+                      [&](mysql2::ServerConnection& conn, const mysql2::ServerStatementExecuteInfo& info) {
+            stmt_execute_seen = info.query == "EXECUTE polycpp_stmt";
+            conn.write_ok();
+        });
+        connection.on(mysql2::event::ServerQuit, [&](mysql2::ServerConnection&) {
+            quit_seen = true;
+        });
+    });
+
+    server.listen();
+
+    mysql2::ConnectionOptions client_options;
+    client_options.host = server.address();
+    client_options.port = server.port();
+    client_options.user = "polycpp";
+    client_options.connect_timeout_ms = 5000;
+    client_options.connect_attributes["polycpp_test"] = "server-mode";
+
+    auto client = mysql2::create_connection(client_options);
+    const auto result = client.query("SELECT 42 AS answer");
+    ASSERT_EQ(result.rows.size(), 1u);
+    EXPECT_EQ(std::get<int64_t>(result.rows[0].at("answer")), 42);
+    client.query("PREPARE polycpp_stmt FROM 'SELECT 1'");
+    client.query("EXECUTE polycpp_stmt");
+    client.ping();
+    client.end();
+
+    for (int i = 0; i < 50 && !quit_seen.load(); ++i) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(10));
+    }
+    server.close();
+
+    EXPECT_TRUE(auth_seen);
+    EXPECT_TRUE(connection_seen);
+    EXPECT_TRUE(query_seen);
+    EXPECT_TRUE(ping_seen);
+    EXPECT_TRUE(quit_seen);
+    EXPECT_TRUE(stmt_prepare_seen);
+    EXPECT_TRUE(stmt_execute_seen);
+    EXPECT_EQ(server.connection_count(), 0u);
+}
+
+TEST(server_mode, auth_callback_rejects_client_with_error_packet) {
+    mysql2::ServerOptions server_options;
+    server_options.handshake.auth_callback = [](const mysql2::ServerAuthInfo&) -> std::optional<mysql2::Error> {
+        return mysql2::Error(1045, "28000", "access denied by test server");
+    };
+
+    auto server = mysql2::create_server(server_options);
+    server.listen();
+
+    mysql2::ConnectionOptions client_options;
+    client_options.host = server.address();
+    client_options.port = server.port();
+    client_options.user = "rejected";
+    client_options.connect_timeout_ms = 5000;
+
+    try {
+        (void)mysql2::create_connection(client_options);
+        FAIL() << "expected server auth rejection";
+    } catch (const mysql2::Error& error) {
+        EXPECT_EQ(error.code(), 1045);
+        EXPECT_EQ(error.sql_state(), "28000");
+    }
+
+    server.close();
 }
 
 TEST(mysql2_integration, query_against_real_database_when_configured) {

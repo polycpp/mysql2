@@ -271,6 +271,50 @@ private:
     std::size_t offset_ = 0;
 };
 
+class ServerConnection;
+
+struct ServerAuthInfo {
+    std::string user;
+    std::string database;
+    std::string address;
+    uint16_t port = 0;
+    uint32_t client_flags = 0;
+    uint16_t charset_number = 0;
+    std::string auth_plugin_name;
+    Buffer auth_token;
+    std::unordered_map<std::string, std::string> connect_attributes;
+};
+
+struct ServerStatementExecuteInfo {
+    uint32_t statement_id = 0;
+    uint8_t flags = 0;
+    uint32_t iteration_count = 0;
+    std::vector<Value> values;
+    std::string query;
+    Buffer raw_payload;
+};
+
+using ServerAuthCallback = std::function<std::optional<Error>(const ServerAuthInfo&)>;
+
+struct ServerHandshakeOptions {
+    uint8_t protocol_version = 10;
+    std::string server_version = "polycpp-mysql2";
+    uint32_t connection_id = 1;
+    uint32_t capability_flags = 0;
+    uint8_t character_set = 224;
+    uint16_t status_flags = 2;
+    std::string auth_plugin_name = "mysql_native_password";
+    ServerAuthCallback auth_callback;
+};
+
+struct ServerOptions {
+    std::string host = "127.0.0.1";
+    uint16_t port = 0;
+    int backlog = 128;
+    bool auto_handshake = true;
+    ServerHandshakeOptions handshake;
+};
+
 using VoidCallback = std::function<void(std::exception_ptr)>;
 using OkCallback = std::function<void(std::exception_ptr, OkPacket)>;
 using QueryCallback = std::function<void(std::exception_ptr, QueryResult)>;
@@ -438,6 +482,64 @@ private:
     Impl* impl_ = nullptr;
 };
 
+class ServerConnection : public events::EventEmitterForwarder {
+public:
+    ~ServerConnection();
+
+    ServerConnection(ServerConnection&&) noexcept;
+    ServerConnection& operator=(ServerConnection&&) noexcept;
+
+    ServerConnection(const ServerConnection&) = delete;
+    ServerConnection& operator=(const ServerConnection&) = delete;
+
+    void server_handshake(ServerHandshakeOptions options = {});
+    void write_ok(OkPacket ok = {});
+    void write_error(uint16_t code, const std::string& sql_state, const std::string& message);
+    void write_error(const Error& error);
+    void write_text_result(const QueryResult& result);
+    void write_text_result(const std::vector<Row>& rows, const std::vector<Field>& fields);
+    void close() noexcept;
+
+    bool connected() const noexcept;
+    const ServerAuthInfo& auth_info() const noexcept;
+    std::string remote_address() const;
+    uint16_t remote_port() const;
+
+private:
+    friend class ServerImpl;
+    class Impl;
+    explicit ServerConnection(std::shared_ptr<Impl> impl);
+
+    std::shared_ptr<Impl> impl_;
+};
+
+class ServerImpl;
+
+class Server : public events::EventEmitterForwarder {
+public:
+    explicit Server(ServerOptions options = {});
+    ~Server();
+
+    Server(Server&&) noexcept;
+    Server& operator=(Server&&) noexcept;
+
+    Server(const Server&) = delete;
+    Server& operator=(const Server&) = delete;
+
+    void listen();
+    void listen(uint16_t port);
+    void listen(uint16_t port, const std::string& host);
+    void close();
+
+    bool listening() const noexcept;
+    std::string address() const;
+    uint16_t port() const noexcept;
+    std::size_t connection_count() const noexcept;
+
+private:
+    std::shared_ptr<ServerImpl> impl_;
+};
+
 class PoolImpl;
 
 class PoolConnection {
@@ -557,6 +659,7 @@ Promise<std::shared_ptr<Connection>> create_connection_promise(ConnectionOptions
 Pool create_pool(PoolOptions options);
 Pool create_pool(const std::string& uri);
 PoolCluster create_pool_cluster(PoolClusterOptions options = {});
+Server create_server(ServerOptions options = {});
 QueryResult query(ConnectionOptions options, const std::string& sql);
 Promise<QueryResult> query_promise(ConnectionOptions options, const std::string& sql);
 
@@ -574,6 +677,15 @@ inline constexpr events::TypedEvent<"online", const std::string&> Online{};
 inline constexpr events::TypedEvent<"offline", const std::string&> Offline{};
 inline constexpr events::TypedEvent<"remove", const std::string&> Remove{};
 inline constexpr events::TypedEvent<"warn", const Error&> Warn{};
+inline constexpr events::TypedEvent<"connection", ServerConnection&> ServerConnectionAccepted{};
+inline constexpr events::TypedEvent<"query", ServerConnection&, const std::string&> ServerQuery{};
+inline constexpr events::TypedEvent<"ping", ServerConnection&> ServerPing{};
+inline constexpr events::TypedEvent<"quit", ServerConnection&> ServerQuit{};
+inline constexpr events::TypedEvent<"init_db", ServerConnection&, const std::string&> ServerInitDb{};
+inline constexpr events::TypedEvent<"field_list", ServerConnection&, const std::string&, const std::string&> ServerFieldList{};
+inline constexpr events::TypedEvent<"stmt_prepare", ServerConnection&, const std::string&> ServerStatementPrepare{};
+inline constexpr events::TypedEvent<"stmt_execute", ServerConnection&, const ServerStatementExecuteInfo&> ServerStatementExecute{};
+inline constexpr events::TypedEvent<"packet", ServerConnection&, const Buffer&, bool, uint8_t> ServerPacket{};
 }  // namespace event
 
 namespace constants {
@@ -647,6 +759,16 @@ struct ErrorEventOf<mysql2::Pool> {
 
 template <>
 struct ErrorEventOf<mysql2::PoolCluster> {
+    static constexpr auto value = mysql2::event::Error_;
+};
+
+template <>
+struct ErrorEventOf<mysql2::Server> {
+    static constexpr auto value = mysql2::event::Error_;
+};
+
+template <>
+struct ErrorEventOf<mysql2::ServerConnection> {
     static constexpr auto value = mysql2::event::Error_;
 };
 }  // namespace polycpp::events

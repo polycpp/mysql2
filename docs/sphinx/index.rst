@@ -17,18 +17,20 @@ Supported scope
 - Callback overloads, ``polycpp::Promise`` wrappers, typed events, connection URI parsing, compression, and LOCAL INFILE handler hooks.
 - Trace events, connect and command timeout enforcement, AWS RDS TLS profile CA data, and parser-cache compatibility hooks.
 - Bounded register-slave/binlog-dump commands with typed parsing for common binlog event records.
+- Adapted server protocol mode with typed command events and OK/ERR/text-result response writers.
 - Query stream adaptation through typed rows and newline-delimited JSON ``Buffer`` chunks.
 - SQL escaping, identifier escaping, positional formatting, and named formatting helpers.
 
 Not full upstream parity
 ------------------------
 
-The JavaScript server, GTID replication, continuous binlog object streams, full
-row-event decoding, and exact Node ``Readable`` object-mode row chunks are
-intentionally not part of the current C++ surface. Callback, Promise,
-EventEmitter, trace, query attributes, command timeouts, cursor fetch,
-compression, LOCAL INFILE, URI, parser-cache
-compatibility, and pool-cluster surfaces are implemented with C++ adaptations.
+Unix socket server listen overloads, TLS server mode, GTID replication,
+continuous binlog object streams, full row-event decoding, and exact Node
+``Readable`` object-mode row chunks are intentionally not part of the current
+C++ surface. Callback, Promise, EventEmitter, trace, query attributes, command
+timeouts, cursor fetch, compression, LOCAL INFILE, URI, parser-cache
+compatibility, server mode, and pool-cluster surfaces are implemented with C++
+adaptations.
 See
 ``docs/divergences.md`` in the repository for the detailed list.
 

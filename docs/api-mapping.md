@@ -49,7 +49,10 @@
 | `ResultSetHeader` / OK packet | `OkPacket` | adapted | Affected rows, insert id, status, warnings, info. |
 | `Types`, `FieldFlags` constants | `polycpp::mysql2::constants::*` | direct | Protocol constants exposed for result interpretation. |
 | `createBinlogStream`, `_registerSlave`, `_binlogDump` | `Connection::register_slave(...)`, `Connection::binlog_dump(...)`, `parse_binlog_event_packet(...)` | adapted | Provides bounded synchronous replication command support. Query, Rotate, FormatDescription, and Xid events are typed; unknown events retain raw bytes. GTID dump and continuous stream abstraction remain deferred. |
-| server APIs | none | deferred | Server-side protocol mode is separate from the client connection surface and remains deferred. |
+| `createServer`, `Server#listen`, `Server#close` | `create_server(ServerOptions)`, `Server::listen(...)`, `Server::close()` | adapted | TCP listener built on `polycpp::io::TcpAcceptor`. Unix socket listen overloads are not included in the C++ API. |
+| `Connection#serverHandshake(args)` in server mode | `ServerConnection::server_handshake(ServerHandshakeOptions)` | adapted | Sends a MySQL protocol v10 server greeting, parses the client handshake response, exposes `ServerAuthInfo`, and supports an auth callback that can fail closed with an ERR packet. |
+| server command events: `query`, `ping`, `quit`, `init_db`, `field_list`, `stmt_prepare`, `stmt_execute`, `packet` | typed `event::ServerQuery`, `ServerPing`, `ServerQuit`, `ServerInitDb`, `ServerFieldList`, `ServerStatementPrepare`, `ServerStatementExecute`, `ServerPacket` | adapted | Event callbacks receive a `ServerConnection&` and typed payloads. `stmt_execute` receives `ServerStatementExecuteInfo` with parsed id/flags/iteration, raw payload, and best-effort values. Handlers write explicit OK/ERR/result responses where needed. |
+| server response writers: `writeOk`, `writeError`, `writeTextResult` | `ServerConnection::write_ok`, `write_error`, `write_text_result` | adapted | Provides OK, ERR, and text resultset packet writers. Binary row writing and a SQL execution engine are not implied by server mode. |
 | parser cache controls | `set_max_parser_cache(...)`, `max_parser_cache()`, `clear_parser_cache()` | adapted | Compatibility hooks only. The static C++ parser has no generated parser cache to clear. |
 | `node:diagnostics_channel` tracing | `event::Trace` / `TraceEvent` | adapted | Emits typed start/success/error events for connect/query/execute through the existing `polycpp::events::EventEmitter` surface. |
 
@@ -58,7 +61,7 @@
 - Upstream reads or mutates framework/request/response/context objects: no HTTP or web framework objects are involved; upstream reads and writes MySQL connection, socket, command, packet, and config objects.
 - Upstream fields or methods read: connection options, SSL options, server capability flags, auth plugin names, packet buffers, field metadata, and command state.
 - Upstream fields or methods written: connection authorization state, packet sequence ids, command queues, auth plugin state, parser caches, result arrays, and pool queues.
-- C++ adapter boundary: public API exposes `ConnectionOptions`, `SslOptions`, `Connection`, `PreparedStatement`, `PoolOptions`, `Pool`, `QueryResult`, `Field`, `Row`, and `Value`; packet sequencing and auth state remain private in `src/mysql2.cpp`.
+- C++ adapter boundary: public API exposes `ConnectionOptions`, `SslOptions`, `Connection`, `PreparedStatement`, `PoolOptions`, `Pool`, `Server`, `ServerConnection`, `QueryResult`, `Field`, `Row`, and `Value`; packet sequencing and auth state remain private in `src/mysql2.cpp`.
 - Partial mutation risk on validation failure: connection setup throws before marking the connection connected; unsupported auth and malformed packets fail closed. Single-result APIs drain unexpected additional result sets before throwing so the connection remains synchronized.
 
 No polycpp HTTP request, response, or header type should be introduced for this package. The relevant ecosystem boundary is polycpp Buffer, crypto, IO, TLS, and companion charset decoding.
@@ -67,9 +70,9 @@ No polycpp HTTP request, response, or header type should be introduced for this 
 
 - Callback APIs: supported as `std::function` overloads for public connection, pool, and cluster operations; callbacks receive `std::exception_ptr` plus typed result values.
 - Promise APIs: supported through `polycpp::Promise` wrappers for connect, query, execute, prepare, transaction helpers, ping, reset, change-user, end, register-slave/binlog-dump, pool queries, and cluster queries.
-- EventEmitter APIs: supported through typed `polycpp::events::EventEmitter` forwarding on `Connection`, `Pool`, and `PoolCluster`; event names are exposed as constants.
+- EventEmitter APIs: supported through typed `polycpp::events::EventEmitter` forwarding on `Connection`, `Pool`, `PoolCluster`, `Server`, and `ServerConnection`; event names are exposed as constants.
 - Stream APIs: `Query#stream()` is adapted to `Connection::query_stream(...)` for typed rows and `Connection::query_stream_json(...)`, a `polycpp::stream::Readable` of newline-delimited JSON `Buffer` chunks.
 - Buffer and binary APIs: mapped to `polycpp::Buffer` for wire packets, binary SQL values, binary result columns, and LOCAL INFILE chunk uploads.
 - URL, timer, process, and filesystem APIs: URI parsing maps to `polycpp::url`; connect and command inactivity deadlines use `polycpp::io::Timer`; pool wait settings use C++ chrono; process APIs are not public; filesystem access is limited to explicit TLS file options and caller-provided LOCAL INFILE data.
-- Crypto, compression, TLS, network, and HTTP APIs: auth crypto maps to `polycpp::crypto`; compression maps to `polycpp::zlib`; TCP/TLS maps to `polycpp::io`/`polycpp::ssl`; HTTP is not part of this driver boundary.
-- Unsupported or non-meaningful Node-specific APIs and audit reason: exact Node `Readable` object-mode row chunks, server mode, GTID replication, continuous binlog object streams, and full row-event decoding remain deferred as documented in `docs/divergences.md`.
+- Crypto, compression, TLS, network, and HTTP APIs: auth crypto maps to `polycpp::crypto`; compression maps to `polycpp::zlib`; client TCP/TLS maps to `polycpp::io`/`polycpp::ssl`; server TCP listening maps to `polycpp::io::TcpAcceptor`; HTTP is not part of this driver boundary.
+- Unsupported or non-meaningful Node-specific APIs and audit reason: exact Node `Readable` object-mode row chunks, Unix socket server listen overloads, TLS server mode, GTID replication, continuous binlog object streams, and full row-event decoding remain deferred as documented in `docs/divergences.md`.

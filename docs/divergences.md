@@ -21,12 +21,13 @@
 - Server-side prepared-statement cursors are explicit `StatementCursor` objects. Callers fetch batches with `Connection::fetch(...)` and close the underlying prepared statement when they are done.
 - Charset and collation ids are mapped from upstream mysql2 constants and string conversion reuses the `iconv-lite` companion where polycpp Buffer does not already support the encoding. Handshake charset still must fit MySQL's one-byte handshake field.
 - Connection attributes are sent during both the initial handshake and `COM_CHANGE_USER` when the server advertises connect-attribute capability.
+- Server mode is adapted to explicit `Server` and `ServerConnection` objects rather than reusing the client `Connection`. It supports TCP listening, server handshake/auth inspection, typed command events including statement prepare/execute, raw packet observation, and OK/ERR/text-result writers. It does not imply a SQL execution engine, binary row writer parity, Unix socket listening, or TLS server mode.
 
 ## Deferred Features
 
-- Server mode is deferred because it requires a separate server-side connection object, handshake/auth dispatcher, and response-writing API rather than extending the client `Connection`.
 - GTID binlog dump, continuous replication stream abstraction, and full row/table-map event decoding are deferred.
 - Exact Node `Readable` object-mode row chunks are deferred until polycpp stream supports arbitrary typed payload chunks.
+- Unix socket server listen overloads, TLS server mode, and binary server row writers are deferred until there is a concrete downstream need and matching polycpp integration design.
 
 ## Security-Driven Behavior Changes
 

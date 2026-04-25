@@ -39,11 +39,11 @@ Implemented:
 - AWS RDS TLS profile CA data from `aws-ssl-profiles@1.1.2` via `SslOptions::profile = "Amazon RDS"`.
 - Parser-cache compatibility controls as no-op/static-parser audit hooks.
 - Bounded `COM_REGISTER_SLAVE` and `COM_BINLOG_DUMP` support with typed parsing for Query, Rotate, FormatDescription, and Xid events, plus raw payload retention for unknown event types.
+- Adapted server protocol mode with `create_server`, `Server`, `ServerConnection`, server-side protocol handshake/auth callback, typed query/ping/quit/init-db/field-list/statement command events, and OK/ERR/text-result response writers.
 - Optional real MariaDB/MySQL e2e tests controlled by `MYSQL2_TEST_*` environment variables.
 
 Deferred:
 
-- Server mode.
 - GTID binlog dump, continuous replication stream abstraction, and full row/table-map event decoding.
 - Exact Node `Readable` object-mode row chunks. `query_stream(...)` provides a typed C++ row iterator and `query_stream_json()` exposes newline-delimited JSON `Buffer` chunks because polycpp streams currently emit byte/text chunks, not arbitrary row objects.
 
@@ -53,6 +53,7 @@ Known divergences:
 - Native MySQL/MariaDB client SDKs are intentionally not linked.
 - Node diagnostic channels are adapted to typed `event::Trace` events.
 - Node object-mode row streaming is adapted to typed `RowStream` rows plus JSON line byte streams for auditability and `polycpp::stream` compatibility.
+- Server mode is adapted to a TCP-only C++ server object. It supports handshake/auth inspection, command dispatch, packet observation, and basic OK/ERR/text-result writers; Unix socket listen overloads, TLS server mode, and a full SQL engine are intentionally not implied.
 - Parser cache controls are compatibility no-ops because C++ uses static parsers.
 - Query attributes use `std::unordered_map`, so attribute wire order is not a public contract.
 - Bounded binlog dump closes the connection if `max_events` is reached before EOF, because the connection is otherwise left in the replication command stream.
@@ -159,6 +160,32 @@ for (const auto& event : events) {
         (void)event.query;
     }
 }
+```
+
+Adapted server mode:
+
+```cpp
+polycpp::mysql2::ServerOptions server_options;
+server_options.handshake.server_version = "polycpp-mysql2";
+
+auto server = polycpp::mysql2::create_server(server_options);
+server.on(polycpp::mysql2::event::ServerConnectionAccepted,
+    [](polycpp::mysql2::ServerConnection& connection) {
+        connection.on(polycpp::mysql2::event::ServerQuery,
+            [](polycpp::mysql2::ServerConnection& conn, const std::string& sql) {
+                (void)sql;
+
+                polycpp::mysql2::Field field;
+                field.name = "one";
+                field.column_type = polycpp::mysql2::constants::column_type::LONG;
+
+                polycpp::mysql2::Row row;
+                row.values = {int64_t{1}};
+
+                conn.write_text_result({row}, {field});
+            });
+    });
+server.listen(3307);
 ```
 
 TLS:

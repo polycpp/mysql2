@@ -30,6 +30,13 @@ Core types
 ``PoolOptions``, ``Pool``, ``PoolConnection``
     Synchronous RAII connection pooling.
 
+``ServerOptions``, ``ServerHandshakeOptions``, ``ServerAuthInfo``
+    Adapted server protocol configuration and parsed client handshake data.
+
+``Server``, ``ServerConnection``
+    TCP server listener and per-client protocol connection with typed command
+    events and OK/ERR/text-result writers.
+
 ``QueryResult``, ``OkPacket``, ``Field``, ``Row``, ``Value``
     Result metadata and typed row values.
 
@@ -41,6 +48,9 @@ Free functions
 
 ``create_pool``
     Construct a ``Pool``.
+
+``create_server``
+    Construct an adapted MySQL protocol server.
 
 ``query``
     One-shot connect/query/end helper.

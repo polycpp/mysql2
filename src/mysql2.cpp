@@ -5,6 +5,7 @@
 #include <polycpp/crypto.hpp>
 #include <polycpp/iconv_lite/iconv_lite.hpp>
 #include <polycpp/io/event_context.hpp>
+#include <polycpp/io/tcp_acceptor.hpp>
 #include <polycpp/io/tcp_socket.hpp>
 #include <polycpp/io/timer.hpp>
 #include <polycpp/io/tls_context.hpp>
@@ -32,9 +33,12 @@
 #include <optional>
 #include <random>
 #include <sstream>
+#include <thread>
 #include <system_error>
 #include <type_traits>
 #include <utility>
+
+#include <sys/socket.h>
 
 namespace polycpp::mysql2 {
 namespace {
@@ -68,7 +72,9 @@ constexpr uint32_t MULTI_FACTOR_AUTHENTICATION = 0x10000000;
 
 namespace command_code {
 constexpr uint8_t QUIT = 0x01;
+constexpr uint8_t INIT_DB = 0x02;
 constexpr uint8_t QUERY = 0x03;
+constexpr uint8_t FIELD_LIST = 0x04;
 constexpr uint8_t CHANGE_USER = 0x11;
 constexpr uint8_t BINLOG_DUMP = 0x12;
 constexpr uint8_t REGISTER_SLAVE = 0x15;
@@ -1431,6 +1437,359 @@ Buffer build_change_user_payload(const ConnectionOptions& options,
         append_connect_attributes(out, options, charset_encoding(options.charset_number));
     }
     return buffer_from_bytes(out);
+}
+
+uint32_t default_server_capability_flags() {
+    return client_flag::LONG_PASSWORD |
+           client_flag::FOUND_ROWS |
+           client_flag::LONG_FLAG |
+           client_flag::PROTOCOL_41 |
+           client_flag::TRANSACTIONS |
+           client_flag::SECURE_CONNECTION |
+           client_flag::MULTI_RESULTS |
+           client_flag::PS_MULTI_RESULTS |
+           client_flag::PLUGIN_AUTH |
+           client_flag::PLUGIN_AUTH_LENENC_CLIENT_DATA |
+           client_flag::SESSION_TRACK |
+           client_flag::CONNECT_ATTRS;
+}
+
+Buffer random_scramble() {
+    std::array<uint8_t, 20> bytes{};
+    std::random_device rd;
+    for (auto& byte : bytes) {
+        auto value = rd();
+        byte = static_cast<uint8_t>(value & 0xff);
+        if (byte == 0) {
+            byte = 1;
+        }
+    }
+    return Buffer::from(bytes.data(), bytes.size());
+}
+
+Buffer build_server_handshake_payload(const ServerHandshakeOptions& options, const Buffer& scramble) {
+    const auto capability_flags = options.capability_flags == 0
+        ? default_server_capability_flags()
+        : options.capability_flags;
+    const auto auth_plugin = options.auth_plugin_name.empty()
+        ? std::string("mysql_native_password")
+        : options.auth_plugin_name;
+    const auto auth1 = scramble.length() >= 8 ? scramble.slice(0, 8) : scramble;
+    const auto auth2 = scramble.length() > 8 ? scramble.slice(8, std::min<std::size_t>(20, scramble.length())) : Buffer{};
+
+    std::vector<uint8_t> payload;
+    payload.reserve(80 + options.server_version.size() + auth_plugin.size());
+    append_u8(payload, options.protocol_version);
+    append_null_string(payload, options.server_version);
+    append_u32_le(payload, options.connection_id);
+    append_bytes(payload, auth1);
+    for (std::size_t i = auth1.length(); i < 8; ++i) {
+        append_u8(payload, 1);
+    }
+    append_u8(payload, 0);
+    append_u16_le(payload, static_cast<uint16_t>(capability_flags & 0xffff));
+    append_u8(payload, options.character_set);
+    append_u16_le(payload, options.status_flags);
+    append_u16_le(payload, static_cast<uint16_t>((capability_flags >> 16) & 0xffff));
+    append_u8(payload, 21);
+    payload.insert(payload.end(), 10, 0);
+    append_bytes(payload, auth2);
+    for (std::size_t i = auth2.length(); i < 12; ++i) {
+        append_u8(payload, 1);
+    }
+    append_u8(payload, 0);
+    append_null_string(payload, auth_plugin);
+    return buffer_from_bytes(payload);
+}
+
+ServerAuthInfo parse_server_handshake_response(const Buffer& payload,
+                                               uint32_t server_flags,
+                                               const std::string& address,
+                                               uint16_t port) {
+    PacketCursor cursor(payload);
+    ServerAuthInfo info;
+    info.address = address;
+    info.port = port;
+    info.client_flags = cursor.read_u32_le();
+    cursor.read_u32_le();  // max packet size
+    info.charset_number = cursor.read_u8();
+    const auto encoding = charset_encoding(info.charset_number);
+    cursor.skip(23);
+    info.user = PacketCursor::decode_buffer(buffer_from_string(cursor.read_null_terminated_ascii()), encoding);
+
+    const auto flag_enabled = [&](uint32_t flag) {
+        return (info.client_flags & server_flags & flag) != 0;
+    };
+    if (flag_enabled(client_flag::PLUGIN_AUTH_LENENC_CLIENT_DATA)) {
+        const auto length = cursor.read_lenenc_int().value_or(0);
+        info.auth_token = cursor.read_buffer(static_cast<std::size_t>(length));
+    } else if (flag_enabled(client_flag::SECURE_CONNECTION)) {
+        info.auth_token = cursor.read_buffer(cursor.read_u8());
+    } else {
+        const auto start = cursor.offset();
+        auto token = cursor.read_null_terminated_ascii();
+        info.auth_token = buffer_from_string(token);
+        (void)start;
+    }
+    if (flag_enabled(client_flag::CONNECT_WITH_DB) && cursor.has_more()) {
+        info.database = PacketCursor::decode_buffer(buffer_from_string(cursor.read_null_terminated_ascii()), encoding);
+    }
+    if (flag_enabled(client_flag::PLUGIN_AUTH) && cursor.has_more()) {
+        info.auth_plugin_name = PacketCursor::decode_buffer(buffer_from_string(cursor.read_null_terminated_ascii()), encoding);
+    }
+    if (flag_enabled(client_flag::CONNECT_ATTRS) && cursor.has_more()) {
+        const auto attrs_length = cursor.read_lenenc_int().value_or(0);
+        const auto attrs_end = cursor.offset() + static_cast<std::size_t>(attrs_length);
+        while (cursor.offset() < attrs_end) {
+            auto key = cursor.read_lenenc_string(encoding).value_or("");
+            auto value = cursor.read_lenenc_string(encoding).value_or("");
+            info.connect_attributes[std::move(key)] = std::move(value);
+        }
+    }
+    return info;
+}
+
+void append_packet_bytes(std::vector<uint8_t>& out, const Buffer& payload, uint8_t& sequence_id) {
+    std::size_t offset = 0;
+    const bool needs_empty_tail = payload.length() > 0 && payload.length() % kMaxPacketPayloadLength == 0;
+    do {
+        const auto chunk_length = std::min<std::size_t>(kMaxPacketPayloadLength, payload.length() - offset);
+        append_u24_le(out, static_cast<uint32_t>(chunk_length));
+        append_u8(out, sequence_id++);
+        if (chunk_length > 0) {
+            out.insert(out.end(), payload.data() + offset, payload.data() + offset + chunk_length);
+        }
+        offset += chunk_length;
+    } while (offset < payload.length());
+    if (needs_empty_tail) {
+        append_u24_le(out, 0);
+        append_u8(out, sequence_id++);
+    }
+}
+
+Buffer build_ok_payload(const OkPacket& ok) {
+    std::vector<uint8_t> payload;
+    append_u8(payload, marker::OK);
+    append_lenenc_int(payload, ok.affected_rows);
+    append_lenenc_int(payload, ok.insert_id);
+    append_u16_le(payload, ok.server_status == 0 ? 2 : ok.server_status);
+    append_u16_le(payload, ok.warning_count);
+    if (!ok.info.empty()) {
+        append_encoded_string(payload, ok.info, "utf8");
+    }
+    return buffer_from_bytes(payload);
+}
+
+Buffer build_eof_payload(uint16_t warnings = 0, uint16_t status = 2) {
+    std::vector<uint8_t> payload;
+    append_u8(payload, marker::EOF_PACKET);
+    append_u16_le(payload, warnings);
+    append_u16_le(payload, status);
+    return buffer_from_bytes(payload);
+}
+
+Buffer build_error_payload(uint16_t code, std::string sql_state, const std::string& message) {
+    if (sql_state.empty()) {
+        sql_state = "HY000";
+    }
+    if (sql_state.size() != 5) {
+        sql_state = "HY000";
+    }
+    std::vector<uint8_t> payload;
+    append_u8(payload, marker::ERR);
+    append_u16_le(payload, code);
+    append_u8(payload, '#');
+    append_string(payload, sql_state);
+    append_encoded_string(payload, message, "utf8");
+    return buffer_from_bytes(payload);
+}
+
+Buffer build_column_definition_payload(Field field) {
+    if (field.catalog.empty()) field.catalog = "def";
+    if (field.character_set == 0) field.character_set = 224;
+    if (field.encoding.empty()) field.encoding = charset_encoding(field.character_set);
+    if (field.column_length == 0) field.column_length = 1024;
+
+    std::vector<uint8_t> payload;
+    append_lenenc_encoded_string(payload, field.catalog, field.encoding);
+    append_lenenc_encoded_string(payload, field.schema, field.encoding);
+    append_lenenc_encoded_string(payload, field.table, field.encoding);
+    append_lenenc_encoded_string(payload, field.org_table, field.encoding);
+    append_lenenc_encoded_string(payload, field.name, field.encoding);
+    append_lenenc_encoded_string(payload, field.org_name, field.encoding);
+    append_u8(payload, 0x0c);
+    append_u16_le(payload, field.character_set);
+    append_u32_le(payload, field.column_length);
+    append_u8(payload, field.column_type);
+    append_u16_le(payload, field.flags);
+    append_u8(payload, field.decimals);
+    append_u16_le(payload, 0);
+    return buffer_from_bytes(payload);
+}
+
+std::string server_value_to_string(const Value& value) {
+    return std::visit([](const auto& item) -> std::string {
+        using T = std::decay_t<decltype(item)>;
+        if constexpr (std::is_same_v<T, std::monostate>) {
+            return {};
+        } else if constexpr (std::is_same_v<T, bool>) {
+            return item ? "1" : "0";
+        } else if constexpr (std::is_same_v<T, int64_t> || std::is_same_v<T, uint64_t>) {
+            return std::to_string(item);
+        } else if constexpr (std::is_same_v<T, double>) {
+            if (!std::isfinite(item)) {
+                return {};
+            }
+            std::ostringstream out;
+            out << item;
+            return out.str();
+        } else if constexpr (std::is_same_v<T, std::string>) {
+            return item;
+        } else if constexpr (std::is_same_v<T, Buffer>) {
+            return item.toString("latin1");
+        } else if constexpr (std::is_same_v<T, RawSql>) {
+            return item.sql;
+        }
+    }, value);
+}
+
+Buffer build_text_row_payload(const Row& row, const std::vector<Field>& fields) {
+    std::vector<uint8_t> payload;
+    for (std::size_t i = 0; i < fields.size(); ++i) {
+        const auto& value = i < row.values.size() ? row.values[i] : Value{std::monostate{}};
+        if (std::holds_alternative<std::monostate>(value)) {
+            append_u8(payload, 0xfb);
+            continue;
+        }
+        if (const auto* buffer = std::get_if<Buffer>(&value)) {
+            append_lenenc_buffer(payload, *buffer);
+            continue;
+        }
+        append_lenenc_encoded_string(payload, server_value_to_string(value),
+                                     fields[i].encoding.empty() ? "utf8" : fields[i].encoding);
+    }
+    return buffer_from_bytes(payload);
+}
+
+std::vector<uint8_t> build_text_result_packets(const std::vector<Row>& rows,
+                                               const std::vector<Field>& fields,
+                                               uint8_t first_sequence) {
+    std::vector<uint8_t> out;
+    uint8_t sequence = first_sequence;
+    std::vector<uint8_t> header;
+    append_lenenc_int(header, fields.size());
+    append_packet_bytes(out, buffer_from_bytes(header), sequence);
+    for (const auto& field : fields) {
+        append_packet_bytes(out, build_column_definition_payload(field), sequence);
+    }
+    append_packet_bytes(out, build_eof_payload(), sequence);
+    for (const auto& row : rows) {
+        append_packet_bytes(out, build_text_row_payload(row, fields), sequence);
+    }
+    append_packet_bytes(out, build_eof_payload(), sequence);
+    return out;
+}
+
+bool is_server_execute_supported_type(uint8_t type) {
+    using namespace constants::column_type;
+    switch (type) {
+        case NULL_TYPE:
+        case TINY:
+        case SHORT:
+        case LONG:
+        case LONGLONG:
+        case FLOAT:
+        case DOUBLE:
+        case VAR_STRING:
+        case STRING:
+        case VARCHAR:
+        case JSON:
+            return true;
+        default:
+            return false;
+    }
+}
+
+Value read_server_execute_value(PacketCursor& cursor, uint8_t type, const std::string& encoding) {
+    using namespace constants::column_type;
+    switch (type) {
+        case NULL_TYPE:
+            return std::monostate{};
+        case TINY:
+            return static_cast<int64_t>(cursor.read_i8());
+        case SHORT:
+            return static_cast<int64_t>(cursor.read_i16_le());
+        case LONG:
+            return static_cast<int64_t>(cursor.read_i32_le());
+        case LONGLONG:
+            return cursor.read_i64_le();
+        case FLOAT:
+            return static_cast<double>(cursor.read_float_le());
+        case DOUBLE:
+            return cursor.read_double_le();
+        case VAR_STRING:
+        case STRING:
+        case VARCHAR:
+        case JSON:
+            return cursor.read_lenenc_string(encoding).value_or("");
+        default:
+            return std::monostate{};
+    }
+}
+
+ServerStatementExecuteInfo parse_server_statement_execute_payload(const Buffer& payload,
+                                                                  const std::string& encoding) {
+    PacketCursor cursor(payload);
+    ServerStatementExecuteInfo info;
+    info.raw_payload = payload;
+    info.statement_id = cursor.read_u32_le();
+    info.flags = cursor.read_u8();
+    info.iteration_count = cursor.read_u32_le();
+
+    try {
+        std::size_t bind_flag_offset = std::string::npos;
+        for (std::size_t i = cursor.offset(); i + 2 < payload.length(); ++i) {
+            if (payload[i] == 1 &&
+                is_server_execute_supported_type(payload[i + 1]) &&
+                payload[i + 2] == 0) {
+                bind_flag_offset = i;
+                break;
+            }
+        }
+        if (bind_flag_offset == std::string::npos) {
+            return info;
+        }
+
+        PacketCursor type_cursor(payload);
+        type_cursor.skip(bind_flag_offset + 1);
+        std::vector<uint8_t> types;
+        while (type_cursor.offset() + 1 < payload.length()) {
+            const auto type = payload[type_cursor.offset()];
+            const auto unsigned_flag = payload[type_cursor.offset() + 1];
+            if (!is_server_execute_supported_type(type) || unsigned_flag != 0) {
+                break;
+            }
+            types.push_back(type);
+            type_cursor.skip(2);
+        }
+
+        PacketCursor value_cursor(payload);
+        value_cursor.skip(type_cursor.offset());
+        for (const auto type : types) {
+            info.values.push_back(read_server_execute_value(value_cursor, type, encoding));
+        }
+    } catch (const std::exception&) {
+        info.values.clear();
+    }
+    return info;
+}
+
+bool is_server_statement_text(const std::string& sql, const std::string& statement_name) {
+    auto first = sql.substr(0, sql.find_first_of(" \t\r\n"));
+    std::transform(first.begin(), first.end(), first.begin(), [](unsigned char c) {
+        return static_cast<char>(std::toupper(c));
+    });
+    return first == statement_name;
 }
 
 bool looks_like_ip_address(const std::string& host) {
@@ -4532,6 +4891,573 @@ uint32_t Connection::connection_id() const noexcept { return impl_->connection_i
 
 uint32_t Connection::server_capability_flags() const noexcept { return impl_->server_capability_flags(); }
 
+class ServerConnection::Impl : public std::enable_shared_from_this<ServerConnection::Impl> {
+public:
+    Impl(io::TcpSocket socket, EventContext& ctx)
+        : ctx_(ctx), socket_(std::move(socket)) {}
+
+    ~Impl() {
+        close();
+    }
+
+    events::EventEmitter& emitter() noexcept { return emitter_; }
+
+    void set_owner(ServerConnection* owner) noexcept { owner_ = owner; }
+
+    void server_handshake(ServerHandshakeOptions options) {
+        if (handshake_started_) {
+            return;
+        }
+        handshake_started_ = true;
+        handshake_options_ = std::move(options);
+        if (handshake_options_.capability_flags == 0) {
+            handshake_options_.capability_flags = default_server_capability_flags();
+        }
+        if (handshake_options_.auth_plugin_name.empty()) {
+            handshake_options_.auth_plugin_name = "mysql_native_password";
+        }
+        scramble_ = random_scramble();
+        uint8_t sequence = 0;
+        std::vector<uint8_t> packet;
+        append_packet_bytes(packet, build_server_handshake_payload(handshake_options_, scramble_), sequence);
+        write_raw(std::move(packet));
+        read_packet();
+    }
+
+    void write_ok(OkPacket ok) {
+        std::vector<uint8_t> packet;
+        uint8_t sequence = next_response_sequence_;
+        append_packet_bytes(packet, build_ok_payload(ok), sequence);
+        next_response_sequence_ = sequence;
+        write_raw(std::move(packet));
+    }
+
+    void write_error(uint16_t code, const std::string& sql_state, const std::string& message) {
+        std::vector<uint8_t> packet;
+        uint8_t sequence = next_response_sequence_;
+        append_packet_bytes(packet, build_error_payload(code, sql_state, message), sequence);
+        next_response_sequence_ = sequence;
+        write_raw(std::move(packet));
+    }
+
+    void write_text_result(const std::vector<Row>& rows, const std::vector<Field>& fields) {
+        write_raw(build_text_result_packets(rows, fields, next_response_sequence_));
+    }
+
+    void close() noexcept {
+        connected_ = false;
+        std::error_code ec;
+        socket_.shutdown(2, ec);
+        socket_.close(ec);
+    }
+
+    bool connected() const noexcept { return connected_ && socket_.isOpen(); }
+
+    const ServerAuthInfo& auth_info() const noexcept { return auth_info_; }
+
+    std::string remote_address() const { return socket_.remoteAddress(); }
+
+    uint16_t remote_port() const { return socket_.remotePort(); }
+
+private:
+    struct Frame {
+        uint8_t sequence_id = 0;
+        Buffer payload;
+    };
+
+    struct ReadState {
+        uint8_t first_sequence = 0;
+        bool first = true;
+        std::vector<Buffer> parts;
+    };
+
+    void emit_error(const Error& error) {
+        if (emitter_.listenerCount(event::Error_) > 0) {
+            emitter_.emit(event::Error_, error);
+        }
+    }
+
+    void fail(const Error& error) {
+        emit_error(error);
+        close();
+    }
+
+    void read_packet() {
+        if (!connected() && handshake_started_) {
+            return;
+        }
+        read_packet_part(std::make_shared<ReadState>());
+    }
+
+    void read_packet_part(std::shared_ptr<ReadState> state) {
+        auto self = shared_from_this();
+        auto header = std::make_shared<std::array<uint8_t, 4>>();
+        socket_.asyncRead(header->data(), header->size(), [self, state, header](std::error_code ec, std::size_t n) {
+            if (ec) {
+                self->close();
+                return;
+            }
+            if (n != header->size()) {
+                self->fail(Error("mysql2 server connection ended before packet header was complete"));
+                return;
+            }
+            const auto length = static_cast<uint32_t>((*header)[0] | ((*header)[1] << 8) | ((*header)[2] << 16));
+            const auto sequence_id = (*header)[3];
+            if (state->first) {
+                state->first_sequence = sequence_id;
+                state->first = false;
+            }
+            auto body = std::make_shared<std::vector<uint8_t>>(length);
+            if (length == 0) {
+                state->parts.push_back(Buffer{});
+                self->handle_packet(Frame{state->first_sequence, Buffer::concat(state->parts)});
+                return;
+            }
+            self->socket_.asyncRead(body->data(), body->size(), [self, state, body, length](std::error_code body_ec, std::size_t body_n) {
+                if (body_ec) {
+                    self->close();
+                    return;
+                }
+                if (body_n != body->size()) {
+                    self->fail(Error("mysql2 server connection ended before packet payload was complete"));
+                    return;
+                }
+                state->parts.push_back(Buffer::from(body->data(), body->size()));
+                if (length == kMaxPacketPayloadLength) {
+                    self->read_packet_part(state);
+                    return;
+                }
+                self->handle_packet(Frame{state->first_sequence, Buffer::concat(state->parts)});
+            });
+        });
+    }
+
+    void handle_packet(const Frame& frame) {
+        try {
+            if (phase_ == Phase::HandshakeResponse) {
+                handle_handshake_response(frame);
+            } else {
+                handle_command(frame);
+            }
+        } catch (const Error& error) {
+            fail(error);
+        } catch (const std::exception& error) {
+            fail(Error(error.what()));
+        }
+    }
+
+    void handle_handshake_response(const Frame& frame) {
+        next_response_sequence_ = static_cast<uint8_t>(frame.sequence_id + 1);
+        auth_info_ = parse_server_handshake_response(frame.payload,
+                                                     handshake_options_.capability_flags,
+                                                     remote_address(),
+                                                     remote_port());
+        if (handshake_options_.auth_callback) {
+            auto auth_error = handshake_options_.auth_callback(auth_info_);
+            if (auth_error) {
+                write_error_and_close(auth_error->code() == 0 ? 1045 : auth_error->code(),
+                                      auth_error->sql_state().empty() ? "28000" : auth_error->sql_state(),
+                                      auth_error->what());
+                return;
+            }
+        }
+        phase_ = Phase::Command;
+        connected_ = true;
+        write_ok(OkPacket{});
+        read_packet();
+    }
+
+    void handle_command(const Frame& frame) {
+        if (frame.payload.length() == 0) {
+            fail(Error("empty mysql2 server command packet"));
+            return;
+        }
+        next_response_sequence_ = static_cast<uint8_t>(frame.sequence_id + 1);
+        PacketCursor cursor(frame.payload);
+        const auto command = cursor.read_u8();
+        bool known = true;
+        const auto emit_packet = [&]() {
+            if (owner_ && emitter_.listenerCount(event::ServerPacket) > 0) {
+                emitter_.emit(event::ServerPacket, *owner_, frame.payload, known, command);
+            }
+        };
+
+        switch (command) {
+            case command_code::QUIT:
+                emit_packet();
+                if (owner_ && emitter_.listenerCount(event::ServerQuit) > 0) {
+                    emitter_.emit(event::ServerQuit, *owner_);
+                }
+                close();
+                return;
+            case command_code::PING:
+                emit_packet();
+                if (owner_ && emitter_.listenerCount(event::ServerPing) > 0) {
+                    emitter_.emit(event::ServerPing, *owner_);
+                } else {
+                    write_ok(OkPacket{});
+                }
+                break;
+            case command_code::INIT_DB: {
+                const auto schema = PacketCursor::decode_buffer(cursor.read_rest_buffer(), client_encoding());
+                emit_packet();
+                if (owner_ && emitter_.listenerCount(event::ServerInitDb) > 0) {
+                    emitter_.emit(event::ServerInitDb, *owner_, schema);
+                } else {
+                    write_ok(OkPacket{});
+                }
+                break;
+            }
+            case command_code::FIELD_LIST: {
+                const auto table = cursor.read_null_terminated_ascii();
+                const auto fields = PacketCursor::decode_buffer(cursor.read_rest_buffer(), client_encoding());
+                emit_packet();
+                if (owner_ && emitter_.listenerCount(event::ServerFieldList) > 0) {
+                    emitter_.emit(event::ServerFieldList, *owner_, table, fields);
+                } else {
+                    write_error(1287, "HY000", "COM_FIELD_LIST is deprecated and no field_list handler is configured");
+                }
+                break;
+            }
+            case command_code::QUERY: {
+                const auto sql = PacketCursor::decode_buffer(cursor.read_rest_buffer(), client_encoding());
+                emit_packet();
+                if (owner_ &&
+                    (is_server_statement_text(sql, "PREPARE") || is_server_statement_text(sql, "SET")) &&
+                    emitter_.listenerCount(event::ServerStatementPrepare) > 0) {
+                    emitter_.emit(event::ServerStatementPrepare, *owner_, sql);
+                } else if (owner_ &&
+                           is_server_statement_text(sql, "EXECUTE") &&
+                           emitter_.listenerCount(event::ServerStatementExecute) > 0) {
+                    ServerStatementExecuteInfo info;
+                    info.query = sql;
+                    emitter_.emit(event::ServerStatementExecute, *owner_, info);
+                } else if (owner_ && emitter_.listenerCount(event::ServerQuery) > 0) {
+                    emitter_.emit(event::ServerQuery, *owner_, sql);
+                } else {
+                    write_error(1105, "HY000", "No query handler");
+                }
+                break;
+            }
+            case command_code::STMT_PREPARE: {
+                const auto sql = PacketCursor::decode_buffer(cursor.read_rest_buffer(), client_encoding());
+                emit_packet();
+                if (owner_ && emitter_.listenerCount(event::ServerStatementPrepare) > 0) {
+                    emitter_.emit(event::ServerStatementPrepare, *owner_, sql);
+                } else {
+                    write_error(1105, "HY000", "No query handler for prepared statements");
+                }
+                break;
+            }
+            case command_code::STMT_EXECUTE: {
+                const auto execute_payload = cursor.read_rest_buffer();
+                auto info = parse_server_statement_execute_payload(execute_payload, client_encoding());
+                emit_packet();
+                if (owner_ && emitter_.listenerCount(event::ServerStatementExecute) > 0) {
+                    emitter_.emit(event::ServerStatementExecute, *owner_, info);
+                } else {
+                    write_error(1105, "HY000", "No query handler for execute statements");
+                }
+                break;
+            }
+            default:
+                known = false;
+                emit_packet();
+                write_error(1047, "08S01", "Unknown command");
+                break;
+        }
+        read_packet();
+    }
+
+    std::string client_encoding() const {
+        return auth_info_.charset_number == 0 ? "utf8" : charset_encoding(auth_info_.charset_number);
+    }
+
+    void write_error_and_close(uint16_t code, const std::string& sql_state, const std::string& message) {
+        std::vector<uint8_t> packet;
+        uint8_t sequence = next_response_sequence_;
+        append_packet_bytes(packet, build_error_payload(code, sql_state, message), sequence);
+        next_response_sequence_ = sequence;
+        write_raw(std::move(packet), true);
+    }
+
+    void write_raw(std::vector<uint8_t> bytes, bool close_after_write = false) {
+        if (!socket_.isOpen()) {
+            return;
+        }
+        auto self = shared_from_this();
+        auto data = std::make_shared<std::vector<uint8_t>>(std::move(bytes));
+        socket_.asyncWrite(data->data(), data->size(), [self, data, close_after_write](std::error_code ec, std::size_t) {
+            if (ec) {
+                self->emit_error(Error("mysql2 server socket write failed: " + ec.message()));
+                self->close();
+                return;
+            }
+            if (close_after_write) {
+                self->close();
+            }
+        });
+    }
+
+    enum class Phase {
+        HandshakeResponse,
+        Command
+    };
+
+    EventContext& ctx_;
+    io::TcpSocket socket_;
+    events::EventEmitter emitter_;
+    ServerConnection* owner_ = nullptr;
+    ServerHandshakeOptions handshake_options_;
+    ServerAuthInfo auth_info_;
+    Buffer scramble_;
+    Phase phase_ = Phase::HandshakeResponse;
+    uint8_t next_response_sequence_ = 0;
+    bool handshake_started_ = false;
+    bool connected_ = true;
+};
+
+ServerConnection::ServerConnection(std::shared_ptr<Impl> impl) : impl_(std::move(impl)) {
+    if (impl_) {
+        impl_->set_owner(this);
+        setEmitter_(impl_->emitter());
+    }
+}
+
+ServerConnection::~ServerConnection() {
+    if (impl_) {
+        impl_->close();
+    }
+}
+
+ServerConnection::ServerConnection(ServerConnection&& other) noexcept
+    : impl_(std::move(other.impl_)) {
+    if (impl_) {
+        impl_->set_owner(this);
+        setEmitter_(impl_->emitter());
+    }
+    other.resetEmitter_();
+}
+
+ServerConnection& ServerConnection::operator=(ServerConnection&& other) noexcept {
+    if (this != &other) {
+        if (impl_) {
+            impl_->close();
+        }
+        impl_ = std::move(other.impl_);
+        if (impl_) {
+            impl_->set_owner(this);
+            setEmitter_(impl_->emitter());
+        } else {
+            resetEmitter_();
+        }
+        other.resetEmitter_();
+    }
+    return *this;
+}
+
+void ServerConnection::server_handshake(ServerHandshakeOptions options) { impl_->server_handshake(std::move(options)); }
+
+void ServerConnection::write_ok(OkPacket ok) { impl_->write_ok(ok); }
+
+void ServerConnection::write_error(uint16_t code, const std::string& sql_state, const std::string& message) {
+    impl_->write_error(code, sql_state, message);
+}
+
+void ServerConnection::write_error(const Error& error) {
+    impl_->write_error(error.code() == 0 ? 1105 : error.code(),
+                       error.sql_state().empty() ? "HY000" : error.sql_state(),
+                       error.what());
+}
+
+void ServerConnection::write_text_result(const QueryResult& result) {
+    impl_->write_text_result(result.rows, result.fields);
+}
+
+void ServerConnection::write_text_result(const std::vector<Row>& rows, const std::vector<Field>& fields) {
+    impl_->write_text_result(rows, fields);
+}
+
+void ServerConnection::close() noexcept {
+    if (impl_) {
+        impl_->close();
+    }
+}
+
+bool ServerConnection::connected() const noexcept { return impl_ && impl_->connected(); }
+
+const ServerAuthInfo& ServerConnection::auth_info() const noexcept { return impl_->auth_info(); }
+
+std::string ServerConnection::remote_address() const { return impl_ ? impl_->remote_address() : std::string{}; }
+
+uint16_t ServerConnection::remote_port() const { return impl_ ? impl_->remote_port() : 0; }
+
+class ServerImpl : public std::enable_shared_from_this<ServerImpl> {
+public:
+    explicit ServerImpl(ServerOptions options)
+        : options_(std::move(options)), acceptor_(ctx_) {}
+
+    ~ServerImpl() {
+        close();
+    }
+
+    events::EventEmitter& emitter() noexcept { return emitter_; }
+
+    void listen(std::optional<uint16_t> port = std::nullopt, std::optional<std::string> host = std::nullopt) {
+        if (listening_) {
+            throw Error("mysql2 server is already listening");
+        }
+        if (port) {
+            options_.port = *port;
+        }
+        if (host) {
+            options_.host = *host;
+        }
+        ctx_.restart();
+        const int family = options_.host.find(':') == std::string::npos ? AF_INET : AF_INET6;
+        acceptor_.open(family);
+        acceptor_.setReuseAddress(true);
+        acceptor_.bind(options_.host, options_.port);
+        acceptor_.listen(options_.backlog);
+        local_address_ = acceptor_.localAddress();
+        local_port_ = acceptor_.localPort();
+        listening_ = true;
+        next_connection_id_ = options_.handshake.connection_id == 0 ? 1 : options_.handshake.connection_id;
+        start_accept();
+        thread_ = std::thread([self = shared_from_this()] {
+            self->ctx_.run();
+        });
+    }
+
+    void close() {
+        if (!listening_ && !thread_.joinable()) {
+            return;
+        }
+        listening_ = false;
+        std::error_code ec;
+        acceptor_.close(ec);
+        {
+            std::lock_guard<std::mutex> lock(mutex_);
+            for (auto& connection : connections_) {
+                if (connection) {
+                    connection->close();
+                }
+            }
+            connections_.clear();
+        }
+        ctx_.stop();
+        if (thread_.joinable()) {
+            if (thread_.get_id() != std::this_thread::get_id()) {
+                thread_.join();
+            } else {
+                thread_.detach();
+            }
+        }
+    }
+
+    bool listening() const noexcept { return listening_; }
+
+    const std::string& address() const noexcept { return local_address_; }
+
+    uint16_t port() const noexcept { return local_port_; }
+
+    std::size_t connection_count() const noexcept {
+        std::lock_guard<std::mutex> lock(mutex_);
+        return connections_.size();
+    }
+
+private:
+    void start_accept() {
+        auto self = shared_from_this();
+        acceptor_.asyncAccept([self](std::error_code ec, io::TcpSocket socket) {
+            if (!self->listening_) {
+                return;
+            }
+            if (ec) {
+                if (self->emitter_.listenerCount(event::Error_) > 0) {
+                    self->emitter_.emit(event::Error_, Error("mysql2 server accept failed: " + ec.message()));
+                }
+                self->start_accept();
+                return;
+            }
+            auto impl = std::make_shared<ServerConnection::Impl>(std::move(socket), self->ctx_);
+            auto connection = std::shared_ptr<ServerConnection>(new ServerConnection(std::move(impl)));
+            {
+                std::lock_guard<std::mutex> lock(self->mutex_);
+                self->connections_.push_back(connection);
+            }
+            self->emitter_.emit(event::ServerConnectionAccepted, *connection);
+            if (self->options_.auto_handshake) {
+                auto handshake = self->options_.handshake;
+                handshake.connection_id = self->next_connection_id_++;
+                connection->server_handshake(std::move(handshake));
+            }
+            self->start_accept();
+        });
+    }
+
+    ServerOptions options_;
+    EventContext ctx_;
+    io::TcpAcceptor acceptor_;
+    events::EventEmitter emitter_;
+    std::thread thread_;
+    mutable std::mutex mutex_;
+    std::vector<std::shared_ptr<ServerConnection>> connections_;
+    std::string local_address_;
+    uint16_t local_port_ = 0;
+    uint32_t next_connection_id_ = 1;
+    std::atomic<bool> listening_{false};
+};
+
+Server::Server(ServerOptions options) : impl_(std::make_shared<ServerImpl>(std::move(options))) {
+    setEmitter_(impl_->emitter());
+}
+
+Server::~Server() {
+    if (impl_) {
+        impl_->close();
+    }
+}
+
+Server::Server(Server&& other) noexcept : impl_(std::move(other.impl_)) {
+    if (impl_) {
+        setEmitter_(impl_->emitter());
+    }
+    other.resetEmitter_();
+}
+
+Server& Server::operator=(Server&& other) noexcept {
+    if (this != &other) {
+        if (impl_) {
+            impl_->close();
+        }
+        impl_ = std::move(other.impl_);
+        if (impl_) {
+            setEmitter_(impl_->emitter());
+        } else {
+            resetEmitter_();
+        }
+        other.resetEmitter_();
+    }
+    return *this;
+}
+
+void Server::listen() { impl_->listen(); }
+
+void Server::listen(uint16_t port) { impl_->listen(port, std::nullopt); }
+
+void Server::listen(uint16_t port, const std::string& host) { impl_->listen(port, host); }
+
+void Server::close() { impl_->close(); }
+
+bool Server::listening() const noexcept { return impl_ && impl_->listening(); }
+
+std::string Server::address() const { return impl_ ? impl_->address() : std::string{}; }
+
+uint16_t Server::port() const noexcept { return impl_ ? impl_->port() : 0; }
+
+std::size_t Server::connection_count() const noexcept { return impl_ ? impl_->connection_count() : 0; }
+
 class PoolImpl : public std::enable_shared_from_this<PoolImpl> {
 public:
     explicit PoolImpl(PoolOptions options) : options_(std::move(options)) {
@@ -5252,6 +6178,10 @@ Pool create_pool(const std::string& uri) {
 
 PoolCluster create_pool_cluster(PoolClusterOptions options) {
     return PoolCluster(options);
+}
+
+Server create_server(ServerOptions options) {
+    return Server(std::move(options));
 }
 
 QueryResult query(ConnectionOptions options, const std::string& sql) {
