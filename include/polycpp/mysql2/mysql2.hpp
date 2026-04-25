@@ -219,11 +219,13 @@ struct RegisterSlaveOptions {
 };
 
 struct BinlogDumpOptions {
-    uint32_t binlog_position = 4;
+    uint64_t binlog_position = 4;
     uint16_t flags = 0x01;
     uint32_t server_id = 0;
     std::string filename;
     std::size_t max_events = 1024;
+    bool use_gtid = false;
+    std::string gtid_set;
 };
 
 struct BinlogEventHeader {
@@ -235,10 +237,28 @@ struct BinlogEventHeader {
     uint16_t flags = 0;
 };
 
+struct BinlogRowChange {
+    std::vector<Value> before;
+    std::vector<Value> after;
+    Buffer raw_before;
+    Buffer raw_after;
+};
+
+struct BinlogGtidInterval {
+    uint64_t start = 0;
+    uint64_t end = 0;
+};
+
+struct BinlogGtidSource {
+    std::string sid;
+    std::vector<BinlogGtidInterval> intervals;
+};
+
 struct BinlogEvent {
     std::string name;
     BinlogEventHeader header;
     Buffer raw;
+    Buffer body;
     Buffer status_vars;
     std::string schema;
     std::string query;
@@ -250,6 +270,38 @@ struct BinlogEvent {
     uint8_t event_header_length = 0;
     Buffer event_type_header_lengths;
     uint64_t xid = 0;
+    uint64_t table_id = 0;
+    uint16_t table_flags = 0;
+    std::string table;
+    std::vector<uint8_t> column_types;
+    std::vector<uint16_t> column_metadata;
+    Buffer column_null_bitmap;
+    Buffer columns_present_bitmap;
+    Buffer columns_present_bitmap_after;
+    std::vector<BinlogRowChange> row_changes;
+    uint8_t gtid_flags = 0;
+    std::string gtid_sid;
+    uint64_t gtid_sequence_number = 0;
+    std::vector<BinlogGtidSource> previous_gtids;
+};
+
+class BinlogParser {
+public:
+    BinlogParser();
+    ~BinlogParser();
+
+    BinlogParser(BinlogParser&&) noexcept;
+    BinlogParser& operator=(BinlogParser&&) noexcept;
+
+    BinlogParser(const BinlogParser&) = delete;
+    BinlogParser& operator=(const BinlogParser&) = delete;
+
+    BinlogEvent parse(const Buffer& payload);
+    void clear_table_map();
+
+private:
+    class Impl;
+    std::unique_ptr<Impl> impl_;
 };
 
 class RowStream {
@@ -321,6 +373,7 @@ using QueryCallback = std::function<void(std::exception_ptr, QueryResult)>;
 using QueryAllCallback = std::function<void(std::exception_ptr, std::vector<QueryResult>)>;
 using PrepareCallback = std::function<void(std::exception_ptr, PreparedStatement)>;
 using BinlogEventsCallback = std::function<void(std::exception_ptr, std::vector<BinlogEvent>)>;
+using BinlogEventCallback = std::function<bool(const BinlogEvent&)>;
 
 RawSql raw(std::string sql);
 std::string escape(const Value& value);
@@ -345,6 +398,7 @@ void set_max_parser_cache(std::size_t max) noexcept;
 std::size_t max_parser_cache() noexcept;
 void clear_parser_cache() noexcept;
 BinlogEvent parse_binlog_event_packet(const Buffer& payload);
+std::vector<BinlogGtidSource> parse_gtid_set(const std::string& gtid_set);
 
 class Connection : public events::EventEmitterForwarder {
 public:
@@ -439,6 +493,7 @@ public:
     void register_slave(const RegisterSlaveOptions& options, OkCallback callback);
     Promise<OkPacket> register_slave_promise(RegisterSlaveOptions options);
     std::vector<BinlogEvent> binlog_dump(const BinlogDumpOptions& options = {});
+    std::size_t binlog_dump_each(const BinlogDumpOptions& options, BinlogEventCallback callback);
     void binlog_dump(const BinlogDumpOptions& options, BinlogEventsCallback callback);
     Promise<std::vector<BinlogEvent>> binlog_dump_promise(BinlogDumpOptions options = {});
     void close_statement(const PreparedStatement& statement);
@@ -496,8 +551,18 @@ public:
     void write_ok(OkPacket ok = {});
     void write_error(uint16_t code, const std::string& sql_state, const std::string& message);
     void write_error(const Error& error);
+    void write_columns(const std::vector<Field>& fields);
+    void write_text_row(const Row& row, const std::vector<Field>& fields);
+    void write_binary_row(const Row& row, const std::vector<Field>& fields);
+    void write_eof(uint16_t warnings = 0, uint16_t status = 2);
     void write_text_result(const QueryResult& result);
     void write_text_result(const std::vector<Row>& rows, const std::vector<Field>& fields);
+    void write_binary_result(const QueryResult& result);
+    void write_binary_result(const std::vector<Row>& rows, const std::vector<Field>& fields);
+    void write_statement_prepare_ok(uint32_t statement_id,
+                                    const std::vector<Field>& parameters = {},
+                                    const std::vector<Field>& fields = {},
+                                    uint16_t warning_count = 0);
     void close() noexcept;
 
     bool connected() const noexcept;
@@ -742,6 +807,23 @@ inline constexpr uint16_t NUM = 32768;
 namespace binlog_dump_flags {
 inline constexpr uint16_t NON_BLOCK = 0x01;
 }  // namespace binlog_dump_flags
+
+namespace binlog_event_type {
+inline constexpr uint8_t QUERY = 2;
+inline constexpr uint8_t ROTATE = 4;
+inline constexpr uint8_t FORMAT_DESCRIPTION = 15;
+inline constexpr uint8_t XID = 16;
+inline constexpr uint8_t TABLE_MAP = 19;
+inline constexpr uint8_t WRITE_ROWS_V1 = 23;
+inline constexpr uint8_t UPDATE_ROWS_V1 = 24;
+inline constexpr uint8_t DELETE_ROWS_V1 = 25;
+inline constexpr uint8_t WRITE_ROWS_V2 = 30;
+inline constexpr uint8_t UPDATE_ROWS_V2 = 31;
+inline constexpr uint8_t DELETE_ROWS_V2 = 32;
+inline constexpr uint8_t GTID = 33;
+inline constexpr uint8_t ANONYMOUS_GTID = 34;
+inline constexpr uint8_t PREVIOUS_GTIDS = 35;
+}  // namespace binlog_event_type
 }  // namespace constants
 
 }  // namespace polycpp::mysql2

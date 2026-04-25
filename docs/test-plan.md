@@ -15,8 +15,8 @@
 - SSL profile helper coverage verifies the generated AWS RDS CA bundle is loadable as PEM strings.
 - Parser-cache compatibility hooks are covered as no-op static-parser controls.
 - Typed `RowStream` coverage verifies row iteration and NDJSON buffer conversion.
-- Binlog packet parser coverage includes QueryEvent fixtures; Rotate, FormatDescription, Xid, and unknown-event fixtures should be added.
-- Adapted server mode loopback coverage creates a `Server`, accepts a `Connection` client, validates handshake auth/connect attributes, dispatches query, ping, statement prepare, and statement execute events, writes text/OK responses, observes quit, and verifies auth callback rejection returns a MySQL ERR packet.
+- Binlog packet parser coverage includes QueryEvent fixtures, GTID set parsing, and stateful TableMap plus WriteRows decoding. Rotate, FormatDescription, Xid, GTID packet, PreviousGTIDs packet, update/delete rows, and unknown-event fixtures should be expanded.
+- Adapted server mode loopback coverage creates a `Server`, accepts a `Connection` client, validates handshake auth/connect attributes, dispatches query, ping, statement prepare, and statement execute events, writes text/OK responses, writes a prepared-statement OK packet and binary result rows for a real client `prepare`/`execute`, observes quit, and verifies auth callback rejection returns a MySQL ERR packet.
 
 ## Integration Tests
 
@@ -52,7 +52,7 @@
 - RSA auth path uses OAEP SHA1 to match upstream caching_sha2_password behavior.
 - Single-result APIs drain additional result sets before throwing so the connection is reusable.
 - Per-command inactivity timeout closes the transport and marks the connection disconnected.
-- Bounded binlog dump closes the connection if `max_events` is reached before EOF, so callers do not accidentally reuse a connection that is still inside a replication stream.
+- Bounded binlog dump closes the connection if `max_events` is reached before EOF, so callers do not accidentally reuse a connection that is still inside a replication stream. Callback-controlled `binlog_dump_each` is the documented escape hatch for continuous consumption.
 - Server auth callbacks can reject a client by returning an `Error`; accepted clients expose parsed `ServerAuthInfo` without validating passwords implicitly. Rejection is covered by a loopback test that expects error code 1045 / SQL state 28000.
 
 ## Release-Blocking Behaviors
@@ -61,7 +61,7 @@
 - Real MariaDB e2e passes without TLS.
 - Real MariaDB e2e passes with verified TLS.
 - Real MySQL 8 e2e passes before claiming MySQL 8 auth parity.
-- Stream adaptation, command timeout behavior, compression, LOCAL INFILE policy, callback/Promise wrappers, EventEmitter/trace behavior, adapted server mode, bounded binlog behavior, parser-cache compatibility hooks, and SSL profile data remain documented with exact C++ semantics.
+- Stream adaptation, command timeout behavior, compression, LOCAL INFILE policy, callback/Promise wrappers, EventEmitter/trace behavior, adapted server mode, bounded/callback binlog behavior, parser-cache compatibility hooks, and SSL profile data remain documented with exact C++ semantics.
 - Third-party license notices are complete.
 - Documentation builds with `python3 docs/build.py`.
 - GitHub repo remains private until production-grade quality and public docs are ready.

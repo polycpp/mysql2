@@ -24,13 +24,13 @@ Supported scope
 Not full upstream parity
 ------------------------
 
-Unix socket server listen overloads, TLS server mode, GTID replication,
-continuous binlog object streams, full row-event decoding, and exact Node
-``Readable`` object-mode row chunks are intentionally not part of the current
-C++ surface. Callback, Promise, EventEmitter, trace, query attributes, command
-timeouts, cursor fetch, compression, LOCAL INFILE, URI, parser-cache
-compatibility, server mode, and pool-cluster surfaces are implemented with C++
-adaptations.
+Unix socket server listen overloads, TLS server mode, exact Node
+``createBinlogStream`` object/EventEmitter shape, and exact Node ``Readable``
+object-mode row chunks are intentionally not part of the current C++ surface.
+Callback, Promise, EventEmitter, trace, query attributes, command timeouts,
+cursor fetch, compression, LOCAL INFILE, URI, parser-cache compatibility,
+GTID/binlog parser support, server mode, and pool-cluster surfaces are
+implemented with C++ adaptations.
 See
 ``docs/divergences.md`` in the repository for the detailed list.
 

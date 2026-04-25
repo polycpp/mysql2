@@ -78,6 +78,7 @@ constexpr uint8_t FIELD_LIST = 0x04;
 constexpr uint8_t CHANGE_USER = 0x11;
 constexpr uint8_t BINLOG_DUMP = 0x12;
 constexpr uint8_t REGISTER_SLAVE = 0x15;
+constexpr uint8_t BINLOG_DUMP_GTID = 0x1e;
 constexpr uint8_t PING = 0x0e;
 constexpr uint8_t STMT_PREPARE = 0x16;
 constexpr uint8_t STMT_EXECUTE = 0x17;
@@ -472,6 +473,13 @@ void append_u64_le(std::vector<uint8_t>& out, uint64_t value) {
 void append_double_le(std::vector<uint8_t>& out, double value) {
     static_assert(sizeof(double) == 8);
     std::array<uint8_t, 8> bytes{};
+    std::memcpy(bytes.data(), &value, bytes.size());
+    out.insert(out.end(), bytes.begin(), bytes.end());
+}
+
+void append_float_le(std::vector<uint8_t>& out, float value) {
+    static_assert(sizeof(float) == 4);
+    std::array<uint8_t, 4> bytes{};
     std::memcpy(bytes.data(), &value, bytes.size());
     out.insert(out.end(), bytes.begin(), bytes.end());
 }
@@ -1690,6 +1698,313 @@ std::vector<uint8_t> build_text_result_packets(const std::vector<Row>& rows,
     return out;
 }
 
+int64_t value_to_i64(const Value& value) {
+    return std::visit([](const auto& item) -> int64_t {
+        using T = std::decay_t<decltype(item)>;
+        if constexpr (std::is_same_v<T, std::monostate>) {
+            return 0;
+        } else if constexpr (std::is_same_v<T, bool>) {
+            return item ? 1 : 0;
+        } else if constexpr (std::is_same_v<T, int64_t>) {
+            return item;
+        } else if constexpr (std::is_same_v<T, uint64_t>) {
+            return static_cast<int64_t>(item);
+        } else if constexpr (std::is_same_v<T, double>) {
+            return static_cast<int64_t>(item);
+        } else if constexpr (std::is_same_v<T, std::string>) {
+            return item.empty() ? 0 : std::stoll(item);
+        } else if constexpr (std::is_same_v<T, Buffer>) {
+            const auto text = item.toString();
+            return text.empty() ? 0 : std::stoll(text);
+        } else if constexpr (std::is_same_v<T, RawSql>) {
+            return item.sql.empty() ? 0 : std::stoll(item.sql);
+        }
+    }, value);
+}
+
+uint64_t value_to_u64(const Value& value) {
+    return std::visit([](const auto& item) -> uint64_t {
+        using T = std::decay_t<decltype(item)>;
+        if constexpr (std::is_same_v<T, std::monostate>) {
+            return 0;
+        } else if constexpr (std::is_same_v<T, bool>) {
+            return item ? 1 : 0;
+        } else if constexpr (std::is_same_v<T, int64_t>) {
+            return static_cast<uint64_t>(item);
+        } else if constexpr (std::is_same_v<T, uint64_t>) {
+            return item;
+        } else if constexpr (std::is_same_v<T, double>) {
+            return static_cast<uint64_t>(item);
+        } else if constexpr (std::is_same_v<T, std::string>) {
+            return item.empty() ? 0 : static_cast<uint64_t>(std::stoull(item));
+        } else if constexpr (std::is_same_v<T, Buffer>) {
+            const auto text = item.toString();
+            return text.empty() ? 0 : static_cast<uint64_t>(std::stoull(text));
+        } else if constexpr (std::is_same_v<T, RawSql>) {
+            return item.sql.empty() ? 0 : static_cast<uint64_t>(std::stoull(item.sql));
+        }
+    }, value);
+}
+
+double value_to_double(const Value& value) {
+    return std::visit([](const auto& item) -> double {
+        using T = std::decay_t<decltype(item)>;
+        if constexpr (std::is_same_v<T, std::monostate>) {
+            return 0;
+        } else if constexpr (std::is_same_v<T, bool>) {
+            return item ? 1 : 0;
+        } else if constexpr (std::is_same_v<T, int64_t> || std::is_same_v<T, uint64_t>) {
+            return static_cast<double>(item);
+        } else if constexpr (std::is_same_v<T, double>) {
+            return item;
+        } else if constexpr (std::is_same_v<T, std::string>) {
+            return item.empty() ? 0 : std::stod(item);
+        } else if constexpr (std::is_same_v<T, Buffer>) {
+            const auto text = item.toString();
+            return text.empty() ? 0 : std::stod(text);
+        } else if constexpr (std::is_same_v<T, RawSql>) {
+            return item.sql.empty() ? 0 : std::stod(item.sql);
+        }
+    }, value);
+}
+
+Buffer value_to_encoded_buffer(const Value& value, const std::string& encoding) {
+    return std::visit([&](const auto& item) -> Buffer {
+        using T = std::decay_t<decltype(item)>;
+        if constexpr (std::is_same_v<T, std::monostate>) {
+            return {};
+        } else if constexpr (std::is_same_v<T, Buffer>) {
+            return item;
+        } else if constexpr (std::is_same_v<T, std::string>) {
+            return encode_string_for_mysql(item, encoding);
+        } else if constexpr (std::is_same_v<T, RawSql>) {
+            return encode_string_for_mysql(item.sql, encoding);
+        } else {
+            return encode_string_for_mysql(server_value_to_string(value), encoding);
+        }
+    }, value);
+}
+
+struct DateTimeParts {
+    uint16_t year = 0;
+    uint8_t month = 0;
+    uint8_t day = 0;
+    uint8_t hour = 0;
+    uint8_t minute = 0;
+    uint8_t second = 0;
+    uint32_t micros = 0;
+};
+
+uint32_t parse_fraction_micros(std::string_view fraction) {
+    uint32_t micros = 0;
+    uint32_t scale = 100000;
+    for (std::size_t i = 0; i < fraction.size() && i < 6; ++i) {
+        const auto ch = fraction[i];
+        if (!std::isdigit(static_cast<unsigned char>(ch))) {
+            throw Error("invalid fractional seconds in MySQL time value");
+        }
+        micros += static_cast<uint32_t>(ch - '0') * scale;
+        scale /= 10;
+    }
+    return micros;
+}
+
+DateTimeParts parse_datetime_parts(std::string value, bool date_only) {
+    if (value.size() < 10 || value[4] != '-' || value[7] != '-') {
+        throw Error("invalid MySQL date/datetime string for binary row");
+    }
+    DateTimeParts out;
+    out.year = static_cast<uint16_t>(std::stoi(value.substr(0, 4)));
+    out.month = static_cast<uint8_t>(std::stoi(value.substr(5, 2)));
+    out.day = static_cast<uint8_t>(std::stoi(value.substr(8, 2)));
+    if (!date_only && value.size() > 10) {
+        const auto time_start = value[10] == 'T' || value[10] == ' ' ? 11 : 10;
+        if (value.size() < time_start + 8 || value[time_start + 2] != ':' || value[time_start + 5] != ':') {
+            throw Error("invalid MySQL datetime time component for binary row");
+        }
+        out.hour = static_cast<uint8_t>(std::stoi(value.substr(time_start, 2)));
+        out.minute = static_cast<uint8_t>(std::stoi(value.substr(time_start + 3, 2)));
+        out.second = static_cast<uint8_t>(std::stoi(value.substr(time_start + 6, 2)));
+        if (value.size() > time_start + 8 && value[time_start + 8] == '.') {
+            out.micros = parse_fraction_micros(std::string_view(value).substr(time_start + 9));
+        }
+    }
+    return out;
+}
+
+void append_binary_datetime_value(std::vector<uint8_t>& out, const Value& value, bool date_only) {
+    const auto text = server_value_to_string(value);
+    if (text.empty() || text == "0000-00-00" || text == "0000-00-00 00:00:00") {
+        append_u8(out, 0);
+        return;
+    }
+    const auto parts = parse_datetime_parts(text, date_only);
+    const bool include_time = !date_only && (parts.hour != 0 || parts.minute != 0 || parts.second != 0 || parts.micros != 0);
+    if (date_only || !include_time) {
+        append_u8(out, 4);
+        append_u16_le(out, parts.year);
+        append_u8(out, parts.month);
+        append_u8(out, parts.day);
+        return;
+    }
+    append_u8(out, parts.micros == 0 ? 7 : 11);
+    append_u16_le(out, parts.year);
+    append_u8(out, parts.month);
+    append_u8(out, parts.day);
+    append_u8(out, parts.hour);
+    append_u8(out, parts.minute);
+    append_u8(out, parts.second);
+    if (parts.micros != 0) {
+        append_u32_le(out, parts.micros);
+    }
+}
+
+void append_binary_time_value(std::vector<uint8_t>& out, const Value& value) {
+    auto text = server_value_to_string(value);
+    if (text.empty() || text == "00:00:00") {
+        append_u8(out, 0);
+        return;
+    }
+    bool negative = false;
+    if (!text.empty() && text[0] == '-') {
+        negative = true;
+        text.erase(text.begin());
+    }
+    const auto first_colon = text.find(':');
+    const auto second_colon = first_colon == std::string::npos ? std::string::npos : text.find(':', first_colon + 1);
+    if (first_colon == std::string::npos || second_colon == std::string::npos) {
+        throw Error("invalid MySQL time string for binary row");
+    }
+    const auto hours_total = static_cast<uint32_t>(std::stoul(text.substr(0, first_colon)));
+    const auto minutes = static_cast<uint8_t>(std::stoul(text.substr(first_colon + 1, second_colon - first_colon - 1)));
+    const auto second_part = text.substr(second_colon + 1);
+    const auto dot = second_part.find('.');
+    const auto seconds = static_cast<uint8_t>(std::stoul(dot == std::string::npos ? second_part : second_part.substr(0, dot)));
+    const auto micros = dot == std::string::npos ? 0 : parse_fraction_micros(std::string_view(second_part).substr(dot + 1));
+    append_u8(out, micros == 0 ? 8 : 12);
+    append_u8(out, negative ? 1 : 0);
+    append_u32_le(out, hours_total / 24);
+    append_u8(out, static_cast<uint8_t>(hours_total % 24));
+    append_u8(out, minutes);
+    append_u8(out, seconds);
+    if (micros != 0) {
+        append_u32_le(out, micros);
+    }
+}
+
+void append_binary_result_value(std::vector<uint8_t>& out, const Value& value, const Field& field) {
+    using namespace constants::column_type;
+    switch (field.column_type) {
+        case TINY:
+            append_u8(out, static_cast<uint8_t>(value_to_i64(value)));
+            break;
+        case SHORT:
+        case YEAR:
+            append_u16_le(out, static_cast<uint16_t>(value_to_i64(value)));
+            break;
+        case LONG:
+        case INT24:
+            append_u32_le(out, static_cast<uint32_t>(value_to_i64(value)));
+            break;
+        case LONGLONG:
+            append_u64_le(out, field.is_unsigned() ? value_to_u64(value) : static_cast<uint64_t>(value_to_i64(value)));
+            break;
+        case FLOAT:
+            append_float_le(out, static_cast<float>(value_to_double(value)));
+            break;
+        case DOUBLE:
+            append_double_le(out, value_to_double(value));
+            break;
+        case DATE:
+        case NEWDATE:
+            append_binary_datetime_value(out, value, true);
+            break;
+        case DATETIME:
+        case TIMESTAMP:
+            append_binary_datetime_value(out, value, false);
+            break;
+        case TIME:
+            append_binary_time_value(out, value);
+            break;
+        default: {
+            const auto bytes = value_to_encoded_buffer(value, field.encoding.empty() ? "utf8" : field.encoding);
+            append_lenenc_buffer(out, bytes);
+            break;
+        }
+    }
+}
+
+Buffer build_binary_row_payload(const Row& row, const std::vector<Field>& fields) {
+    std::vector<uint8_t> payload;
+    append_u8(payload, 0);
+    const std::size_t null_bitmap_length = (fields.size() + 7 + 2) / 8;
+    std::vector<uint8_t> null_bitmap(null_bitmap_length, 0);
+    for (std::size_t i = 0; i < fields.size(); ++i) {
+        const auto& value = i < row.values.size() ? row.values[i] : Value{std::monostate{}};
+        if (std::holds_alternative<std::monostate>(value)) {
+            const auto bit = i + 2;
+            null_bitmap[bit / 8] |= static_cast<uint8_t>(1u << (bit % 8));
+        }
+    }
+    payload.insert(payload.end(), null_bitmap.begin(), null_bitmap.end());
+    for (std::size_t i = 0; i < fields.size(); ++i) {
+        const auto& value = i < row.values.size() ? row.values[i] : Value{std::monostate{}};
+        if (!std::holds_alternative<std::monostate>(value)) {
+            append_binary_result_value(payload, value, fields[i]);
+        }
+    }
+    return buffer_from_bytes(payload);
+}
+
+std::vector<uint8_t> build_binary_result_packets(const std::vector<Row>& rows,
+                                                 const std::vector<Field>& fields,
+                                                 uint8_t first_sequence) {
+    std::vector<uint8_t> out;
+    uint8_t sequence = first_sequence;
+    std::vector<uint8_t> header;
+    append_lenenc_int(header, fields.size());
+    append_packet_bytes(out, buffer_from_bytes(header), sequence);
+    for (const auto& field : fields) {
+        append_packet_bytes(out, build_column_definition_payload(field), sequence);
+    }
+    append_packet_bytes(out, build_eof_payload(), sequence);
+    for (const auto& row : rows) {
+        append_packet_bytes(out, build_binary_row_payload(row, fields), sequence);
+    }
+    append_packet_bytes(out, build_eof_payload(), sequence);
+    return out;
+}
+
+std::vector<uint8_t> build_statement_prepare_ok_packets(uint32_t statement_id,
+                                                        const std::vector<Field>& parameters,
+                                                        const std::vector<Field>& fields,
+                                                        uint16_t warning_count,
+                                                        uint8_t first_sequence) {
+    std::vector<uint8_t> out;
+    uint8_t sequence = first_sequence;
+    std::vector<uint8_t> ok;
+    append_u8(ok, marker::OK);
+    append_u32_le(ok, statement_id);
+    append_u16_le(ok, static_cast<uint16_t>(fields.size()));
+    append_u16_le(ok, static_cast<uint16_t>(parameters.size()));
+    append_u8(ok, 0);
+    append_u16_le(ok, warning_count);
+    append_packet_bytes(out, buffer_from_bytes(ok), sequence);
+    if (!parameters.empty()) {
+        for (const auto& parameter : parameters) {
+            append_packet_bytes(out, build_column_definition_payload(parameter), sequence);
+        }
+        append_packet_bytes(out, build_eof_payload(), sequence);
+    }
+    if (!fields.empty()) {
+        for (const auto& field : fields) {
+            append_packet_bytes(out, build_column_definition_payload(field), sequence);
+        }
+        append_packet_bytes(out, build_eof_payload(), sequence);
+    }
+    return out;
+}
+
 bool is_server_execute_supported_type(uint8_t type) {
     using namespace constants::column_type;
     switch (type) {
@@ -2363,14 +2678,190 @@ Buffer build_register_slave_payload(const RegisterSlaveOptions& options, const s
     return buffer_from_bytes(payload);
 }
 
+uint64_t read_u48_le(PacketCursor& cursor) {
+    const auto bytes = cursor.read_buffer(6);
+    uint64_t value = 0;
+    for (int i = 0; i < 6; ++i) {
+        value |= static_cast<uint64_t>(bytes[i]) << (8 * i);
+    }
+    return value;
+}
+
+std::string trim_ascii(std::string value) {
+    auto first = value.begin();
+    while (first != value.end() && std::isspace(static_cast<unsigned char>(*first))) {
+        ++first;
+    }
+    auto last = value.end();
+    while (last != first && std::isspace(static_cast<unsigned char>(*(last - 1)))) {
+        --last;
+    }
+    return std::string(first, last);
+}
+
+std::vector<std::string> split_ascii(const std::string& value, char delimiter) {
+    std::vector<std::string> parts;
+    std::size_t start = 0;
+    while (start <= value.size()) {
+        const auto pos = value.find(delimiter, start);
+        if (pos == std::string::npos) {
+            parts.push_back(value.substr(start));
+            break;
+        }
+        parts.push_back(value.substr(start, pos - start));
+        start = pos + 1;
+    }
+    return parts;
+}
+
+uint8_t hex_digit_value(char ch) {
+    if (ch >= '0' && ch <= '9') return static_cast<uint8_t>(ch - '0');
+    if (ch >= 'a' && ch <= 'f') return static_cast<uint8_t>(ch - 'a' + 10);
+    if (ch >= 'A' && ch <= 'F') return static_cast<uint8_t>(ch - 'A' + 10);
+    throw Error("invalid UUID hex digit in GTID set");
+}
+
+std::array<uint8_t, 16> parse_uuid_bytes(const std::string& uuid) {
+    std::string hex;
+    hex.reserve(32);
+    for (const auto ch : uuid) {
+        if (ch == '-') continue;
+        hex.push_back(ch);
+    }
+    if (hex.size() != 32) {
+        throw Error("invalid UUID length in GTID set");
+    }
+    std::array<uint8_t, 16> out{};
+    for (std::size_t i = 0; i < out.size(); ++i) {
+        out[i] = static_cast<uint8_t>((hex_digit_value(hex[i * 2]) << 4) | hex_digit_value(hex[i * 2 + 1]));
+    }
+    return out;
+}
+
+std::string uuid_from_bytes(const Buffer& bytes) {
+    if (bytes.length() != 16) {
+        throw Error("invalid SID length in encoded GTID set");
+    }
+    static constexpr char digits[] = "0123456789abcdef";
+    std::string out;
+    out.reserve(36);
+    for (std::size_t i = 0; i < 16; ++i) {
+        if (i == 4 || i == 6 || i == 8 || i == 10) {
+            out.push_back('-');
+        }
+        out.push_back(digits[(bytes[i] >> 4) & 0x0f]);
+        out.push_back(digits[bytes[i] & 0x0f]);
+    }
+    return out;
+}
+
+std::vector<BinlogGtidSource> parse_gtid_set_text(const std::string& gtid_set) {
+    std::vector<BinlogGtidSource> out;
+    const auto trimmed = trim_ascii(gtid_set);
+    if (trimmed.empty()) {
+        return out;
+    }
+    for (auto source_text : split_ascii(trimmed, ',')) {
+        source_text = trim_ascii(source_text);
+        if (source_text.empty()) {
+            continue;
+        }
+        const auto first_colon = source_text.find(':');
+        if (first_colon == std::string::npos) {
+            throw Error("invalid GTID set source: missing interval list");
+        }
+        BinlogGtidSource source;
+        source.sid = trim_ascii(source_text.substr(0, first_colon));
+        (void)parse_uuid_bytes(source.sid);
+        for (auto interval_text : split_ascii(source_text.substr(first_colon + 1), ':')) {
+            interval_text = trim_ascii(interval_text);
+            if (interval_text.empty()) {
+                continue;
+            }
+            const auto dash = interval_text.find('-');
+            BinlogGtidInterval interval;
+            if (dash == std::string::npos) {
+                interval.start = std::stoull(interval_text);
+                interval.end = interval.start;
+            } else {
+                interval.start = std::stoull(interval_text.substr(0, dash));
+                interval.end = std::stoull(interval_text.substr(dash + 1));
+            }
+            if (interval.start == 0 || interval.end < interval.start) {
+                throw Error("invalid GTID interval");
+            }
+            source.intervals.push_back(interval);
+        }
+        out.push_back(std::move(source));
+    }
+    return out;
+}
+
+Buffer encode_gtid_set(const std::string& gtid_set) {
+    const auto sources = parse_gtid_set_text(gtid_set);
+    std::vector<uint8_t> out;
+    append_u64_le(out, sources.size());
+    for (const auto& source : sources) {
+        const auto sid = parse_uuid_bytes(source.sid);
+        out.insert(out.end(), sid.begin(), sid.end());
+        append_u64_le(out, source.intervals.size());
+        for (const auto& interval : source.intervals) {
+            append_u64_le(out, interval.start);
+            append_u64_le(out, interval.end + 1);
+        }
+    }
+    return buffer_from_bytes(out);
+}
+
+std::vector<BinlogGtidSource> decode_gtid_set(Buffer encoded) {
+    PacketCursor cursor(std::move(encoded));
+    std::vector<BinlogGtidSource> out;
+    if (!cursor.has_more()) {
+        return out;
+    }
+    const auto source_count = cursor.read_u64_le();
+    out.reserve(static_cast<std::size_t>(source_count));
+    for (uint64_t i = 0; i < source_count; ++i) {
+        BinlogGtidSource source;
+        source.sid = uuid_from_bytes(cursor.read_buffer(16));
+        const auto interval_count = cursor.read_u64_le();
+        source.intervals.reserve(static_cast<std::size_t>(interval_count));
+        for (uint64_t j = 0; j < interval_count; ++j) {
+            BinlogGtidInterval interval;
+            interval.start = cursor.read_u64_le();
+            const auto exclusive_end = cursor.read_u64_le();
+            interval.end = exclusive_end == 0 ? 0 : exclusive_end - 1;
+            source.intervals.push_back(interval);
+        }
+        out.push_back(std::move(source));
+    }
+    return out;
+}
+
 Buffer build_binlog_dump_payload(const BinlogDumpOptions& options) {
     std::vector<uint8_t> payload;
-    payload.reserve(11 + options.filename.size());
-    append_u8(payload, command_code::BINLOG_DUMP);
-    append_u32_le(payload, options.binlog_position);
-    append_u16_le(payload, options.flags);
-    append_u32_le(payload, options.server_id);
-    append_string(payload, options.filename);
+    if (options.use_gtid) {
+        const auto encoded_gtids = encode_gtid_set(options.gtid_set);
+        payload.reserve(23 + options.filename.size() + encoded_gtids.length());
+        append_u8(payload, command_code::BINLOG_DUMP_GTID);
+        append_u16_le(payload, options.flags);
+        append_u32_le(payload, options.server_id);
+        append_u32_le(payload, static_cast<uint32_t>(options.filename.size()));
+        append_string(payload, options.filename);
+        append_u64_le(payload, options.binlog_position);
+        append_u32_le(payload, static_cast<uint32_t>(encoded_gtids.length()));
+        append_bytes(payload, encoded_gtids);
+    } else {
+        if (options.binlog_position > std::numeric_limits<uint32_t>::max()) {
+            throw Error("COM_BINLOG_DUMP binlog_position exceeds 32-bit protocol field; use GTID dump for 64-bit positions");
+        }
+        payload.reserve(11 + options.filename.size());
+        append_u8(payload, command_code::BINLOG_DUMP);
+        append_u32_le(payload, static_cast<uint32_t>(options.binlog_position));
+        append_u16_le(payload, options.flags);
+        append_u32_le(payload, options.server_id);
+        append_string(payload, options.filename);
+    }
     return buffer_from_bytes(payload);
 }
 
@@ -2384,15 +2875,436 @@ std::string strip_at_nul(std::string value) {
 
 std::string binlog_event_name(uint8_t event_type) {
     switch (event_type) {
-        case 2: return "QueryEvent";
-        case 4: return "RotateEvent";
-        case 15: return "FormatDescriptionEvent";
-        case 16: return "XidEvent";
+        case constants::binlog_event_type::QUERY: return "QueryEvent";
+        case constants::binlog_event_type::ROTATE: return "RotateEvent";
+        case constants::binlog_event_type::FORMAT_DESCRIPTION: return "FormatDescriptionEvent";
+        case constants::binlog_event_type::XID: return "XidEvent";
+        case constants::binlog_event_type::TABLE_MAP: return "TableMapEvent";
+        case constants::binlog_event_type::WRITE_ROWS_V1: return "WriteRowsEventV1";
+        case constants::binlog_event_type::UPDATE_ROWS_V1: return "UpdateRowsEventV1";
+        case constants::binlog_event_type::DELETE_ROWS_V1: return "DeleteRowsEventV1";
+        case constants::binlog_event_type::WRITE_ROWS_V2: return "WriteRowsEventV2";
+        case constants::binlog_event_type::UPDATE_ROWS_V2: return "UpdateRowsEventV2";
+        case constants::binlog_event_type::DELETE_ROWS_V2: return "DeleteRowsEventV2";
+        case constants::binlog_event_type::GTID: return "GtidEvent";
+        case constants::binlog_event_type::ANONYMOUS_GTID: return "AnonymousGtidEvent";
+        case constants::binlog_event_type::PREVIOUS_GTIDS: return "PreviousGtidsEvent";
         default: return "UnknownEvent";
     }
 }
 
-BinlogEvent parse_binlog_event_packet_impl(const Buffer& payload) {
+struct BinlogTableMapState {
+    std::string schema;
+    std::string table;
+    uint16_t flags = 0;
+    std::vector<uint8_t> column_types;
+    std::vector<uint16_t> column_metadata;
+    Buffer column_null_bitmap;
+};
+
+struct BinlogParserState {
+    std::unordered_map<uint64_t, BinlogTableMapState> tables;
+};
+
+constexpr uint8_t kColumnTimestamp2 = 0x11;
+constexpr uint8_t kColumnDatetime2 = 0x12;
+constexpr uint8_t kColumnTime2 = 0x13;
+
+bool bitmap_has_bit(const Buffer& bitmap, std::size_t bit) {
+    return bit / 8 < bitmap.length() && (bitmap[bit / 8] & (1u << (bit % 8))) != 0;
+}
+
+std::size_t bitmap_byte_length(std::size_t bit_count) {
+    return (bit_count + 7) / 8;
+}
+
+std::size_t bitmap_set_count(const Buffer& bitmap, std::size_t bit_count) {
+    std::size_t count = 0;
+    for (std::size_t i = 0; i < bit_count; ++i) {
+        if (bitmap_has_bit(bitmap, i)) {
+            ++count;
+        }
+    }
+    return count;
+}
+
+uint16_t parse_table_map_column_metadata(PacketCursor& cursor, uint8_t type) {
+    using namespace constants::column_type;
+    switch (type) {
+        case FLOAT:
+        case DOUBLE:
+        case BLOB:
+        case TINY_BLOB:
+        case MEDIUM_BLOB:
+        case LONG_BLOB:
+        case JSON:
+        case GEOMETRY:
+        case kColumnTimestamp2:
+        case kColumnDatetime2:
+        case kColumnTime2:
+            return cursor.read_u8();
+        case VARCHAR:
+        case BIT:
+        case NEWDECIMAL:
+        case STRING:
+        case ENUM:
+        case SET:
+            return cursor.read_u16_le();
+        default:
+            return 0;
+    }
+}
+
+std::vector<uint16_t> parse_table_map_metadata(const std::vector<uint8_t>& column_types, const Buffer& metadata) {
+    PacketCursor cursor(metadata);
+    std::vector<uint16_t> out;
+    out.reserve(column_types.size());
+    for (const auto type : column_types) {
+        out.push_back(parse_table_map_column_metadata(cursor, type));
+    }
+    return out;
+}
+
+uint64_t read_le_integer(PacketCursor& cursor, std::size_t byte_length) {
+    if (byte_length == 0 || byte_length > 8) {
+        throw Error("invalid MySQL integer byte length");
+    }
+    uint64_t value = 0;
+    const auto bytes = cursor.read_buffer(byte_length);
+    for (std::size_t i = 0; i < byte_length; ++i) {
+        value |= static_cast<uint64_t>(bytes[i]) << (8 * i);
+    }
+    return value;
+}
+
+int64_t sign_extend(uint64_t value, std::size_t bits) {
+    const uint64_t sign_bit = uint64_t{1} << (bits - 1);
+    if ((value & sign_bit) == 0) {
+        return static_cast<int64_t>(value);
+    }
+    const uint64_t mask = (~uint64_t{0}) << bits;
+    return static_cast<int64_t>(value | mask);
+}
+
+uint32_t read_be_integer(const std::vector<uint8_t>& bytes, std::size_t& offset, std::size_t length) {
+    uint32_t value = 0;
+    for (std::size_t i = 0; i < length; ++i) {
+        value = (value << 8) | bytes[offset++];
+    }
+    return value;
+}
+
+std::string read_newdecimal_string(PacketCursor& cursor, uint16_t metadata) {
+    static constexpr std::array<int, 10> compressed_bytes = {0, 1, 1, 2, 2, 3, 3, 4, 4, 4};
+    const int precision = (metadata >> 8) & 0xff;
+    const int scale = metadata & 0xff;
+    if (precision <= 0 || scale < 0 || scale > precision) {
+        throw Error("invalid NEWDECIMAL metadata in binlog row");
+    }
+    const int intg = precision - scale;
+    const int intg0 = intg / 9;
+    const int frac0 = scale / 9;
+    const int intg0x = intg - intg0 * 9;
+    const int frac0x = scale - frac0 * 9;
+    const std::size_t byte_count = static_cast<std::size_t>(intg0 * 4 + compressed_bytes[intg0x] +
+                                                            frac0 * 4 + compressed_bytes[frac0x]);
+    auto bytes = bytes_from_buffer(cursor.read_buffer(byte_count));
+    const bool positive = (bytes[0] & 0x80) != 0;
+    bytes[0] ^= 0x80;
+    if (!positive) {
+        for (auto& byte : bytes) {
+            byte ^= 0xff;
+        }
+    }
+    std::size_t offset = 0;
+    std::ostringstream out;
+    if (!positive) {
+        out << '-';
+    }
+    bool wrote_int = false;
+    if (intg0x > 0) {
+        out << read_be_integer(bytes, offset, static_cast<std::size_t>(compressed_bytes[intg0x]));
+        wrote_int = true;
+    }
+    for (int i = 0; i < intg0; ++i) {
+        const auto group = read_be_integer(bytes, offset, 4);
+        if (wrote_int) {
+            out.width(9);
+            out.fill('0');
+        }
+        out << group;
+        wrote_int = true;
+    }
+    if (!wrote_int) {
+        out << '0';
+    }
+    if (scale > 0) {
+        out << '.';
+        for (int i = 0; i < frac0; ++i) {
+            const auto group = read_be_integer(bytes, offset, 4);
+            out.width(9);
+            out.fill('0');
+            out << group;
+        }
+        if (frac0x > 0) {
+            const auto group = read_be_integer(bytes, offset, static_cast<std::size_t>(compressed_bytes[frac0x]));
+            out.width(frac0x);
+            out.fill('0');
+            out << group;
+        }
+    }
+    return out.str();
+}
+
+std::string format_date_from_packed(uint32_t value) {
+    const auto day = value & 0x1f;
+    const auto month = (value >> 5) & 0x0f;
+    const auto year = value >> 9;
+    return format_mysql_datetime(static_cast<uint16_t>(year), static_cast<uint8_t>(month), static_cast<uint8_t>(day), 0, 0, 0, 0, true);
+}
+
+std::string format_time_from_seconds(int64_t total_seconds) {
+    const bool negative = total_seconds < 0;
+    if (negative) {
+        total_seconds = -total_seconds;
+    }
+    const auto hours = total_seconds / 3600;
+    const auto minutes = (total_seconds / 60) % 60;
+    const auto seconds = total_seconds % 60;
+    return std::string(negative ? "-" : "") + std::to_string(hours) + ":" +
+           two_digits(static_cast<uint32_t>(minutes)) + ":" + two_digits(static_cast<uint32_t>(seconds));
+}
+
+std::size_t fractional_second_storage_bytes(uint8_t decimals) {
+    if (decimals == 0) return 0;
+    if (decimals <= 2) return 1;
+    if (decimals <= 4) return 2;
+    return 3;
+}
+
+Value read_binlog_row_value(PacketCursor& cursor, uint8_t type, uint16_t metadata) {
+    using namespace constants::column_type;
+    switch (type) {
+        case TINY:
+            return static_cast<int64_t>(cursor.read_i8());
+        case SHORT:
+            return static_cast<int64_t>(cursor.read_i16_le());
+        case INT24:
+            return sign_extend(read_le_integer(cursor, 3), 24);
+        case LONG:
+            return static_cast<int64_t>(cursor.read_i32_le());
+        case LONGLONG:
+            return cursor.read_i64_le();
+        case FLOAT:
+            return static_cast<double>(cursor.read_float_le());
+        case DOUBLE:
+            return cursor.read_double_le();
+        case YEAR: {
+            const auto raw = cursor.read_u8();
+            return static_cast<int64_t>(raw == 0 ? 0 : 1900 + raw);
+        }
+        case DATE:
+        case NEWDATE:
+            return format_date_from_packed(cursor.read_u24_le());
+        case TIMESTAMP:
+            return static_cast<uint64_t>(cursor.read_u32_le());
+        case TIME:
+            return format_time_from_seconds(sign_extend(read_le_integer(cursor, 3), 24));
+        case DATETIME: {
+            const auto raw = cursor.read_u64_le();
+            const auto seconds = raw % 100;
+            const auto minutes = (raw / 100) % 100;
+            const auto hours = (raw / 10000) % 100;
+            const auto day = (raw / 1000000) % 100;
+            const auto month = (raw / 100000000) % 100;
+            const auto year = raw / 10000000000ULL;
+            return format_mysql_datetime(static_cast<uint16_t>(year),
+                                         static_cast<uint8_t>(month),
+                                         static_cast<uint8_t>(day),
+                                         static_cast<uint8_t>(hours),
+                                         static_cast<uint8_t>(minutes),
+                                         static_cast<uint8_t>(seconds),
+                                         0,
+                                         false);
+        }
+        case NEWDECIMAL:
+            return read_newdecimal_string(cursor, metadata);
+        case VARCHAR: {
+            const auto length = metadata > 255 ? cursor.read_u16_le() : cursor.read_u8();
+            return PacketCursor::decode_buffer(cursor.read_buffer(length), "utf8");
+        }
+        case STRING:
+        case VAR_STRING: {
+            const auto length = metadata > 255 ? cursor.read_u16_le() : cursor.read_u8();
+            return PacketCursor::decode_buffer(cursor.read_buffer(length), "utf8");
+        }
+        case ENUM:
+        case SET: {
+            const auto length = std::max<uint16_t>(metadata & 0xff, 1);
+            return static_cast<uint64_t>(read_le_integer(cursor, std::min<std::size_t>(length, 8)));
+        }
+        case BIT: {
+            const auto bit_count = static_cast<std::size_t>(((metadata >> 8) * 8) + (metadata & 0xff));
+            const auto byte_count = bitmap_byte_length(bit_count);
+            const auto bytes = cursor.read_buffer(byte_count);
+            if (byte_count <= 8) {
+                uint64_t value = 0;
+                for (std::size_t i = 0; i < byte_count; ++i) {
+                    value = (value << 8) | bytes[i];
+                }
+                return value;
+            }
+            return bytes;
+        }
+        case BLOB:
+        case TINY_BLOB:
+        case MEDIUM_BLOB:
+        case LONG_BLOB:
+        case JSON:
+        case GEOMETRY: {
+            const auto length_size = metadata == 0 ? 1 : metadata;
+            const auto length = read_le_integer(cursor, length_size);
+            return cursor.read_buffer(static_cast<std::size_t>(length));
+        }
+        case kColumnTimestamp2:
+            return cursor.read_buffer(4 + fractional_second_storage_bytes(static_cast<uint8_t>(metadata)));
+        case kColumnDatetime2:
+            return cursor.read_buffer(5 + fractional_second_storage_bytes(static_cast<uint8_t>(metadata)));
+        case kColumnTime2:
+            return cursor.read_buffer(3 + fractional_second_storage_bytes(static_cast<uint8_t>(metadata)));
+        case NULL_TYPE:
+            return std::monostate{};
+        default:
+            throw Error("unsupported binlog row column type: " + std::to_string(type));
+    }
+}
+
+std::vector<Value> read_binlog_row_values(PacketCursor& cursor,
+                                          const BinlogTableMapState& table_map,
+                                          const Buffer& columns_present_bitmap) {
+    const auto selected_count = bitmap_set_count(columns_present_bitmap, table_map.column_types.size());
+    const auto null_bitmap = cursor.read_buffer(bitmap_byte_length(selected_count));
+    std::vector<Value> values(table_map.column_types.size(), std::monostate{});
+    std::size_t selected = 0;
+    for (std::size_t i = 0; i < table_map.column_types.size(); ++i) {
+        if (!bitmap_has_bit(columns_present_bitmap, i)) {
+            continue;
+        }
+        if (bitmap_has_bit(null_bitmap, selected)) {
+            values[i] = std::monostate{};
+        } else {
+            const auto metadata = i < table_map.column_metadata.size() ? table_map.column_metadata[i] : 0;
+            values[i] = read_binlog_row_value(cursor, table_map.column_types[i], metadata);
+        }
+        ++selected;
+    }
+    return values;
+}
+
+void parse_table_map_event_body(BinlogEvent& event, PacketCursor& body_cursor, BinlogParserState* state) {
+    event.table_id = read_u48_le(body_cursor);
+    event.table_flags = body_cursor.read_u16_le();
+    const auto schema_length = body_cursor.read_u8();
+    event.schema = body_cursor.read_ascii(schema_length);
+    body_cursor.read_u8();
+    const auto table_length = body_cursor.read_u8();
+    event.table = body_cursor.read_ascii(table_length);
+    body_cursor.read_u8();
+    const auto column_count = body_cursor.read_lenenc_int().value_or(0);
+    event.column_types.reserve(static_cast<std::size_t>(column_count));
+    for (uint64_t i = 0; i < column_count; ++i) {
+        event.column_types.push_back(body_cursor.read_u8());
+    }
+    const auto metadata_length = body_cursor.read_lenenc_int().value_or(0);
+    event.column_metadata = parse_table_map_metadata(event.column_types,
+                                                     body_cursor.read_buffer(static_cast<std::size_t>(metadata_length)));
+    event.column_null_bitmap = body_cursor.read_buffer(bitmap_byte_length(static_cast<std::size_t>(column_count)));
+
+    if (state) {
+        BinlogTableMapState table_map;
+        table_map.schema = event.schema;
+        table_map.table = event.table;
+        table_map.flags = event.table_flags;
+        table_map.column_types = event.column_types;
+        table_map.column_metadata = event.column_metadata;
+        table_map.column_null_bitmap = event.column_null_bitmap;
+        state->tables[event.table_id] = std::move(table_map);
+    }
+}
+
+bool is_rows_event(uint8_t event_type) {
+    return event_type == constants::binlog_event_type::WRITE_ROWS_V1 ||
+           event_type == constants::binlog_event_type::UPDATE_ROWS_V1 ||
+           event_type == constants::binlog_event_type::DELETE_ROWS_V1 ||
+           event_type == constants::binlog_event_type::WRITE_ROWS_V2 ||
+           event_type == constants::binlog_event_type::UPDATE_ROWS_V2 ||
+           event_type == constants::binlog_event_type::DELETE_ROWS_V2;
+}
+
+bool is_update_rows_event(uint8_t event_type) {
+    return event_type == constants::binlog_event_type::UPDATE_ROWS_V1 ||
+           event_type == constants::binlog_event_type::UPDATE_ROWS_V2;
+}
+
+bool is_delete_rows_event(uint8_t event_type) {
+    return event_type == constants::binlog_event_type::DELETE_ROWS_V1 ||
+           event_type == constants::binlog_event_type::DELETE_ROWS_V2;
+}
+
+bool is_rows_event_v2(uint8_t event_type) {
+    return event_type == constants::binlog_event_type::WRITE_ROWS_V2 ||
+           event_type == constants::binlog_event_type::UPDATE_ROWS_V2 ||
+           event_type == constants::binlog_event_type::DELETE_ROWS_V2;
+}
+
+void parse_rows_event_body(BinlogEvent& event, PacketCursor& body_cursor, BinlogParserState* state) {
+    event.table_id = read_u48_le(body_cursor);
+    event.table_flags = body_cursor.read_u16_le();
+    if (is_rows_event_v2(event.header.event_type)) {
+        const auto extra_data_length = body_cursor.read_u16_le();
+        if (extra_data_length > 2) {
+            body_cursor.skip(extra_data_length - 2);
+        }
+    }
+    const auto column_count = body_cursor.read_lenenc_int().value_or(0);
+    const auto bitmap_length = bitmap_byte_length(static_cast<std::size_t>(column_count));
+    event.columns_present_bitmap = body_cursor.read_buffer(bitmap_length);
+    if (is_update_rows_event(event.header.event_type)) {
+        event.columns_present_bitmap_after = body_cursor.read_buffer(bitmap_length);
+    }
+
+    if (!state) {
+        return;
+    }
+    const auto table = state->tables.find(event.table_id);
+    if (table == state->tables.end()) {
+        return;
+    }
+    event.schema = table->second.schema;
+    event.table = table->second.table;
+    event.column_types = table->second.column_types;
+    event.column_metadata = table->second.column_metadata;
+    event.column_null_bitmap = table->second.column_null_bitmap;
+    while (body_cursor.has_more()) {
+        BinlogRowChange change;
+        const auto before_start = body_cursor.offset();
+        if (is_update_rows_event(event.header.event_type) || is_delete_rows_event(event.header.event_type)) {
+            change.before = read_binlog_row_values(body_cursor, table->second, event.columns_present_bitmap);
+            change.raw_before = body_cursor.payload().slice(before_start, body_cursor.offset());
+        }
+        if (!is_delete_rows_event(event.header.event_type)) {
+            const auto after_start = body_cursor.offset();
+            const auto& after_bitmap = is_update_rows_event(event.header.event_type)
+                ? event.columns_present_bitmap_after
+                : event.columns_present_bitmap;
+            change.after = read_binlog_row_values(body_cursor, table->second, after_bitmap);
+            change.raw_after = body_cursor.payload().slice(after_start, body_cursor.offset());
+        }
+        event.row_changes.push_back(std::move(change));
+    }
+}
+
+BinlogEvent parse_binlog_event_packet_impl(const Buffer& payload, BinlogParserState* state = nullptr) {
     if (payload.length() == 0) {
         throw Error("empty binlog event packet");
     }
@@ -2412,9 +3324,10 @@ BinlogEvent parse_binlog_event_packet_impl(const Buffer& payload) {
     event.header.flags = cursor.read_u16_le();
     event.name = binlog_event_name(event.header.event_type);
 
-    PacketCursor body_cursor(cursor.read_rest_buffer());
+    event.body = cursor.read_rest_buffer();
+    PacketCursor body_cursor(event.body);
     switch (event.header.event_type) {
-        case 2: {
+        case constants::binlog_event_type::QUERY: {
             body_cursor.read_u32_le(); // slave proxy id
             body_cursor.read_u32_le(); // execution time
             const auto schema_length = body_cursor.read_u8();
@@ -2428,14 +3341,14 @@ BinlogEvent parse_binlog_event_packet_impl(const Buffer& payload) {
             event.query = body_cursor.read_ascii(body_cursor.length() - body_cursor.offset());
             break;
         }
-        case 4: {
+        case constants::binlog_event_type::ROTATE: {
             const auto low = body_cursor.read_u32_le();
             const auto high = body_cursor.read_u32_le();
             event.next_position = (static_cast<uint64_t>(high) << 32) | low;
             event.next_binlog = body_cursor.read_ascii(body_cursor.length() - body_cursor.offset());
             break;
         }
-        case 15: {
+        case constants::binlog_event_type::FORMAT_DESCRIPTION: {
             event.binlog_version = body_cursor.read_u16_le();
             event.server_version = strip_at_nul(body_cursor.read_ascii(50));
             event.create_timestamp = body_cursor.read_u32_le();
@@ -2443,11 +3356,26 @@ BinlogEvent parse_binlog_event_packet_impl(const Buffer& payload) {
             event.event_type_header_lengths = body_cursor.read_rest_buffer();
             break;
         }
-        case 16: {
+        case constants::binlog_event_type::XID: {
             event.xid = body_cursor.read_u64_le();
             break;
         }
+        case constants::binlog_event_type::TABLE_MAP:
+            parse_table_map_event_body(event, body_cursor, state);
+            break;
+        case constants::binlog_event_type::GTID:
+        case constants::binlog_event_type::ANONYMOUS_GTID:
+            event.gtid_flags = body_cursor.read_u8();
+            event.gtid_sid = uuid_from_bytes(body_cursor.read_buffer(16));
+            event.gtid_sequence_number = body_cursor.read_u64_le();
+            break;
+        case constants::binlog_event_type::PREVIOUS_GTIDS:
+            event.previous_gtids = decode_gtid_set(body_cursor.read_rest_buffer());
+            break;
         default:
+            if (is_rows_event(event.header.event_type)) {
+                parse_rows_event_body(event, body_cursor, state);
+            }
             break;
     }
     return event;
@@ -2811,13 +3739,26 @@ public:
     }
 
     std::vector<BinlogEvent> binlog_dump(const BinlogDumpOptions& options) {
-        ensure_connected();
         if ((options.flags & kBinlogDumpNonBlock) == 0 && options.max_events == 0) {
-            throw Error("blocking COM_BINLOG_DUMP requires max_events to avoid an unbounded synchronous read");
+            throw Error("blocking binlog_dump requires max_events to avoid an unbounded vector read; use binlog_dump_each for a callback-controlled stream");
         }
-
-        write_packet(build_binlog_dump_payload(options), 0);
         std::vector<BinlogEvent> events;
+        events.reserve(options.max_events == 0 ? 0 : options.max_events);
+        binlog_dump_each(options, [&](const BinlogEvent& event) {
+            events.push_back(event);
+            return true;
+        });
+        return events;
+    }
+
+    std::size_t binlog_dump_each(const BinlogDumpOptions& options, const BinlogEventCallback& callback) {
+        ensure_connected();
+        if (!callback) {
+            throw Error("binlog_dump_each requires a callback");
+        }
+        write_packet(build_binlog_dump_payload(options), 0);
+        BinlogParserState parser_state;
+        std::size_t count = 0;
         while (true) {
             const auto frame = read_packet();
             if (is_err_packet(frame.payload)) {
@@ -2826,8 +3767,10 @@ public:
             if (is_eof_packet(frame.payload)) {
                 break;
             }
-            events.push_back(parse_binlog_event_packet(frame.payload));
-            if (options.max_events != 0 && events.size() >= options.max_events) {
+            const auto event = parse_binlog_event_packet_impl(frame.payload, &parser_state);
+            ++count;
+            const bool keep_going = callback(event);
+            if (!keep_going || (options.max_events != 0 && count >= options.max_events)) {
                 close_transport();
                 connected_ = false;
                 tls_active_ = false;
@@ -2835,7 +3778,7 @@ public:
                 break;
             }
         }
-        return events;
+        return count;
     }
 
     void close_statement(const PreparedStatement& statement) {
@@ -4091,8 +5034,33 @@ void clear_parser_cache() noexcept {
     // JavaScript parser generation caches do not exist in this static C++ parser.
 }
 
+std::vector<BinlogGtidSource> parse_gtid_set(const std::string& gtid_set) {
+    return parse_gtid_set_text(gtid_set);
+}
+
 BinlogEvent parse_binlog_event_packet(const Buffer& payload) {
     return parse_binlog_event_packet_impl(payload);
+}
+
+class BinlogParser::Impl {
+public:
+    BinlogParserState state;
+};
+
+BinlogParser::BinlogParser() : impl_(std::make_unique<Impl>()) {}
+
+BinlogParser::~BinlogParser() = default;
+
+BinlogParser::BinlogParser(BinlogParser&&) noexcept = default;
+
+BinlogParser& BinlogParser::operator=(BinlogParser&&) noexcept = default;
+
+BinlogEvent BinlogParser::parse(const Buffer& payload) {
+    return parse_binlog_event_packet_impl(payload, &impl_->state);
+}
+
+void BinlogParser::clear_table_map() {
+    impl_->state.tables.clear();
 }
 
 template <typename T, typename F>
@@ -4735,6 +5703,15 @@ std::vector<BinlogEvent> Connection::binlog_dump(const BinlogDumpOptions& option
     }
 }
 
+std::size_t Connection::binlog_dump_each(const BinlogDumpOptions& options, BinlogEventCallback callback) {
+    try {
+        return impl_->binlog_dump_each(options, callback);
+    } catch (const Error& error) {
+        impl_->emit_error(error);
+        throw;
+    }
+}
+
 void Connection::binlog_dump(const BinlogDumpOptions& options, BinlogEventsCallback callback) {
     try {
         auto events = binlog_dump(options);
@@ -4940,8 +5917,49 @@ public:
         write_raw(std::move(packet));
     }
 
+    void write_columns(const std::vector<Field>& fields) {
+        std::vector<uint8_t> out;
+        uint8_t sequence = next_response_sequence_;
+        std::vector<uint8_t> header;
+        append_lenenc_int(header, fields.size());
+        append_packet_bytes(out, buffer_from_bytes(header), sequence);
+        for (const auto& field : fields) {
+            append_packet_bytes(out, build_column_definition_payload(field), sequence);
+        }
+        append_packet_bytes(out, build_eof_payload(), sequence);
+        next_response_sequence_ = sequence;
+        write_raw(std::move(out));
+    }
+
+    void write_text_row(const Row& row, const std::vector<Field>& fields) {
+        write_packet_payload(build_text_row_payload(row, fields));
+    }
+
+    void write_binary_row(const Row& row, const std::vector<Field>& fields) {
+        write_packet_payload(build_binary_row_payload(row, fields));
+    }
+
+    void write_eof(uint16_t warnings, uint16_t status) {
+        write_packet_payload(build_eof_payload(warnings, status));
+    }
+
     void write_text_result(const std::vector<Row>& rows, const std::vector<Field>& fields) {
         write_raw(build_text_result_packets(rows, fields, next_response_sequence_));
+    }
+
+    void write_binary_result(const std::vector<Row>& rows, const std::vector<Field>& fields) {
+        write_raw(build_binary_result_packets(rows, fields, next_response_sequence_));
+    }
+
+    void write_statement_prepare_ok(uint32_t statement_id,
+                                    const std::vector<Field>& parameters,
+                                    const std::vector<Field>& fields,
+                                    uint16_t warning_count) {
+        write_raw(build_statement_prepare_ok_packets(statement_id,
+                                                     parameters,
+                                                     fields,
+                                                     warning_count,
+                                                     next_response_sequence_));
     }
 
     void close() noexcept {
@@ -5181,6 +6199,14 @@ private:
         write_raw(std::move(packet), true);
     }
 
+    void write_packet_payload(const Buffer& payload) {
+        std::vector<uint8_t> packet;
+        uint8_t sequence = next_response_sequence_;
+        append_packet_bytes(packet, payload, sequence);
+        next_response_sequence_ = sequence;
+        write_raw(std::move(packet));
+    }
+
     void write_raw(std::vector<uint8_t> bytes, bool close_after_write = false) {
         if (!socket_.isOpen()) {
             return;
@@ -5270,12 +6296,43 @@ void ServerConnection::write_error(const Error& error) {
                        error.what());
 }
 
+void ServerConnection::write_columns(const std::vector<Field>& fields) {
+    impl_->write_columns(fields);
+}
+
+void ServerConnection::write_text_row(const Row& row, const std::vector<Field>& fields) {
+    impl_->write_text_row(row, fields);
+}
+
+void ServerConnection::write_binary_row(const Row& row, const std::vector<Field>& fields) {
+    impl_->write_binary_row(row, fields);
+}
+
+void ServerConnection::write_eof(uint16_t warnings, uint16_t status) {
+    impl_->write_eof(warnings, status);
+}
+
 void ServerConnection::write_text_result(const QueryResult& result) {
     impl_->write_text_result(result.rows, result.fields);
 }
 
 void ServerConnection::write_text_result(const std::vector<Row>& rows, const std::vector<Field>& fields) {
     impl_->write_text_result(rows, fields);
+}
+
+void ServerConnection::write_binary_result(const QueryResult& result) {
+    impl_->write_binary_result(result.rows, result.fields);
+}
+
+void ServerConnection::write_binary_result(const std::vector<Row>& rows, const std::vector<Field>& fields) {
+    impl_->write_binary_result(rows, fields);
+}
+
+void ServerConnection::write_statement_prepare_ok(uint32_t statement_id,
+                                                  const std::vector<Field>& parameters,
+                                                  const std::vector<Field>& fields,
+                                                  uint16_t warning_count) {
+    impl_->write_statement_prepare_ok(statement_id, parameters, fields, warning_count);
 }
 
 void ServerConnection::close() noexcept {

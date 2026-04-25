@@ -134,6 +134,94 @@ TEST(binlog, parse_query_event_packet) {
     EXPECT_EQ(event.query, query);
 }
 
+TEST(binlog, stateful_parser_decodes_table_map_and_write_rows) {
+    auto append_u8 = [](std::vector<uint8_t>& payload, uint8_t value) { payload.push_back(value); };
+    auto append_u16 = [](std::vector<uint8_t>& payload, uint16_t value) {
+        payload.push_back(static_cast<uint8_t>(value & 0xff));
+        payload.push_back(static_cast<uint8_t>((value >> 8) & 0xff));
+    };
+    auto append_u32 = [](std::vector<uint8_t>& payload, uint32_t value) {
+        payload.push_back(static_cast<uint8_t>(value & 0xff));
+        payload.push_back(static_cast<uint8_t>((value >> 8) & 0xff));
+        payload.push_back(static_cast<uint8_t>((value >> 16) & 0xff));
+        payload.push_back(static_cast<uint8_t>((value >> 24) & 0xff));
+    };
+    auto append_u48 = [](std::vector<uint8_t>& payload, uint64_t value) {
+        for (int i = 0; i < 6; ++i) {
+            payload.push_back(static_cast<uint8_t>((value >> (8 * i)) & 0xff));
+        }
+    };
+    auto append_string = [](std::vector<uint8_t>& payload, const std::string& value) {
+        payload.insert(payload.end(), value.begin(), value.end());
+    };
+    auto make_event = [&](uint8_t type, const std::vector<uint8_t>& body) {
+        std::vector<uint8_t> payload;
+        append_u8(payload, 0x00);
+        append_u32(payload, 1);
+        append_u8(payload, type);
+        append_u32(payload, 99);
+        append_u32(payload, static_cast<uint32_t>(19 + body.size()));
+        append_u32(payload, 1234);
+        append_u16(payload, 0);
+        payload.insert(payload.end(), body.begin(), body.end());
+        return mysql2::Buffer::from(payload.data(), payload.size());
+    };
+
+    std::vector<uint8_t> table_map_body;
+    append_u48(table_map_body, 7);
+    append_u16(table_map_body, 0);
+    append_u8(table_map_body, 4);
+    append_string(table_map_body, "test");
+    append_u8(table_map_body, 0);
+    append_u8(table_map_body, 1);
+    append_string(table_map_body, "t");
+    append_u8(table_map_body, 0);
+    append_u8(table_map_body, 2);
+    append_u8(table_map_body, mysql2::constants::column_type::LONG);
+    append_u8(table_map_body, mysql2::constants::column_type::VAR_STRING);
+    append_u8(table_map_body, 2);
+    append_u16(table_map_body, 255);
+    append_u8(table_map_body, 0);
+
+    std::vector<uint8_t> row_body;
+    append_u48(row_body, 7);
+    append_u16(row_body, 0);
+    append_u8(row_body, 2);
+    append_u8(row_body, 0x03);
+    append_u8(row_body, 0x00);
+    append_u32(row_body, 42);
+    append_u8(row_body, 3);
+    append_string(row_body, "Ada");
+
+    mysql2::BinlogParser parser;
+    const auto table_map = parser.parse(make_event(mysql2::constants::binlog_event_type::TABLE_MAP, table_map_body));
+    EXPECT_EQ(table_map.name, "TableMapEvent");
+    EXPECT_EQ(table_map.table_id, 7u);
+    EXPECT_EQ(table_map.schema, "test");
+    EXPECT_EQ(table_map.table, "t");
+    ASSERT_EQ(table_map.column_types.size(), 2u);
+
+    const auto rows = parser.parse(make_event(mysql2::constants::binlog_event_type::WRITE_ROWS_V1, row_body));
+    EXPECT_EQ(rows.name, "WriteRowsEventV1");
+    EXPECT_EQ(rows.schema, "test");
+    EXPECT_EQ(rows.table, "t");
+    ASSERT_EQ(rows.row_changes.size(), 1u);
+    ASSERT_EQ(rows.row_changes[0].after.size(), 2u);
+    EXPECT_EQ(std::get<int64_t>(rows.row_changes[0].after[0]), 42);
+    EXPECT_EQ(std::get<std::string>(rows.row_changes[0].after[1]), "Ada");
+}
+
+TEST(binlog, parses_gtid_set_text) {
+    const auto sources = mysql2::parse_gtid_set("3E11FA47-71CA-11E1-9E33-C80AA9429562:1-3:7");
+    ASSERT_EQ(sources.size(), 1u);
+    EXPECT_EQ(sources[0].sid, "3E11FA47-71CA-11E1-9E33-C80AA9429562");
+    ASSERT_EQ(sources[0].intervals.size(), 2u);
+    EXPECT_EQ(sources[0].intervals[0].start, 1u);
+    EXPECT_EQ(sources[0].intervals[0].end, 3u);
+    EXPECT_EQ(sources[0].intervals[1].start, 7u);
+    EXPECT_EQ(sources[0].intervals[1].end, 7u);
+}
+
 TEST(sql_escape, identifiers_and_format) {
     EXPECT_EQ(mysql2::escape_id("users.name"), "`users`.`name`");
     EXPECT_EQ(mysql2::escape_id("we`ird", true), "`we``ird`");
@@ -201,6 +289,8 @@ TEST(server_mode, loopback_query_uses_adapted_server_api) {
     std::atomic<bool> quit_seen{false};
     std::atomic<bool> stmt_prepare_seen{false};
     std::atomic<bool> stmt_execute_seen{false};
+    std::atomic<bool> protocol_stmt_prepare_seen{false};
+    std::atomic<bool> protocol_stmt_execute_seen{false};
 
     server_options.handshake.auth_callback = [&](const mysql2::ServerAuthInfo& auth) -> std::optional<mysql2::Error> {
         const auto attr = auth.connect_attributes.find("polycpp_test");
@@ -231,13 +321,42 @@ TEST(server_mode, loopback_query_uses_adapted_server_api) {
             conn.write_ok();
         });
         connection.on(mysql2::event::ServerStatementPrepare, [&](mysql2::ServerConnection& conn, const std::string& sql) {
-            stmt_prepare_seen = sql.rfind("PREPARE ", 0) == 0;
-            conn.write_ok();
+            if (sql == "SELECT ? AS answer") {
+                protocol_stmt_prepare_seen = true;
+                mysql2::Field parameter;
+                parameter.name = "param";
+                parameter.column_type = mysql2::constants::column_type::LONGLONG;
+                parameter.character_set = 63;
+                parameter.encoding = "binary";
+
+                mysql2::Field answer;
+                answer.name = "answer";
+                answer.column_type = mysql2::constants::column_type::LONGLONG;
+                answer.character_set = 63;
+                answer.encoding = "binary";
+                conn.write_statement_prepare_ok(7, {parameter}, {answer});
+            } else {
+                stmt_prepare_seen = sql.rfind("PREPARE ", 0) == 0;
+                conn.write_ok();
+            }
         });
         connection.on(mysql2::event::ServerStatementExecute,
                       [&](mysql2::ServerConnection& conn, const mysql2::ServerStatementExecuteInfo& info) {
-            stmt_execute_seen = info.query == "EXECUTE polycpp_stmt";
-            conn.write_ok();
+            if (info.statement_id == 7) {
+                protocol_stmt_execute_seen = !info.values.empty() && std::get<int64_t>(info.values[0]) == 41;
+                mysql2::Field answer;
+                answer.name = "answer";
+                answer.column_type = mysql2::constants::column_type::LONGLONG;
+                answer.character_set = 63;
+                answer.encoding = "binary";
+
+                mysql2::Row row;
+                row.values = {int64_t{42}};
+                conn.write_binary_result(std::vector<mysql2::Row>{row}, std::vector<mysql2::Field>{answer});
+            } else {
+                stmt_execute_seen = info.query == "EXECUTE polycpp_stmt";
+                conn.write_ok();
+            }
         });
         connection.on(mysql2::event::ServerQuit, [&](mysql2::ServerConnection&) {
             quit_seen = true;
@@ -259,6 +378,10 @@ TEST(server_mode, loopback_query_uses_adapted_server_api) {
     EXPECT_EQ(std::get<int64_t>(result.rows[0].at("answer")), 42);
     client.query("PREPARE polycpp_stmt FROM 'SELECT 1'");
     client.query("EXECUTE polycpp_stmt");
+    const auto statement = client.prepare("SELECT ? AS answer");
+    const auto prepared_result = client.execute(statement, {int64_t{41}});
+    ASSERT_EQ(prepared_result.rows.size(), 1u);
+    EXPECT_EQ(std::get<int64_t>(prepared_result.rows[0].at("answer")), 42);
     client.ping();
     client.end();
 
@@ -274,6 +397,8 @@ TEST(server_mode, loopback_query_uses_adapted_server_api) {
     EXPECT_TRUE(quit_seen);
     EXPECT_TRUE(stmt_prepare_seen);
     EXPECT_TRUE(stmt_execute_seen);
+    EXPECT_TRUE(protocol_stmt_prepare_seen);
+    EXPECT_TRUE(protocol_stmt_execute_seen);
     EXPECT_EQ(server.connection_count(), 0u);
 }
 

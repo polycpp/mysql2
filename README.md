@@ -38,14 +38,15 @@ Implemented:
 - `COM_CHANGE_USER`, transaction helpers, ping, reset, graceful end, synchronous RAII pools, and pool clusters.
 - AWS RDS TLS profile CA data from `aws-ssl-profiles@1.1.2` via `SslOptions::profile = "Amazon RDS"`.
 - Parser-cache compatibility controls as no-op/static-parser audit hooks.
-- Bounded `COM_REGISTER_SLAVE` and `COM_BINLOG_DUMP` support with typed parsing for Query, Rotate, FormatDescription, and Xid events, plus raw payload retention for unknown event types.
-- Adapted server protocol mode with `create_server`, `Server`, `ServerConnection`, server-side protocol handshake/auth callback, typed query/ping/quit/init-db/field-list/statement command events, and OK/ERR/text-result response writers.
+- Bounded `COM_REGISTER_SLAVE`, `COM_BINLOG_DUMP`, and `COM_BINLOG_DUMP_GTID` support with typed parsing for Query, Rotate, FormatDescription, Xid, GTID, PreviousGTIDs, TableMap, and common row events, plus raw payload retention for audit and unsupported event types.
+- `BinlogParser` for stateful table-map-aware row decoding and `Connection::binlog_dump_each(...)` for callback-controlled replication reads without accumulating an unbounded vector.
+- Adapted server protocol mode with `create_server`, `Server`, `ServerConnection`, server-side protocol handshake/auth callback, typed query/ping/quit/init-db/field-list/statement command events, statement-prepare OK writers, and OK/ERR/text/binary result response writers.
 - Optional real MariaDB/MySQL e2e tests controlled by `MYSQL2_TEST_*` environment variables.
 
 Deferred:
 
-- GTID binlog dump, continuous replication stream abstraction, and full row/table-map event decoding.
 - Exact Node `Readable` object-mode row chunks. `query_stream(...)` provides a typed C++ row iterator and `query_stream_json()` exposes newline-delimited JSON `Buffer` chunks because polycpp streams currently emit byte/text chunks, not arbitrary row objects.
+- Unix socket server listen overloads and TLS server mode. `polycpp::net`/`polycpp::io` currently provide TCP server primitives, while the mysql2 server TLS upgrade path requires a separate server-side TLS design.
 
 Known divergences:
 
@@ -53,10 +54,10 @@ Known divergences:
 - Native MySQL/MariaDB client SDKs are intentionally not linked.
 - Node diagnostic channels are adapted to typed `event::Trace` events.
 - Node object-mode row streaming is adapted to typed `RowStream` rows plus JSON line byte streams for auditability and `polycpp::stream` compatibility.
-- Server mode is adapted to a TCP-only C++ server object. It supports handshake/auth inspection, command dispatch, packet observation, and basic OK/ERR/text-result writers; Unix socket listen overloads, TLS server mode, and a full SQL engine are intentionally not implied.
+- Server mode is adapted to a TCP-only C++ server object. It supports handshake/auth inspection, command dispatch, packet observation, statement prepare OK packets, and OK/ERR/text/binary result writers; Unix socket listen overloads, TLS server mode, and a full SQL engine are intentionally not implied.
 - Parser cache controls are compatibility no-ops because C++ uses static parsers.
 - Query attributes use `std::unordered_map`, so attribute wire order is not a public contract.
-- Bounded binlog dump closes the connection if `max_events` is reached before EOF, because the connection is otherwise left in the replication command stream.
+- Bounded binlog dump closes the connection if `max_events` is reached before EOF, because the connection is otherwise left in the replication command stream. Use `binlog_dump_each(...)` when the caller wants callback-controlled continuous consumption.
 
 ## Prerequisites
 
@@ -160,6 +161,24 @@ for (const auto& event : events) {
         (void)event.query;
     }
 }
+```
+
+Callback-controlled binlog read with table-map-aware parsing:
+
+```cpp
+polycpp::mysql2::BinlogDumpOptions stream_dump;
+stream_dump.flags = 0;
+stream_dump.max_events = 0;
+stream_dump.server_id = 12345;
+
+conn.binlog_dump_each(stream_dump, [](const polycpp::mysql2::BinlogEvent& event) {
+    if (event.name == "WriteRowsEventV2") {
+        for (const auto& change : event.row_changes) {
+            (void)change.after;
+        }
+    }
+    return true; // return false to close the replication command stream
+});
 ```
 
 Adapted server mode:
