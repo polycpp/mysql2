@@ -33,13 +33,13 @@ python3 /data/work/libgen/scripts/analyze-upstream-js.py /data/work/lib/mysql2 /
 |---|---|---|---|---|---|---|---|---|---:|---:|---:|---:|---|---|
 | @types/node | peer | >= 8 | not installed | MIT | npm package metadata license field | dev/test-only | dev/test-only, not shipped | no-dev-only | 0 | 0 | 0 | 0 | omit from C++ port | Type-only package for upstream TypeScript declarations. |
 | aws-ssl-profiles | hard | ^1.1.2 | 1.1.2 | MIT | package.json license field | permissive | permissive dependency ok with notice | no | 0 | 8 | 0 | 0 | deferred or unsupported feature | Only needed for named TLS profile data. TLS itself is implemented through polycpp TLS options. |
-| denque | hard | ^2.1.0 | 2.1.0 | Apache-2.0 | package.json license field | permissive | permissive dependency ok with notice | no | 0 | 2 | 0 | 5 | implement private helper in this repo | Upstream uses it for command queues; this synchronous port uses standard containers and an RAII pool. |
-| generate-function | hard | ^2.3.1 | 2.3.1 | MIT | package.json license field | permissive | permissive dependency ok with notice | no | 1 | 3 | 1 | 13 | deferred or unsupported feature | Upstream uses generated JS parsers for V8 speed. C++ uses static parsers. |
-| iconv-lite | hard | ^0.7.2 | 0.7.2 | MIT | package.json license field and existing companion license | permissive | use existing companion license | no | 1 | 16 | 37 | 39 | use existing polycpp companion | Existing `/data/work/lib/iconv-lite` companion is linked for charset decoding. |
-| long | hard | ^5.3.2 | 5.3.2 | Apache-2.0 | package.json license field | permissive | permissive dependency ok with notice | no | 0 | 6 | 0 | 20 | implement private helper in this repo | C++ native `int64_t` and `uint64_t` replace JS Long behavior for parsed values. |
-| lru.min | hard | ^1.1.4 | 1.1.4 | MIT | package.json license field | permissive | permissive dependency ok with notice | no | 0 | 4 | 0 | 53 | create separate private polycpp companion repo if reused broadly | Needed for upstream parser and prepared statement caches; this port implements prepared statements without an LRU cache. |
-| named-placeholders | hard | ^1.1.6 | 1.1.6 | MIT | package.json license field | permissive | permissive dependency ok with notice | no | 1 | 1 | 0 | 7 | implement private helper in this repo | The port implements a small named placeholder formatter locally against C++ value variants. |
-| sql-escaper | hard | ^1.3.3 | 1.3.3 | MIT | package.json license field | permissive | permissive dependency ok with notice | no | 0 | 5 | 6 | 57 | implement private helper in this repo | The port implements SQL escape, identifier escape, positional format, and raw SQL locally. |
+| denque | hard | ^2.1.0 | 2.1.0 | Apache-2.0 | package.json license field | permissive | permissive dependency ok with notice | no | 0 | 2 | 0 | 13 | implement private helper in this repo | Upstream uses it for command queues; this synchronous port uses standard containers and an RAII pool. |
+| generate-function | hard | ^2.3.1 | 2.3.1 | MIT | package.json license field | permissive | permissive dependency ok with notice | no | 1 | 3 | 2 | 13 | deferred or unsupported feature | Upstream uses generated JS parsers for V8 speed. C++ uses static parsers. |
+| iconv-lite | hard | ^0.7.2 | 0.7.2 | MIT | package.json license field and existing companion license | permissive | use existing companion license | no | 1 | 16 | 38 | 55 | use existing polycpp companion | Existing `/data/work/lib/iconv-lite` companion is linked for charset decoding. |
+| long | hard | ^5.3.2 | 5.3.2 | Apache-2.0 | package.json license field | permissive | permissive dependency ok with notice | no | 0 | 6 | 0 | 21 | implement private helper in this repo | C++ native `int64_t` and `uint64_t` replace JS Long behavior for parsed values. |
+| lru.min | hard | ^1.1.4 | 1.1.4 | MIT | package.json license field | permissive | permissive dependency ok with notice | no | 0 | 4 | 0 | 71 | create separate private polycpp companion repo if reused broadly | Needed for upstream parser and prepared statement caches; this port implements the required statement-cache behavior locally with standard containers. |
+| named-placeholders | hard | ^1.1.6 | 1.1.6 | MIT | package.json license field | permissive | permissive dependency ok with notice | no | 1 | 1 | 0 | 8 | implement private helper in this repo | The port implements a small named placeholder formatter locally against C++ value variants. |
+| sql-escaper | hard | ^1.3.3 | 1.3.3 | MIT | package.json license field | permissive | permissive dependency ok with notice | no | 0 | 5 | 8 | 65 | implement private helper in this repo | The port implements SQL escape, identifier escape, positional format, and raw SQL locally. |
 
 ## Dependency ownership decisions
 
@@ -48,7 +48,7 @@ python3 /data/work/libgen/scripts/analyze-upstream-js.py /data/work/lib/mysql2 /
 - `denque`: replace with standard containers and synchronous pool bookkeeping.
 - `named-placeholders`: implement small local formatter for `:name` values.
 - `sql-escaper`: implement local SQL escaping utilities and test edge bytes.
-- `lru.min`: defer until prepared-statement cache is implemented; create a separate companion only if multiple ports need it.
+- `lru.min`: implement the required prepared-statement cache semantics locally with standard containers; create a separate companion only if multiple ports need a reusable LRU type.
 - `generate-function`: omit because C++ parser generation is not needed.
 - `aws-ssl-profiles`: defer named TLS profile support; direct TLS options are implemented.
 - `@types/node`: omit as type-only upstream metadata.
@@ -82,6 +82,7 @@ python3 /data/work/libgen/scripts/analyze-upstream-js.py /data/work/lib/mysql2 /
 ### Analyzer porting gates
 
 - polycpp reuse hints consumed: yes; Buffer, crypto, IO, JSON, and zlib/TLS hints were reviewed
+- Node parity hints consumed: yes; callback, Promise, EventEmitter, stream, Buffer, URL, timer/process, crypto, compression, filesystem, network, and TLS surfaces were reviewed against polycpp APIs
 - security hints consumed: yes; package is security-sensitive because it handles credentials, crypto, network packets, and SQL escaping
 - security-sensitive package: yes
 
@@ -91,16 +92,28 @@ python3 /data/work/libgen/scripts/analyze-upstream-js.py /data/work/lib/mysql2 /
 - `crypto`: SHA1/SHA256/RSA public encrypt; mapped to `polycpp::crypto`.
 - `net`: TCP client; mapped to `polycpp::io::TcpSocket`.
 - `tls`: mapped to `polycpp::io::TlsContext`, `polycpp::io::TlsStream`, and `polycpp::ssl::X509Cert`.
-- `zlib`: deferred compression.
-- `events`, `stream`, `process`, `timers`: Node runtime command and callback mechanics; adapted to synchronous C++ API or deferred for streams.
-- `url`: connection URI parsing is deferred.
+- `zlib`: mapped to `polycpp::zlib` for the MySQL compressed packet protocol.
+- `events`: mapped to typed `polycpp::events::EventEmitter` integration on connections, pools, and pool clusters.
+- `stream`: Node object-mode row streams are adapted to `polycpp::stream::Readable` byte chunks containing newline-delimited JSON rows.
+- `process`, `timers`: Node runtime command queue mechanics are adapted to synchronous typed execution; pool wait timeouts are represented with C++ chrono values.
+- `url`: mapped to `polycpp::url` for connection URI parsing.
+
+### Node parity surface usage
+
+- callbacks: implemented as `std::function` overloads over the typed connection, pool, and cluster operations.
+- Promise APIs: implemented as `polycpp::Promise` wrappers that settle from the typed implementation.
+- EventEmitter APIs: implemented through typed `polycpp::events::EventEmitter` forwarding on connections, pools, and pool clusters.
+- streams: adapted to `polycpp::stream::Readable` newline-delimited JSON `Buffer` chunks.
+- Buffer and binary data: mapped to `polycpp::Buffer` for packets, binary SQL values, result columns, and LOCAL INFILE chunks.
+- URL/timer/process/filesystem APIs: URI parsing uses `polycpp::url`; wait timeouts use C++ chrono; process APIs are not public; filesystem access is limited to explicit TLS file options and caller-provided LOCAL INFILE buffers.
+- crypto/compression/TLS/network/HTTP APIs: crypto uses `polycpp::crypto`; compression uses `polycpp::zlib`; TCP/TLS uses `polycpp::io` and `polycpp::ssl`; HTTP APIs are not relevant to this protocol driver.
 
 ### JavaScript API usage
 
 - Dynamic object options become `ConnectionOptions`.
 - Dynamic rows become `Row` containing `std::variant` values plus field-name index lookup.
 - Generated JS parsers are replaced by static C++ text-row parsing.
-- Callback and Promise wrappers are omitted.
+- Callback and `polycpp::Promise` wrappers are provided as compatibility surfaces over the typed synchronous implementation.
 
 ### Framework object boundary usage
 
@@ -112,7 +125,7 @@ python3 /data/work/libgen/scripts/analyze-upstream-js.py /data/work/lib/mysql2 /
 
 - Implement pure MySQL protocol over polycpp TCP sockets.
 - Keep the public C++ API synchronous to make integration tests deterministic.
-- Fail closed on unsupported auth plugins, LOCAL INFILE, TLS-only cleartext auth, malformed packets, unexpected multi-results in single-result APIs, and server ERR packets.
+- Fail closed on unsupported auth plugins, LOCAL INFILE without an explicit handler, TLS-only cleartext auth, malformed packets, unexpected multi-results in single-result APIs, and server ERR packets.
 - Record deferred features explicitly rather than implying upstream parity.
 - Reuse `iconv-lite` companion for charset decoding, but document incomplete charset id mapping.
 

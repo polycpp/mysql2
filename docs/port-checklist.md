@@ -56,6 +56,7 @@ Legend:
 - [x] dependency license strategy recorded
 - [x] GPL/AGPL/LGPL/MPL impacts reviewed
 - [x] Node.js API usage reviewed
+- [x] Node parity surface audit completed
 - [x] JavaScript API usage reviewed
 
 ## Scope
@@ -74,6 +75,7 @@ Legend:
 - [x] direct vs adapted vs deferred status recorded
 - [x] dynamic typing adaptations recorded
 - [x] framework object boundary reviewed
+- [x] Node parity surface review recorded
 
 ## Testing
 
@@ -119,9 +121,10 @@ Validation evidence:
 
 - `cmake --build build -j2` passed.
 - `ctest --test-dir build --output-on-failure` passed with unit tests and skipped e2e when env was absent.
-- Real MariaDB 10.6 e2e passed with `MYSQL2_TEST_HOST=127.0.0.1 MYSQL2_TEST_PORT=43306 MYSQL2_TEST_USER=root MYSQL2_TEST_DATABASE=polycpp_mysql2_test`.
-- Real MariaDB 10.6 verified TLS e2e passed with `MYSQL2_TEST_SSL=1 MYSQL2_TEST_SSL_REJECT_UNAUTHORIZED=1 MYSQL2_TEST_SSL_VERIFY_IDENTITY=1 MYSQL2_TEST_SSL_CA_FILE=$PWD/build/mariadb-tls/ca.pem`.
 - Real MySQL 8.4.6 Docker e2e passed from an Ubuntu 22.04 helper container sharing the MySQL container network namespace.
+- Real MariaDB 10.6 Docker e2e passed from an Ubuntu 22.04 helper container sharing the MariaDB container network namespace.
+- Real MariaDB 10.6 verified TLS Docker e2e passed with `MYSQL2_TEST_SSL=1`, `MYSQL2_TEST_SSL_REJECT_UNAUTHORIZED=1`, `MYSQL2_TEST_SSL_VERIFY_IDENTITY=1`, and `MYSQL2_TEST_SSL_CA_FILE=/work/build/mariadb-tls/ca.pem`.
+- `python3 docs/build.py` passed.
 
 ## Public Release
 
@@ -132,4 +135,4 @@ Validation evidence:
 - [x] third-party license notices complete
 - [ ] GitHub repo visibility changed to public
 
-Public release note: keep the repository private until compression/non-compression release positioning and public visibility timing are reviewed.
+Public release note: keep the repository private until the user confirms public visibility for this comprehensive driver port.

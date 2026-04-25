@@ -7,8 +7,11 @@
 #include <polycpp/io/tls_context.hpp>
 #include <polycpp/io/tls_stream.hpp>
 #include <polycpp/ssl/x509_cert.hpp>
+#include <polycpp/url.hpp>
+#include <polycpp/zlib.hpp>
 
 #include <algorithm>
+#include <any>
 #include <cctype>
 #include <cstdlib>
 #include <array>
@@ -17,10 +20,13 @@
 #include <cmath>
 #include <condition_variable>
 #include <cstring>
+#include <deque>
 #include <limits>
+#include <map>
 #include <memory>
 #include <mutex>
 #include <optional>
+#include <random>
 #include <sstream>
 #include <system_error>
 #include <utility>
@@ -33,6 +39,7 @@ constexpr uint32_t LONG_PASSWORD = 0x00000001;
 constexpr uint32_t FOUND_ROWS = 0x00000002;
 constexpr uint32_t LONG_FLAG = 0x00000004;
 constexpr uint32_t CONNECT_WITH_DB = 0x00000008;
+constexpr uint32_t COMPRESS = 0x00000020;
 constexpr uint32_t LOCAL_FILES = 0x00000080;
 constexpr uint32_t PROTOCOL_41 = 0x00000200;
 constexpr uint32_t SSL = 0x00000800;
@@ -54,6 +61,7 @@ constexpr uint32_t MULTI_FACTOR_AUTHENTICATION = 0x10000000;
 namespace command_code {
 constexpr uint8_t QUIT = 0x01;
 constexpr uint8_t QUERY = 0x03;
+constexpr uint8_t CHANGE_USER = 0x11;
 constexpr uint8_t PING = 0x0e;
 constexpr uint8_t STMT_PREPARE = 0x16;
 constexpr uint8_t STMT_EXECUTE = 0x17;
@@ -74,7 +82,17 @@ constexpr uint16_t MORE_RESULTS_EXISTS = 0x0008;
 }  // namespace server_status
 
 constexpr std::size_t kPacketHeaderLength = 4;
+constexpr std::size_t kCompressedPacketHeaderLength = 7;
 constexpr std::size_t kMaxPacketPayloadLength = 0x00ffffff;
+constexpr std::size_t kMaxCompressedPayloadInputLength = 16777210;
+
+std::size_t normal_packet_count_for_payload(std::size_t payload_length) {
+    auto count = payload_length / kMaxPacketPayloadLength + 1;
+    if (payload_length > 0 && payload_length % kMaxPacketPayloadLength == 0) {
+        ++count;
+    }
+    return count;
+}
 
 bool is_eof_packet(const Buffer& payload) {
     return payload.length() > 0 && payload[0] == marker::EOF_PACKET && payload.length() < 9;
@@ -631,6 +649,12 @@ uint32_t build_client_flags(const ConnectionOptions& options, const Handshake& h
     if (options.ssl.enabled) {
         desired |= client_flag::SSL;
     }
+    if (options.compress) {
+        desired |= client_flag::COMPRESS;
+    }
+    if (options.local_infile_handler) {
+        desired |= client_flag::LOCAL_FILES;
+    }
     desired |= handshake.capability_flags & client_flag::MULTI_FACTOR_AUTHENTICATION;
     auto flags = desired & handshake.capability_flags;
     if (options.multiple_statements) {
@@ -710,6 +734,32 @@ Buffer build_ssl_request(const ConnectionOptions& options, uint32_t client_flags
     append_u32_le(out, 0);  // max packet size: 0 means default/no client-side cap.
     append_u8(out, options.charset_number);
     out.insert(out.end(), 23, 0);
+    return buffer_from_bytes(out);
+}
+
+Buffer build_change_user_payload(const ConnectionOptions& options,
+                                 uint32_t client_flags,
+                                 const std::string& auth_plugin_name,
+                                 const Buffer& auth_token) {
+    std::vector<uint8_t> out;
+    out.reserve(64 + options.user.size() + options.database.size() + auth_token.length());
+    append_u8(out, command_code::CHANGE_USER);
+    append_null_string(out, options.user);
+    if (client_flags & client_flag::SECURE_CONNECTION) {
+        if (auth_token.length() > 255) {
+            throw Error("authentication token is too large for COM_CHANGE_USER packet");
+        }
+        append_u8(out, static_cast<uint8_t>(auth_token.length()));
+        append_bytes(out, auth_token);
+    } else {
+        append_bytes(out, auth_token);
+        append_u8(out, 0);
+    }
+    append_null_string(out, options.database);
+    append_u16_le(out, options.charset_number);
+    if (client_flags & client_flag::PLUGIN_AUTH) {
+        append_null_string(out, auth_plugin_name);
+    }
     return buffer_from_bytes(out);
 }
 
@@ -1217,6 +1267,7 @@ public:
         client_encoding_ = charset_encoding(options_.charset_number);
 
         auto client_flags = build_client_flags(options_, handshake_);
+        client_flags_ = client_flags;
         if (options_.ssl.enabled) {
             if ((client_flags & client_flag::SSL) == 0) {
                 throw Error("server does not advertise SSL support");
@@ -1230,7 +1281,9 @@ public:
         auto token = calculate_auth_token(plugin, options_.password, scramble);
         write_packet(build_handshake_response(options_, handshake_, client_flags, plugin, token), tls_active_ ? 2 : 1);
         handle_auth_result(plugin, scramble, tls_active_ ? 3 : 2);
+        compression_active_ = options_.compress && ((client_flags & client_flag::COMPRESS) != 0);
         connected_ = true;
+        emitter_.emit(event::Connect, connection_info());
     }
 
     QueryResult query(const std::string& sql) {
@@ -1282,6 +1335,40 @@ public:
         return statement;
     }
 
+    PreparedStatement prepare_cached(const std::string& sql) {
+        const auto cached = statement_cache_.find(sql);
+        if (cached != statement_cache_.end()) {
+            touch_lru_key(sql);
+            return cached->second;
+        }
+        auto statement = prepare(sql);
+        if (options_.max_prepared_statements == 0) {
+            return statement;
+        }
+        while (statement_cache_.size() >= options_.max_prepared_statements && !statement_lru_.empty()) {
+            const auto evict_key = statement_lru_.front();
+            statement_lru_.pop_front();
+            const auto evict = statement_cache_.find(evict_key);
+            if (evict != statement_cache_.end()) {
+                const auto evict_statement = evict->second;
+                statement_cache_.erase(evict);
+                close_statement(evict_statement);
+            }
+        }
+        statement_lru_.push_back(sql);
+        statement_cache_[sql] = statement;
+        return statement;
+    }
+
+    void touch_lru_key(const std::string& sql) {
+        erase_lru_key(sql);
+        statement_lru_.push_back(sql);
+    }
+
+    void erase_lru_key(const std::string& sql) {
+        statement_lru_.erase(std::remove(statement_lru_.begin(), statement_lru_.end(), sql), statement_lru_.end());
+    }
+
     QueryResult execute(const PreparedStatement& statement, const std::vector<Value>& values) {
         auto results = execute_all(statement, values);
         if (results.size() != 1) {
@@ -1300,27 +1387,13 @@ public:
     }
 
     QueryResult execute(const std::string& sql, const std::vector<Value>& values) {
-        auto statement = prepare(sql);
-        try {
-            auto result = execute(statement, values);
-            close_statement(statement);
-            return result;
-        } catch (...) {
-            close_statement(statement);
-            throw;
-        }
+        auto statement = prepare_cached(sql);
+        return execute(statement, values);
     }
 
     std::vector<QueryResult> execute_all(const std::string& sql, const std::vector<Value>& values) {
-        auto statement = prepare(sql);
-        try {
-            auto results = execute_all(statement, values);
-            close_statement(statement);
-            return results;
-        } catch (...) {
-            close_statement(statement);
-            throw;
-        }
+        auto statement = prepare_cached(sql);
+        return execute_all(statement, values);
     }
 
     void close_statement(const PreparedStatement& statement) {
@@ -1328,11 +1401,30 @@ public:
         if (statement.id == 0) {
             return;
         }
+        for (auto it = statement_cache_.begin(); it != statement_cache_.end();) {
+            if (it->second.id == statement.id) {
+                erase_lru_key(it->first);
+                it = statement_cache_.erase(it);
+            } else {
+                ++it;
+            }
+        }
         std::vector<uint8_t> payload;
         payload.reserve(5);
         append_u8(payload, command_code::STMT_CLOSE);
         append_u32_le(payload, statement.id);
         write_packet(buffer_from_bytes(payload), 0);
+    }
+
+    void close_statement(const std::string& sql) {
+        const auto it = statement_cache_.find(sql);
+        if (it == statement_cache_.end()) {
+            return;
+        }
+        const auto statement = it->second;
+        erase_lru_key(sql);
+        statement_cache_.erase(it);
+        close_statement(statement);
     }
 
     OkPacket begin_transaction() {
@@ -1370,12 +1462,52 @@ public:
         if (!is_ok_packet(frame.payload)) {
             throw Error("unexpected packet for COM_RESET_CONNECTION");
         }
+        statement_cache_.clear();
+        statement_lru_.clear();
+    }
+
+    void change_user(ConnectionOptions options) {
+        ensure_connected();
+        options.host = options_.host;
+        options.port = options_.port;
+        options.ssl = options_.ssl;
+        options.compress = options_.compress;
+        if (options.charset.empty()) {
+            options.charset = options_.charset;
+            options.charset_number = options_.charset_number;
+        } else {
+            options.charset_number = charset_number_for_name(options.charset, options.charset_number);
+        }
+        if (options.user.empty()) {
+            options.user = options_.user;
+        }
+        if (options.password.empty()) {
+            options.password = options_.password;
+        }
+        if (options.database.empty()) {
+            options.database = options_.database;
+        }
+        const auto scramble = handshake_.scramble();
+        const auto plugin = choose_auth_plugin(handshake_.auth_plugin_name, tls_active_, options.enable_cleartext_plugin || options_.enable_cleartext_plugin);
+        const auto token = calculate_auth_token(plugin, options.password, scramble);
+        write_packet(build_change_user_payload(options, client_flags_, plugin, token), 0);
+        handle_auth_result(plugin, scramble, 1);
+        statement_cache_.clear();
+        statement_lru_.clear();
+        options_.user = std::move(options.user);
+        options_.password = std::move(options.password);
+        options_.database = std::move(options.database);
+        options_.charset = std::move(options.charset);
+        options_.charset_number = options.charset_number;
+        options_.enable_cleartext_plugin = options.enable_cleartext_plugin || options_.enable_cleartext_plugin;
+        client_encoding_ = charset_encoding(options_.charset_number);
     }
 
     void end() noexcept {
         if (!connected_ && !transport_is_open()) {
             return;
         }
+        const bool was_connected = connected_;
         try {
             if (transport_is_open()) {
                 if (connected_) {
@@ -1387,14 +1519,43 @@ public:
         }
         connected_ = false;
         tls_active_ = false;
+        compression_active_ = false;
+        try {
+            if (was_connected) {
+                emitter_.emit(event::End);
+            }
+            emitter_.emit(event::Close);
+        } catch (...) {
+        }
     }
 
     bool connected() const noexcept { return connected_; }
     bool encrypted() const noexcept { return tls_active_; }
+    bool compressed() const noexcept { return compression_active_; }
+    bool paused() const noexcept { return paused_; }
     const ConnectionOptions& options() const noexcept { return options_; }
     const std::string& server_version() const noexcept { return server_version_; }
     uint32_t connection_id() const noexcept { return connection_id_; }
     uint32_t server_capability_flags() const noexcept { return server_capability_flags_; }
+    events::EventEmitter& emitter() noexcept { return emitter_; }
+
+    ConnectionInfo connection_info() const {
+        return ConnectionInfo{
+            .connection_id = connection_id_,
+            .server_version = server_version_,
+            .server_capability_flags = server_capability_flags_,
+            .encrypted = tls_active_,
+        };
+    }
+
+    void emit_error(const Error& error) {
+        if (emitter_.listenerCount(event::Error_) > 0) {
+            emitter_.emit(event::Error_, error);
+        }
+    }
+
+    void pause() noexcept { paused_ = true; }
+    void resume() noexcept { paused_ = false; }
 
 private:
     void ensure_connected() {
@@ -1565,6 +1726,13 @@ private:
     }
 
     PacketFrame read_packet() {
+        if (compression_active_) {
+            return read_compressed_packet();
+        }
+        return read_uncompressed_packet();
+    }
+
+    PacketFrame read_uncompressed_packet() {
         std::vector<Buffer> parts;
         uint8_t first_sequence = 0;
         bool first = true;
@@ -1590,29 +1758,120 @@ private:
     }
 
     void write_packet(const Buffer& payload, uint8_t sequence_id) {
+        if (compression_active_ && sequence_id == 0) {
+            compressed_sequence_id_ = 0;
+            compressed_plain_buffer_.clear();
+            compressed_plain_offset_ = 0;
+        }
+
+        std::vector<uint8_t> packets;
         std::size_t offset = 0;
         bool wrote_full_packet = false;
         do {
             const auto remaining = payload.length() - offset;
             const auto chunk_length = std::min<std::size_t>(remaining, kMaxPacketPayloadLength);
-            std::vector<uint8_t> packet;
-            packet.reserve(kPacketHeaderLength + chunk_length);
-            append_u24_le(packet, static_cast<uint32_t>(chunk_length));
-            append_u8(packet, sequence_id++);
+            append_u24_le(packets, static_cast<uint32_t>(chunk_length));
+            append_u8(packets, sequence_id++);
             if (chunk_length > 0) {
-                packet.insert(packet.end(), payload.data() + offset, payload.data() + offset + chunk_length);
+                packets.insert(packets.end(), payload.data() + offset, payload.data() + offset + chunk_length);
             }
-            write_all(packet.data(), packet.size());
             offset += chunk_length;
             wrote_full_packet = chunk_length == kMaxPacketPayloadLength;
         } while (offset < payload.length());
 
         if (wrote_full_packet) {
-            std::vector<uint8_t> terminator;
-            append_u24_le(terminator, 0);
-            append_u8(terminator, sequence_id);
-            write_all(terminator.data(), terminator.size());
+            append_u24_le(packets, 0);
+            append_u8(packets, sequence_id);
         }
+
+        if (compression_active_) {
+            write_compressed_packets(packets);
+        } else if (!packets.empty()) {
+            write_all(packets.data(), packets.size());
+        }
+    }
+
+    PacketFrame read_compressed_packet() {
+        std::vector<Buffer> parts;
+        uint8_t first_sequence = 0;
+        bool first = true;
+        while (true) {
+            const auto frame = read_normal_packet_from_compressed_stream();
+            if (first) {
+                first_sequence = frame.sequence_id;
+                first = false;
+            }
+            parts.push_back(std::move(frame.payload));
+            if (parts.back().length() < kMaxPacketPayloadLength) {
+                break;
+            }
+        }
+        return {first_sequence, Buffer::concat(parts)};
+    }
+
+    PacketFrame read_normal_packet_from_compressed_stream() {
+        while (compressed_plain_buffer_.size() - compressed_plain_offset_ < kPacketHeaderLength) {
+            append_next_compressed_payload();
+        }
+
+        const auto* header = compressed_plain_buffer_.data() + compressed_plain_offset_;
+        const uint32_t length = static_cast<uint32_t>(header[0] | (header[1] << 8) | (header[2] << 16));
+        const uint8_t sequence = header[3];
+        while (compressed_plain_buffer_.size() - compressed_plain_offset_ < kPacketHeaderLength + length) {
+            append_next_compressed_payload();
+        }
+
+        Buffer payload;
+        if (length > 0) {
+            payload = Buffer::from(compressed_plain_buffer_.data() + compressed_plain_offset_ + kPacketHeaderLength, length);
+        }
+        compressed_plain_offset_ += kPacketHeaderLength + length;
+        if (compressed_plain_offset_ > 0 && compressed_plain_offset_ * 2 >= compressed_plain_buffer_.size()) {
+            compressed_plain_buffer_.erase(compressed_plain_buffer_.begin(),
+                                           compressed_plain_buffer_.begin() + static_cast<std::ptrdiff_t>(compressed_plain_offset_));
+            compressed_plain_offset_ = 0;
+        }
+        return {sequence, std::move(payload)};
+    }
+
+    void append_next_compressed_payload() {
+        const auto header = read_exact(kCompressedPacketHeaderLength);
+        const uint32_t compressed_length = static_cast<uint32_t>(header[0] | (header[1] << 8) | (header[2] << 16));
+        const uint32_t uncompressed_length = static_cast<uint32_t>(header[4] | (header[5] << 8) | (header[6] << 16));
+        const auto bytes = compressed_length > 0 ? read_exact(compressed_length) : std::vector<uint8_t>{};
+        Buffer payload = buffer_from_bytes(bytes);
+        if (uncompressed_length != 0) {
+            payload = zlib::inflateSync(payload, zlib::Options{});
+            if (payload.length() != uncompressed_length) {
+                throw Error("malformed compressed MySQL packet: uncompressed length mismatch");
+            }
+        }
+        compressed_plain_buffer_.insert(compressed_plain_buffer_.end(),
+                                        payload.data(),
+                                        payload.data() + payload.length());
+    }
+
+    void write_compressed_packets(const std::vector<uint8_t>& packets) {
+        std::size_t offset = 0;
+        do {
+            const auto remaining = packets.size() - offset;
+            const auto chunk_length = std::min<std::size_t>(remaining, kMaxCompressedPayloadInputLength);
+            const auto chunk = Buffer::from(packets.data() + offset, chunk_length);
+            const auto compressed = zlib::deflateSync(chunk, zlib::Options{});
+            const bool use_compressed = compressed.length() < chunk_length;
+            const Buffer& body = use_compressed ? compressed : chunk;
+
+            std::vector<uint8_t> header;
+            header.reserve(kCompressedPacketHeaderLength);
+            append_u24_le(header, static_cast<uint32_t>(body.length()));
+            append_u8(header, compressed_sequence_id_++);
+            append_u24_le(header, use_compressed ? static_cast<uint32_t>(chunk_length) : 0);
+            write_all(header.data(), header.size());
+            if (body.length() > 0) {
+                write_all(body.data(), body.length());
+            }
+            offset += chunk_length;
+        } while (offset < packets.size());
     }
 
     void handle_auth_result(const std::string& initial_plugin, const Buffer& scramble, uint8_t expected_sequence) {
@@ -1736,7 +1995,7 @@ private:
             return result;
         }
         if (first.payload.length() > 0 && first.payload[0] == 0xfb) {
-            throw Error("LOCAL INFILE request is not supported by this port");
+            return handle_local_infile_request(first);
         }
 
         PacketCursor header(first.payload);
@@ -1779,24 +2038,71 @@ private:
         return result;
     }
 
+    QueryResult handle_local_infile_request(const PacketFrame& request) {
+        if (!options_.local_infile_handler) {
+            write_packet(Buffer{}, static_cast<uint8_t>(request.sequence_id + 1));
+            throw Error("LOCAL INFILE request received but no local_infile_handler is configured");
+        }
+
+        const auto path = bytes_to_ascii(request.payload, 1, request.payload.length());
+        uint8_t sequence = static_cast<uint8_t>(request.sequence_id + 1);
+        try {
+            const auto chunks = options_.local_infile_handler(path);
+            for (const auto& chunk : chunks) {
+                if (chunk.length() == 0) {
+                    continue;
+                }
+                write_packet(chunk, sequence);
+                sequence = static_cast<uint8_t>(sequence + normal_packet_count_for_payload(chunk.length()));
+            }
+            write_packet(Buffer{}, sequence);
+        } catch (...) {
+            try {
+                write_packet(Buffer{}, sequence);
+            } catch (...) {
+            }
+            throw;
+        }
+
+        const auto final = read_packet();
+        if (is_err_packet(final.payload)) {
+            throw parse_error_packet(final.payload);
+        }
+        if (!is_ok_packet(final.payload)) {
+            throw Error("expected OK packet after LOCAL INFILE upload");
+        }
+        QueryResult result;
+        result.ok = parse_ok_packet(final.payload, server_capability_flags_);
+        return result;
+    }
+
     ConnectionOptions options_;
+    events::EventEmitter emitter_;
     EventContext ctx_;
     io::TcpSocket socket_;
     std::unique_ptr<io::TlsContext> tls_context_;
     std::unique_ptr<io::TlsStream> tls_stream_;
     bool connected_ = false;
     bool tls_active_ = false;
+    bool compression_active_ = false;
+    bool paused_ = false;
     Handshake handshake_;
     std::string server_version_;
     uint32_t connection_id_ = 0;
     uint32_t server_capability_flags_ = 0;
+    uint32_t client_flags_ = 0;
+    uint8_t compressed_sequence_id_ = 0;
+    std::vector<uint8_t> compressed_plain_buffer_;
+    std::size_t compressed_plain_offset_ = 0;
+    std::unordered_map<std::string, PreparedStatement> statement_cache_;
+    std::deque<std::string> statement_lru_;
     std::string client_encoding_ = "utf8";
 };
 
-Error::Error(const std::string& message) : std::runtime_error(message) {}
+Error::Error(const std::string& message) : polycpp::Error(message) {}
 
 Error::Error(uint16_t code, std::string sql_state, std::string message)
-    : std::runtime_error(make_error_message(code, sql_state, message)), code_(code), sql_state_(std::move(sql_state)) {}
+    : polycpp::Error(make_error_message(code, sql_state, message)), code_(code), sql_state_(std::move(sql_state)) {}
 
 uint16_t Error::code() const noexcept { return code_; }
 
@@ -1822,6 +2128,67 @@ const Value& Row::at(const std::string& name) const {
 }
 
 bool QueryResult::has_rows() const noexcept { return !fields.empty(); }
+
+JsonValue value_to_json(const Value& value) {
+    return std::visit([](const auto& item) -> JsonValue {
+        using T = std::decay_t<decltype(item)>;
+        if constexpr (std::is_same_v<T, std::monostate>) {
+            return JsonValue(nullptr);
+        } else if constexpr (std::is_same_v<T, int64_t>) {
+            constexpr int64_t max_safe = 9007199254740991LL;
+            constexpr int64_t min_safe = -9007199254740991LL;
+            if (item > max_safe || item < min_safe) {
+                return JsonValue(std::to_string(item));
+            }
+            return JsonValue(static_cast<double>(item));
+        } else if constexpr (std::is_same_v<T, uint64_t>) {
+            constexpr uint64_t max_safe = 9007199254740991ULL;
+            if (item > max_safe) {
+                return JsonValue(std::to_string(item));
+            }
+            return JsonValue(static_cast<double>(item));
+        } else if constexpr (std::is_same_v<T, double>) {
+            return JsonValue(item);
+        } else if constexpr (std::is_same_v<T, std::string>) {
+            return JsonValue(item);
+        } else if constexpr (std::is_same_v<T, Buffer>) {
+            return item.toJSON();
+        } else if constexpr (std::is_same_v<T, RawSql>) {
+            return JsonValue(item.sql);
+        }
+    }, value);
+}
+
+JsonObject Row::to_json_object(const std::vector<Field>& fields) const {
+    JsonObject object;
+    const auto count = std::min(fields.size(), values.size());
+    for (std::size_t i = 0; i < count; ++i) {
+        object[fields[i].name] = value_to_json(values[i]);
+    }
+    return object;
+}
+
+std::string row_to_json_line(const Row& row, const std::vector<Field>& fields) {
+    return JSON::stringify(JsonValue(row.to_json_object(fields))) + "\n";
+}
+
+JsonValue QueryResult::to_json() const {
+    JsonObject object;
+    JsonArray rows_json;
+    rows_json.reserve(rows.size());
+    for (const auto& row : rows) {
+        rows_json.emplace_back(row.to_json_object(fields));
+    }
+    JsonObject ok_json;
+    ok_json["affectedRows"] = JsonValue(static_cast<double>(ok.affected_rows));
+    ok_json["insertId"] = JsonValue(static_cast<double>(ok.insert_id));
+    ok_json["warningCount"] = JsonValue(static_cast<double>(ok.warning_count));
+    ok_json["changedRows"] = JsonValue(static_cast<double>(ok.changed_rows));
+    ok_json["info"] = JsonValue(ok.info);
+    object["rows"] = JsonValue(std::move(rows_json));
+    object["ok"] = JsonValue(std::move(ok_json));
+    return JsonValue(std::move(object));
+}
 
 RawSql raw(std::string sql) { return RawSql{std::move(sql)}; }
 
@@ -1942,9 +2309,120 @@ std::string format_named(const std::string& sql, const std::unordered_map<std::s
     return out;
 }
 
-Connection::Connection() : impl_(new Impl(ConnectionOptions{})) {}
+std::string percent_decode(std::string_view value) {
+    std::string out;
+    out.reserve(value.size());
+    auto hex = [](char ch) -> int {
+        if (ch >= '0' && ch <= '9') return ch - '0';
+        if (ch >= 'a' && ch <= 'f') return ch - 'a' + 10;
+        if (ch >= 'A' && ch <= 'F') return ch - 'A' + 10;
+        return -1;
+    };
+    for (std::size_t i = 0; i < value.size(); ++i) {
+        if (value[i] == '%' && i + 2 < value.size()) {
+            const int hi = hex(value[i + 1]);
+            const int lo = hex(value[i + 2]);
+            if (hi >= 0 && lo >= 0) {
+                out.push_back(static_cast<char>((hi << 4) | lo));
+                i += 2;
+                continue;
+            }
+        }
+        out.push_back(value[i]);
+    }
+    return out;
+}
 
-Connection::Connection(ConnectionOptions options) : impl_(new Impl(std::move(options))) {}
+bool parse_bool_option(const std::string& value) {
+    std::string lower;
+    lower.reserve(value.size());
+    for (char ch : value) lower.push_back(static_cast<char>(std::tolower(static_cast<unsigned char>(ch))));
+    return lower == "1" || lower == "true" || lower == "yes" || lower == "on";
+}
+
+ConnectionOptions parse_connection_uri(const std::string& uri) {
+    url::URL parsed(uri);
+    ConnectionOptions options;
+    if (parsed.protocol == "mysqls:") {
+        options.ssl.enabled = true;
+    } else if (!parsed.protocol.empty() && parsed.protocol != "mysql:") {
+        throw Error("unsupported mysql2 connection URI scheme: " + parsed.protocol);
+    }
+    if (!parsed.hostname.empty()) {
+        options.host = percent_decode(parsed.hostname);
+        if (options.host.size() >= 2 && options.host.front() == '[' && options.host.back() == ']') {
+            options.host = options.host.substr(1, options.host.size() - 2);
+        }
+    }
+    if (!parsed.port.empty()) {
+        const auto port = std::stoul(parsed.port);
+        if (port > 65535) {
+            throw Error("mysql2 connection URI port is out of range");
+        }
+        options.port = static_cast<uint16_t>(port);
+    }
+    if (!parsed.username.empty()) {
+        options.user = percent_decode(parsed.username);
+    }
+    if (!parsed.password.empty()) {
+        options.password = percent_decode(parsed.password);
+    }
+    if (!parsed.pathname.empty() && parsed.pathname != "/") {
+        options.database = percent_decode(parsed.pathname.front() == '/' ? std::string_view(parsed.pathname).substr(1) : std::string_view(parsed.pathname));
+    }
+    for (const auto& [key, value] : parsed.searchParams.entries()) {
+        if (key == "charset") options.charset = value;
+        else if (key == "charsetNumber") options.charset_number = static_cast<uint8_t>(std::stoul(value));
+        else if (key == "connectTimeout" || key == "connect_timeout_ms") options.connect_timeout_ms = static_cast<uint32_t>(std::stoul(value));
+        else if (key == "maxPreparedStatements" || key == "max_prepared_statements") options.max_prepared_statements = static_cast<std::size_t>(std::stoull(value));
+        else if (key == "multipleStatements" || key == "multiple_statements") options.multiple_statements = parse_bool_option(value);
+        else if (key == "supportBigNumbers" || key == "support_big_numbers") options.support_big_numbers = parse_bool_option(value);
+        else if (key == "bigNumberStrings" || key == "big_number_strings") options.big_number_strings = parse_bool_option(value);
+        else if (key == "decimalNumbers" || key == "decimal_numbers") options.decimal_numbers = parse_bool_option(value);
+        else if (key == "enableKeepAlive" || key == "enable_keep_alive") options.enable_keep_alive = parse_bool_option(value);
+        else if (key == "enableCleartextPlugin" || key == "enable_cleartext_plugin") options.enable_cleartext_plugin = parse_bool_option(value);
+        else if (key == "compress") options.compress = parse_bool_option(value);
+        else if (key == "ssl") options.ssl.enabled = parse_bool_option(value);
+        else if (key == "rejectUnauthorized" || key == "ssl.rejectUnauthorized") options.ssl.reject_unauthorized = parse_bool_option(value);
+        else if (key == "verifyIdentity" || key == "ssl.verifyIdentity") options.ssl.verify_identity = parse_bool_option(value);
+        else if (key == "ssl.ca" || key == "ssl_ca_file") options.ssl.ca_file = value;
+        else if (key == "ssl.cert" || key == "ssl_cert_file") options.ssl.cert_file = value;
+        else if (key == "ssl.key" || key == "ssl_key_file") options.ssl.key_file = value;
+    }
+    options.charset_number = charset_number_for_name(options.charset, options.charset_number);
+    return options;
+}
+
+template <typename T, typename F>
+Promise<T> promise_from(F&& work) {
+    return Promise<T>([fn = std::forward<F>(work)](auto resolve, auto reject) mutable {
+        try {
+            resolve(fn());
+        } catch (...) {
+            reject(std::any(std::current_exception()));
+        }
+    });
+}
+
+template <typename F>
+Promise<void> promise_void_from(F&& work) {
+    return Promise<void>([fn = std::forward<F>(work)](auto resolve, auto reject) mutable {
+        try {
+            fn();
+            resolve();
+        } catch (...) {
+            reject(std::any(std::current_exception()));
+        }
+    });
+}
+
+Connection::Connection() : impl_(new Impl(ConnectionOptions{})) {
+    setEmitter_(impl_->emitter());
+}
+
+Connection::Connection(ConnectionOptions options) : impl_(new Impl(std::move(options))) {
+    setEmitter_(impl_->emitter());
+}
 
 Connection::~Connection() {
     if (impl_) {
@@ -1953,7 +2431,12 @@ Connection::~Connection() {
     }
 }
 
-Connection::Connection(Connection&& other) noexcept : impl_(std::exchange(other.impl_, nullptr)) {}
+Connection::Connection(Connection&& other) noexcept : impl_(std::exchange(other.impl_, nullptr)) {
+    if (impl_) {
+        setEmitter_(impl_->emitter());
+    }
+    other.resetEmitter_();
+}
 
 Connection& Connection::operator=(Connection&& other) noexcept {
     if (this != &other) {
@@ -1962,51 +2445,333 @@ Connection& Connection::operator=(Connection&& other) noexcept {
             delete impl_;
         }
         impl_ = std::exchange(other.impl_, nullptr);
+        if (impl_) {
+            setEmitter_(impl_->emitter());
+        } else {
+            resetEmitter_();
+        }
+        other.resetEmitter_();
     }
     return *this;
 }
 
-void Connection::connect() { impl_->connect(); }
+void Connection::connect() {
+    try {
+        impl_->connect();
+    } catch (const Error& error) {
+        impl_->emit_error(error);
+        throw;
+    }
+}
 
-QueryResult Connection::query(const std::string& sql) { return impl_->query(sql); }
+void Connection::connect(VoidCallback callback) {
+    try {
+        connect();
+        if (callback) callback(nullptr);
+    } catch (...) {
+        if (callback) callback(std::current_exception());
+    }
+}
 
-std::vector<QueryResult> Connection::query_all(const std::string& sql) { return impl_->query_all(sql); }
+Promise<void> Connection::connect_promise() { return promise_void_from([this] { connect(); }); }
 
-PreparedStatement Connection::prepare(const std::string& sql) { return impl_->prepare(sql); }
+QueryResult Connection::query(const std::string& sql) {
+    try {
+        return impl_->query(sql);
+    } catch (const Error& error) {
+        impl_->emit_error(error);
+        throw;
+    }
+}
+
+void Connection::query(const std::string& sql, QueryCallback callback) {
+    try {
+        auto result = query(sql);
+        if (callback) callback(nullptr, std::move(result));
+    } catch (...) {
+        if (callback) callback(std::current_exception(), QueryResult{});
+    }
+}
+
+Promise<QueryResult> Connection::query_promise(const std::string& sql) {
+    return promise_from<QueryResult>([this, sql] { return query(sql); });
+}
+
+std::vector<QueryResult> Connection::query_all(const std::string& sql) {
+    try {
+        return impl_->query_all(sql);
+    } catch (const Error& error) {
+        impl_->emit_error(error);
+        throw;
+    }
+}
+
+void Connection::query_all(const std::string& sql, QueryAllCallback callback) {
+    try {
+        auto result = query_all(sql);
+        if (callback) callback(nullptr, std::move(result));
+    } catch (...) {
+        if (callback) callback(std::current_exception(), {});
+    }
+}
+
+Promise<std::vector<QueryResult>> Connection::query_all_promise(const std::string& sql) {
+    return promise_from<std::vector<QueryResult>>([this, sql] { return query_all(sql); });
+}
+
+stream::Readable Connection::query_stream_json(const std::string& sql) {
+    auto result = query(sql);
+    std::vector<Buffer> chunks;
+    chunks.reserve(result.rows.size());
+    for (const auto& row : result.rows) {
+        chunks.push_back(Buffer::from(row_to_json_line(row, result.fields)));
+    }
+    return stream::Readable::from(chunks);
+}
+
+PreparedStatement Connection::prepare(const std::string& sql) {
+    try {
+        return impl_->prepare(sql);
+    } catch (const Error& error) {
+        impl_->emit_error(error);
+        throw;
+    }
+}
+
+void Connection::prepare(const std::string& sql, PrepareCallback callback) {
+    try {
+        auto statement = prepare(sql);
+        if (callback) callback(nullptr, std::move(statement));
+    } catch (...) {
+        if (callback) callback(std::current_exception(), PreparedStatement{});
+    }
+}
+
+Promise<PreparedStatement> Connection::prepare_promise(const std::string& sql) {
+    return promise_from<PreparedStatement>([this, sql] { return prepare(sql); });
+}
 
 QueryResult Connection::execute(const PreparedStatement& statement, const std::vector<Value>& values) {
-    return impl_->execute(statement, values);
+    try {
+        return impl_->execute(statement, values);
+    } catch (const Error& error) {
+        impl_->emit_error(error);
+        throw;
+    }
+}
+
+void Connection::execute(const PreparedStatement& statement, const std::vector<Value>& values, QueryCallback callback) {
+    try {
+        auto result = execute(statement, values);
+        if (callback) callback(nullptr, std::move(result));
+    } catch (...) {
+        if (callback) callback(std::current_exception(), QueryResult{});
+    }
+}
+
+Promise<QueryResult> Connection::execute_promise(const PreparedStatement& statement, const std::vector<Value>& values) {
+    return promise_from<QueryResult>([this, statement, values] { return execute(statement, values); });
 }
 
 std::vector<QueryResult> Connection::execute_all(const PreparedStatement& statement, const std::vector<Value>& values) {
-    return impl_->execute_all(statement, values);
+    try {
+        return impl_->execute_all(statement, values);
+    } catch (const Error& error) {
+        impl_->emit_error(error);
+        throw;
+    }
+}
+
+void Connection::execute_all(const PreparedStatement& statement, const std::vector<Value>& values, QueryAllCallback callback) {
+    try {
+        auto result = execute_all(statement, values);
+        if (callback) callback(nullptr, std::move(result));
+    } catch (...) {
+        if (callback) callback(std::current_exception(), {});
+    }
+}
+
+Promise<std::vector<QueryResult>> Connection::execute_all_promise(const PreparedStatement& statement, const std::vector<Value>& values) {
+    return promise_from<std::vector<QueryResult>>([this, statement, values] { return execute_all(statement, values); });
 }
 
 QueryResult Connection::execute(const std::string& sql, const std::vector<Value>& values) {
-    return impl_->execute(sql, values);
+    try {
+        return impl_->execute(sql, values);
+    } catch (const Error& error) {
+        impl_->emit_error(error);
+        throw;
+    }
+}
+
+void Connection::execute(const std::string& sql, const std::vector<Value>& values, QueryCallback callback) {
+    try {
+        auto result = execute(sql, values);
+        if (callback) callback(nullptr, std::move(result));
+    } catch (...) {
+        if (callback) callback(std::current_exception(), QueryResult{});
+    }
+}
+
+Promise<QueryResult> Connection::execute_promise(const std::string& sql, const std::vector<Value>& values) {
+    return promise_from<QueryResult>([this, sql, values] { return execute(sql, values); });
 }
 
 std::vector<QueryResult> Connection::execute_all(const std::string& sql, const std::vector<Value>& values) {
-    return impl_->execute_all(sql, values);
+    try {
+        return impl_->execute_all(sql, values);
+    } catch (const Error& error) {
+        impl_->emit_error(error);
+        throw;
+    }
+}
+
+void Connection::execute_all(const std::string& sql, const std::vector<Value>& values, QueryAllCallback callback) {
+    try {
+        auto result = execute_all(sql, values);
+        if (callback) callback(nullptr, std::move(result));
+    } catch (...) {
+        if (callback) callback(std::current_exception(), {});
+    }
+}
+
+Promise<std::vector<QueryResult>> Connection::execute_all_promise(const std::string& sql, const std::vector<Value>& values) {
+    return promise_from<std::vector<QueryResult>>([this, sql, values] { return execute_all(sql, values); });
 }
 
 void Connection::close_statement(const PreparedStatement& statement) { impl_->close_statement(statement); }
 
-OkPacket Connection::begin_transaction() { return impl_->begin_transaction(); }
+void Connection::close_statement(const std::string& sql) { impl_->close_statement(sql); }
 
-OkPacket Connection::commit() { return impl_->commit(); }
+OkPacket Connection::begin_transaction() { return query("START TRANSACTION").ok; }
 
-OkPacket Connection::rollback() { return impl_->rollback(); }
+void Connection::begin_transaction(OkCallback callback) {
+    try {
+        auto ok = begin_transaction();
+        if (callback) callback(nullptr, ok);
+    } catch (...) {
+        if (callback) callback(std::current_exception(), OkPacket{});
+    }
+}
 
-OkPacket Connection::ping() { return impl_->ping(); }
+Promise<OkPacket> Connection::begin_transaction_promise() {
+    return promise_from<OkPacket>([this] { return begin_transaction(); });
+}
 
-void Connection::reset() { impl_->reset(); }
+OkPacket Connection::commit() { return query("COMMIT").ok; }
+
+void Connection::commit(OkCallback callback) {
+    try {
+        auto ok = commit();
+        if (callback) callback(nullptr, ok);
+    } catch (...) {
+        if (callback) callback(std::current_exception(), OkPacket{});
+    }
+}
+
+Promise<OkPacket> Connection::commit_promise() {
+    return promise_from<OkPacket>([this] { return commit(); });
+}
+
+OkPacket Connection::rollback() { return query("ROLLBACK").ok; }
+
+void Connection::rollback(OkCallback callback) {
+    try {
+        auto ok = rollback();
+        if (callback) callback(nullptr, ok);
+    } catch (...) {
+        if (callback) callback(std::current_exception(), OkPacket{});
+    }
+}
+
+Promise<OkPacket> Connection::rollback_promise() {
+    return promise_from<OkPacket>([this] { return rollback(); });
+}
+
+OkPacket Connection::ping() {
+    try {
+        return impl_->ping();
+    } catch (const Error& error) {
+        impl_->emit_error(error);
+        throw;
+    }
+}
+
+void Connection::ping(OkCallback callback) {
+    try {
+        auto ok = ping();
+        if (callback) callback(nullptr, ok);
+    } catch (...) {
+        if (callback) callback(std::current_exception(), OkPacket{});
+    }
+}
+
+Promise<OkPacket> Connection::ping_promise() { return promise_from<OkPacket>([this] { return ping(); }); }
+
+void Connection::reset() {
+    try {
+        impl_->reset();
+    } catch (const Error& error) {
+        impl_->emit_error(error);
+        throw;
+    }
+}
+
+void Connection::reset(VoidCallback callback) {
+    try {
+        reset();
+        if (callback) callback(nullptr);
+    } catch (...) {
+        if (callback) callback(std::current_exception());
+    }
+}
+
+Promise<void> Connection::reset_promise() { return promise_void_from([this] { reset(); }); }
+
+void Connection::change_user(ConnectionOptions options) {
+    try {
+        impl_->change_user(std::move(options));
+    } catch (const Error& error) {
+        impl_->emit_error(error);
+        throw;
+    }
+}
+
+void Connection::change_user(ConnectionOptions options, VoidCallback callback) {
+    try {
+        change_user(std::move(options));
+        if (callback) callback(nullptr);
+    } catch (...) {
+        if (callback) callback(std::current_exception());
+    }
+}
+
+Promise<void> Connection::change_user_promise(ConnectionOptions options) {
+    return promise_void_from([this, options = std::move(options)]() mutable { change_user(std::move(options)); });
+}
 
 void Connection::end() { impl_->end(); }
+
+void Connection::end(VoidCallback callback) {
+    end();
+    if (callback) callback(nullptr);
+}
+
+Promise<void> Connection::end_promise() { return promise_void_from([this] { end(); }); }
+
+void Connection::destroy() noexcept { if (impl_) impl_->end(); }
+
+void Connection::pause() noexcept { if (impl_) impl_->pause(); }
+
+void Connection::resume() noexcept { if (impl_) impl_->resume(); }
 
 bool Connection::connected() const noexcept { return impl_ && impl_->connected(); }
 
 bool Connection::encrypted() const noexcept { return impl_ && impl_->encrypted(); }
+
+bool Connection::compressed() const noexcept { return impl_ && impl_->compressed(); }
+
+bool Connection::paused() const noexcept { return impl_ && impl_->paused(); }
 
 const ConnectionOptions& Connection::options() const noexcept { return impl_->options(); }
 
@@ -2021,6 +2786,9 @@ public:
     explicit PoolImpl(PoolOptions options) : options_(std::move(options)) {
         if (options_.connection_limit == 0) {
             throw Error("pool connection_limit must be greater than zero");
+        }
+        if (options_.max_idle > options_.connection_limit) {
+            options_.max_idle = options_.connection_limit;
         }
     }
 
@@ -2037,6 +2805,7 @@ public:
         if (!idle_.empty()) {
             auto connection = idle_.back();
             idle_.pop_back();
+            emitter_.emit(event::Acquire, *connection);
             return PoolConnection(shared_from_this(), connection);
         }
 
@@ -2044,8 +2813,23 @@ public:
             auto connection = std::make_shared<Connection>(options_.connection);
             connection->connect();
             connections_.push_back(std::move(connection));
+            emitter_.emit(event::ConnectionCreated, *connections_.back());
+            emitter_.emit(event::Acquire, *connections_.back());
             return PoolConnection(shared_from_this(), connections_.back());
         }
+
+        if (!options_.wait_for_connections) {
+            throw Error("no mysql2 pool connections are available");
+        }
+        if (options_.queue_limit != 0 && waiting_count_ >= options_.queue_limit) {
+            throw Error("mysql2 pool queue limit reached");
+        }
+        ++waiting_count_;
+        struct WaitingGuard {
+            std::size_t& value;
+            ~WaitingGuard() { --value; }
+        } waiting_guard{waiting_count_};
+        emitter_.emit(event::Enqueue);
 
         const auto deadline = std::chrono::steady_clock::now() +
             std::chrono::milliseconds(options_.wait_timeout_ms);
@@ -2061,6 +2845,7 @@ public:
         }
         auto connection = idle_.back();
         idle_.pop_back();
+        emitter_.emit(event::Acquire, *connection);
         return PoolConnection(shared_from_this(), connection);
     }
 
@@ -2068,12 +2853,33 @@ public:
         if (!connection) {
             return;
         }
+        if (options_.reset_on_release && connection->connected()) {
+            try {
+                connection->reset();
+            } catch (...) {
+                connection->end();
+                std::lock_guard<std::mutex> lock(mutex_);
+                erase_connection(connection);
+                available_.notify_one();
+                return;
+            }
+        }
         std::lock_guard<std::mutex> lock(mutex_);
         if (closed_) {
             connection->end();
             return;
         }
+        if (idle_.size() >= options_.max_idle) {
+            connection->end();
+            erase_connection(connection);
+            available_.notify_one();
+            return;
+        }
         idle_.push_back(connection);
+        try {
+            emitter_.emit(event::Release, *connection);
+        } catch (...) {
+        }
         available_.notify_one();
     }
 
@@ -2123,12 +2929,21 @@ public:
         return idle_.size();
     }
 
+    events::EventEmitter& emitter() noexcept { return emitter_; }
+
 private:
+    void erase_connection(const std::shared_ptr<Connection>& connection) {
+        connections_.erase(std::remove(connections_.begin(), connections_.end(), connection), connections_.end());
+        idle_.erase(std::remove(idle_.begin(), idle_.end(), connection), idle_.end());
+    }
+
     PoolOptions options_;
+    events::EventEmitter emitter_;
     mutable std::mutex mutex_;
     std::condition_variable available_;
     std::vector<std::shared_ptr<Connection>> connections_;
     std::vector<std::shared_ptr<Connection>> idle_;
+    std::size_t waiting_count_ = 0;
     bool closed_ = false;
 };
 
@@ -2183,33 +2998,478 @@ void PoolConnection::release() {
     }
 }
 
-Pool::Pool(PoolOptions options) : impl_(std::make_shared<PoolImpl>(std::move(options))) {}
+Pool::Pool(PoolOptions options) : impl_(std::make_shared<PoolImpl>(std::move(options))) {
+    setEmitter_(impl_->emitter());
+}
 
 Pool::~Pool() = default;
 
-Pool::Pool(Pool&&) noexcept = default;
+Pool::Pool(Pool&& other) noexcept : impl_(std::move(other.impl_)) {
+    if (impl_) {
+        setEmitter_(impl_->emitter());
+    }
+    other.resetEmitter_();
+}
 
-Pool& Pool::operator=(Pool&&) noexcept = default;
+Pool& Pool::operator=(Pool&& other) noexcept {
+    if (this != &other) {
+        impl_ = std::move(other.impl_);
+        if (impl_) {
+            setEmitter_(impl_->emitter());
+        } else {
+            resetEmitter_();
+        }
+        other.resetEmitter_();
+    }
+    return *this;
+}
 
 PoolConnection Pool::get_connection() { return impl_->acquire(); }
 
+void Pool::get_connection(std::function<void(std::exception_ptr, std::shared_ptr<PoolConnection>)> callback) {
+    try {
+        auto connection = std::make_shared<PoolConnection>(get_connection());
+        if (callback) callback(nullptr, std::move(connection));
+    } catch (...) {
+        if (callback) callback(std::current_exception(), nullptr);
+    }
+}
+
+Promise<std::shared_ptr<PoolConnection>> Pool::get_connection_promise() {
+    return promise_from<std::shared_ptr<PoolConnection>>([this] {
+        return std::make_shared<PoolConnection>(get_connection());
+    });
+}
+
+void Pool::release_connection(PoolConnection& connection) { connection.release(); }
+
 QueryResult Pool::query(const std::string& sql) { return impl_->query(sql); }
+
+void Pool::query(const std::string& sql, QueryCallback callback) {
+    try {
+        auto result = query(sql);
+        if (callback) callback(nullptr, std::move(result));
+    } catch (...) {
+        if (callback) callback(std::current_exception(), QueryResult{});
+    }
+}
+
+Promise<QueryResult> Pool::query_promise(const std::string& sql) {
+    return promise_from<QueryResult>([this, sql] { return query(sql); });
+}
 
 std::vector<QueryResult> Pool::query_all(const std::string& sql) { return impl_->query_all(sql); }
 
+Promise<std::vector<QueryResult>> Pool::query_all_promise(const std::string& sql) {
+    return promise_from<std::vector<QueryResult>>([this, sql] { return query_all(sql); });
+}
+
 QueryResult Pool::execute(const std::string& sql, const std::vector<Value>& values) {
     return impl_->execute(sql, values);
+}
+
+void Pool::execute(const std::string& sql, const std::vector<Value>& values, QueryCallback callback) {
+    try {
+        auto result = execute(sql, values);
+        if (callback) callback(nullptr, std::move(result));
+    } catch (...) {
+        if (callback) callback(std::current_exception(), QueryResult{});
+    }
+}
+
+Promise<QueryResult> Pool::execute_promise(const std::string& sql, const std::vector<Value>& values) {
+    return promise_from<QueryResult>([this, sql, values] { return execute(sql, values); });
 }
 
 std::vector<QueryResult> Pool::execute_all(const std::string& sql, const std::vector<Value>& values) {
     return impl_->execute_all(sql, values);
 }
 
+Promise<std::vector<QueryResult>> Pool::execute_all_promise(const std::string& sql, const std::vector<Value>& values) {
+    return promise_from<std::vector<QueryResult>>([this, sql, values] { return execute_all(sql, values); });
+}
+
 void Pool::end() { impl_->end(); }
+
+void Pool::end(VoidCallback callback) {
+    end();
+    if (callback) callback(nullptr);
+}
+
+Promise<void> Pool::end_promise() { return promise_void_from([this] { end(); }); }
 
 std::size_t Pool::total_count() const noexcept { return impl_ ? impl_->total_count() : 0; }
 
 std::size_t Pool::idle_count() const noexcept { return impl_ ? impl_->idle_count() : 0; }
+
+bool wildcard_match(const std::string& pattern, const std::string& value) {
+    std::size_t p = 0;
+    std::size_t v = 0;
+    std::size_t star = std::string::npos;
+    std::size_t match = 0;
+    while (v < value.size()) {
+        if (p < pattern.size() && (pattern[p] == value[v])) {
+            ++p;
+            ++v;
+        } else if (p < pattern.size() && pattern[p] == '*') {
+            star = p++;
+            match = v;
+        } else if (star != std::string::npos) {
+            p = star + 1;
+            v = ++match;
+        } else {
+            return false;
+        }
+    }
+    while (p < pattern.size() && pattern[p] == '*') {
+        ++p;
+    }
+    return p == pattern.size();
+}
+
+class PoolClusterImpl : public std::enable_shared_from_this<PoolClusterImpl> {
+public:
+    explicit PoolClusterImpl(PoolClusterOptions options) : options_(options) {}
+
+    ~PoolClusterImpl() { end(); }
+
+    events::EventEmitter& emitter() noexcept { return emitter_; }
+
+    void add(std::string id, PoolOptions options) {
+        if (id.empty()) {
+            id = "CLUSTER::" + std::to_string(++last_id_);
+        }
+        std::lock_guard<std::mutex> lock(mutex_);
+        if (closed_) {
+            throw Error("pool cluster is closed");
+        }
+        if (nodes_.find(id) != nodes_.end()) {
+            return;
+        }
+        Node node;
+        node.id = id;
+        node.pool = std::make_shared<Pool>(std::move(options));
+        nodes_.emplace(id, std::move(node));
+    }
+
+    void remove(const std::string& pattern) {
+        std::vector<std::string> ids;
+        {
+            std::lock_guard<std::mutex> lock(mutex_);
+            for (const auto& [id, node] : nodes_) {
+                (void)node;
+                if (wildcard_match(pattern, id)) {
+                    ids.push_back(id);
+                }
+            }
+        }
+        for (const auto& id : ids) {
+            remove_node(id, true);
+        }
+    }
+
+    PoolConnection get_connection(const std::string& pattern, PoolSelector selector) {
+        while (true) {
+            auto id = select_node(pattern, selector, false);
+            if (id.empty()) {
+                if (matching_node_ids(pattern, true).empty()) {
+                    throw Error("pool cluster does not contain a matching pool");
+                }
+                throw Error("pool cluster has no online matching pool");
+            }
+            std::shared_ptr<Pool> pool;
+            {
+                std::lock_guard<std::mutex> lock(mutex_);
+                const auto it = nodes_.find(id);
+                if (it == nodes_.end()) {
+                    continue;
+                }
+                pool = it->second.pool;
+            }
+            try {
+                auto connection = pool->get_connection();
+                decrease_error_count(id);
+                return connection;
+            } catch (const Error& error) {
+                increase_error_count(id);
+                if (options_.can_retry && !matching_node_ids(pattern, false).empty()) {
+                    if (emitter_.listenerCount(event::Warn) > 0) {
+                        emitter_.emit(event::Warn, error);
+                    }
+                    continue;
+                }
+                throw;
+            }
+        }
+    }
+
+    QueryResult query(const std::string& sql) {
+        auto connection = get_connection("*", options_.default_selector);
+        return connection->query(sql);
+    }
+
+    std::vector<QueryResult> query_all(const std::string& sql) {
+        auto connection = get_connection("*", options_.default_selector);
+        return connection->query_all(sql);
+    }
+
+    QueryResult execute(const std::string& sql, const std::vector<Value>& values) {
+        auto connection = get_connection("*", options_.default_selector);
+        return connection->execute(sql, values);
+    }
+
+    std::vector<QueryResult> execute_all(const std::string& sql, const std::vector<Value>& values) {
+        auto connection = get_connection("*", options_.default_selector);
+        return connection->execute_all(sql, values);
+    }
+
+    void end() noexcept {
+        std::map<std::string, std::shared_ptr<Pool>> pools;
+        {
+            std::lock_guard<std::mutex> lock(mutex_);
+            if (closed_ && nodes_.empty()) {
+                return;
+            }
+            closed_ = true;
+            for (auto& [id, node] : nodes_) {
+                pools[id] = node.pool;
+            }
+            nodes_.clear();
+        }
+        for (auto& [id, pool] : pools) {
+            (void)id;
+            if (pool) {
+                pool->end();
+            }
+        }
+    }
+
+    std::size_t node_count() const noexcept {
+        std::lock_guard<std::mutex> lock(mutex_);
+        return nodes_.size();
+    }
+
+private:
+    struct Node {
+        std::string id;
+        std::shared_ptr<Pool> pool;
+        std::size_t error_count = 0;
+        std::chrono::steady_clock::time_point offline_until{};
+    };
+
+    std::vector<std::string> matching_node_ids(const std::string& pattern, bool include_offline) const {
+        std::vector<std::string> ids;
+        const auto now = std::chrono::steady_clock::now();
+        std::lock_guard<std::mutex> lock(mutex_);
+        for (const auto& [id, node] : nodes_) {
+            if (!wildcard_match(pattern, id)) {
+                continue;
+            }
+            if (!include_offline && node.offline_until != std::chrono::steady_clock::time_point{} && node.offline_until > now) {
+                continue;
+            }
+            ids.push_back(id);
+        }
+        return ids;
+    }
+
+    std::string select_node(const std::string& pattern, PoolSelector selector, bool include_offline) {
+        auto ids = matching_node_ids(pattern, include_offline);
+        if (ids.empty()) {
+            return {};
+        }
+        switch (selector) {
+            case PoolSelector::Order:
+                return ids.front();
+            case PoolSelector::Random: {
+                std::uniform_int_distribution<std::size_t> dist(0, ids.size() - 1);
+                return ids[dist(rng_)];
+            }
+            case PoolSelector::RoundRobin:
+            default:
+                return ids[round_robin_index_++ % ids.size()];
+        }
+    }
+
+    void increase_error_count(const std::string& id) {
+        std::shared_ptr<Pool> removed_pool;
+        bool emit_offline = false;
+        bool emit_remove = false;
+        {
+            std::lock_guard<std::mutex> lock(mutex_);
+            auto it = nodes_.find(id);
+            if (it == nodes_.end()) {
+                return;
+            }
+            auto& node = it->second;
+            ++node.error_count;
+            if (node.error_count < options_.remove_node_error_count) {
+                return;
+            }
+            if (options_.restore_node_timeout_ms > 0) {
+                node.offline_until = std::chrono::steady_clock::now() + std::chrono::milliseconds(options_.restore_node_timeout_ms);
+                emit_offline = true;
+            } else {
+                removed_pool = node.pool;
+                nodes_.erase(it);
+                emit_remove = true;
+            }
+        }
+        if (emit_offline) {
+            emitter_.emit(event::Offline, id);
+        }
+        if (emit_remove) {
+            if (removed_pool) {
+                removed_pool->end();
+            }
+            emitter_.emit(event::Remove, id);
+        }
+    }
+
+    void decrease_error_count(const std::string& id) {
+        bool emit_online = false;
+        {
+            std::lock_guard<std::mutex> lock(mutex_);
+            auto it = nodes_.find(id);
+            if (it == nodes_.end()) {
+                return;
+            }
+            auto& node = it->second;
+            if (node.error_count > 0) {
+                --node.error_count;
+            }
+            if (node.offline_until != std::chrono::steady_clock::time_point{} &&
+                node.offline_until <= std::chrono::steady_clock::now()) {
+                node.offline_until = {};
+                emit_online = true;
+            }
+        }
+        if (emit_online) {
+            emitter_.emit(event::Online, id);
+        }
+    }
+
+    void remove_node(const std::string& id, bool emit_event) {
+        std::shared_ptr<Pool> pool;
+        {
+            std::lock_guard<std::mutex> lock(mutex_);
+            auto it = nodes_.find(id);
+            if (it == nodes_.end()) {
+                return;
+            }
+            pool = it->second.pool;
+            nodes_.erase(it);
+        }
+        if (pool) {
+            pool->end();
+        }
+        if (emit_event) {
+            emitter_.emit(event::Remove, id);
+        }
+    }
+
+    PoolClusterOptions options_;
+    events::EventEmitter emitter_;
+    mutable std::mutex mutex_;
+    std::map<std::string, Node> nodes_;
+    std::mt19937 rng_{std::random_device{}()};
+    std::size_t round_robin_index_ = 0;
+    std::size_t last_id_ = 0;
+    bool closed_ = false;
+};
+
+PoolNamespace::PoolNamespace() = default;
+
+PoolNamespace::PoolNamespace(std::shared_ptr<PoolClusterImpl> cluster, std::string pattern, PoolSelector selector)
+    : cluster_(std::move(cluster)), pattern_(std::move(pattern)), selector_(selector) {}
+
+PoolConnection PoolNamespace::get_connection() {
+    if (!cluster_) {
+        throw Error("pool namespace is not bound to a cluster");
+    }
+    return cluster_->get_connection(pattern_, selector_);
+}
+
+QueryResult PoolNamespace::query(const std::string& sql) {
+    auto connection = get_connection();
+    return connection->query(sql);
+}
+
+std::vector<QueryResult> PoolNamespace::query_all(const std::string& sql) {
+    auto connection = get_connection();
+    return connection->query_all(sql);
+}
+
+QueryResult PoolNamespace::execute(const std::string& sql, const std::vector<Value>& values) {
+    auto connection = get_connection();
+    return connection->execute(sql, values);
+}
+
+std::vector<QueryResult> PoolNamespace::execute_all(const std::string& sql, const std::vector<Value>& values) {
+    auto connection = get_connection();
+    return connection->execute_all(sql, values);
+}
+
+PoolCluster::PoolCluster(PoolClusterOptions options)
+    : impl_(std::make_shared<PoolClusterImpl>(options)) {
+    setEmitter_(impl_->emitter());
+}
+
+PoolCluster::~PoolCluster() = default;
+
+PoolCluster::PoolCluster(PoolCluster&& other) noexcept : impl_(std::move(other.impl_)) {
+    if (impl_) {
+        setEmitter_(impl_->emitter());
+    }
+    other.resetEmitter_();
+}
+
+PoolCluster& PoolCluster::operator=(PoolCluster&& other) noexcept {
+    if (this != &other) {
+        impl_ = std::move(other.impl_);
+        if (impl_) {
+            setEmitter_(impl_->emitter());
+        } else {
+            resetEmitter_();
+        }
+        other.resetEmitter_();
+    }
+    return *this;
+}
+
+void PoolCluster::add(PoolOptions options) { impl_->add({}, std::move(options)); }
+
+void PoolCluster::add(std::string id, PoolOptions options) { impl_->add(std::move(id), std::move(options)); }
+
+void PoolCluster::remove(const std::string& pattern) { impl_->remove(pattern); }
+
+PoolConnection PoolCluster::get_connection(const std::string& pattern) {
+    return impl_->get_connection(pattern, PoolSelector::RoundRobin);
+}
+
+PoolConnection PoolCluster::get_connection(const std::string& pattern, PoolSelector selector) {
+    return impl_->get_connection(pattern, selector);
+}
+
+PoolNamespace PoolCluster::of(const std::string& pattern, PoolSelector selector) {
+    return PoolNamespace(impl_, pattern, selector);
+}
+
+QueryResult PoolCluster::query(const std::string& sql) { return impl_->query(sql); }
+
+std::vector<QueryResult> PoolCluster::query_all(const std::string& sql) { return impl_->query_all(sql); }
+
+QueryResult PoolCluster::execute(const std::string& sql, const std::vector<Value>& values) {
+    return impl_->execute(sql, values);
+}
+
+std::vector<QueryResult> PoolCluster::execute_all(const std::string& sql, const std::vector<Value>& values) {
+    return impl_->execute_all(sql, values);
+}
+
+void PoolCluster::end() { impl_->end(); }
+
+std::size_t PoolCluster::node_count() const noexcept { return impl_ ? impl_->node_count() : 0; }
 
 Connection create_connection(ConnectionOptions options) {
     Connection connection(std::move(options));
@@ -2217,13 +3477,41 @@ Connection create_connection(ConnectionOptions options) {
     return connection;
 }
 
+Connection create_connection(const std::string& uri) {
+    return create_connection(parse_connection_uri(uri));
+}
+
+Promise<std::shared_ptr<Connection>> create_connection_promise(ConnectionOptions options) {
+    return promise_from<std::shared_ptr<Connection>>([options = std::move(options)]() mutable {
+        auto connection = std::make_shared<Connection>(std::move(options));
+        connection->connect();
+        return connection;
+    });
+}
+
 Pool create_pool(PoolOptions options) {
     return Pool(std::move(options));
+}
+
+Pool create_pool(const std::string& uri) {
+    PoolOptions options;
+    options.connection = parse_connection_uri(uri);
+    return create_pool(std::move(options));
+}
+
+PoolCluster create_pool_cluster(PoolClusterOptions options) {
+    return PoolCluster(options);
 }
 
 QueryResult query(ConnectionOptions options, const std::string& sql) {
     auto connection = create_connection(std::move(options));
     return connection.query(sql);
+}
+
+Promise<QueryResult> query_promise(ConnectionOptions options, const std::string& sql) {
+    return promise_from<QueryResult>([options = std::move(options), sql]() mutable {
+        return query(std::move(options), sql);
+    });
 }
 
 }  // namespace polycpp::mysql2

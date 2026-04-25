@@ -13,15 +13,19 @@ Supported scope
 - MySQL protocol handshake and common auth plugins.
 - Text queries, prepared statements, binary result rows, and explicit multi-result APIs.
 - Typed rows using ``std::variant`` values.
-- Transactions, ping, reset, graceful shutdown, and a synchronous RAII pool.
+- Transactions, ping, reset, change-user, graceful shutdown, synchronous RAII pools, and pool clusters.
+- Callback overloads, ``polycpp::Promise`` wrappers, typed events, connection URI parsing, compression, and LOCAL INFILE handler hooks.
+- Query stream adaptation through newline-delimited JSON ``Buffer`` chunks.
 - SQL escaping, identifier escaping, positional formatting, and named formatting helpers.
 
 Not full upstream parity
 ------------------------
 
-The JavaScript callback, Promise, EventEmitter, stream, compression, server,
-binlog, and pool-cluster APIs are intentionally not part of the current C++
-surface. See ``docs/divergences.md`` in the repository for the detailed list.
+The JavaScript server, binlog/replication, diagnostics, query-attribute, cursor,
+and native object-mode row stream APIs are intentionally not part of the current
+C++ surface. Callback, Promise, EventEmitter, compression, LOCAL INFILE, URI,
+and pool-cluster surfaces are implemented with C++ adaptations. See
+``docs/divergences.md`` in the repository for the detailed list.
 
 .. code-block:: cpp
 
@@ -45,8 +49,9 @@ surface. See ``docs/divergences.md`` in the repository for the detailed list.
    .. grid-item-card:: Typed C++ API
       :margin: 1
 
-      Adapts dynamic JavaScript rows and callbacks into explicit C++ values,
-      result objects, and RAII lifecycle management.
+      Adapts dynamic JavaScript rows, callbacks, promises, events, and streams
+      into explicit C++ values, result objects, polycpp primitives, and RAII
+      lifecycle management.
 
    .. grid-item-card:: Real e2e tested
       :margin: 1

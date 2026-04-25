@@ -22,24 +22,30 @@ Implemented:
 - `mysql_native_password`, `caching_sha2_password`, `sha256_password`, and TLS-gated `mysql_clear_password` auth behavior.
 - `COM_QUERY` text protocol for result sets and OK packets.
 - Prepared statements using `COM_STMT_PREPARE`, `COM_STMT_EXECUTE`, binary rows, and `COM_STMT_CLOSE`.
+- Prepared-statement execution cache with explicit `close_statement(sql)` / `close_statement(statement)` invalidation.
 - Explicit multi-result APIs with `query_all` and `execute_all`; single-result APIs drain and throw if multiple result sets are returned.
 - Text and binary row decoding into C++ variants, including binary string/blob preservation as `polycpp::Buffer`.
 - SQL `escape`, `escape_id`, positional `format`, and named placeholder formatting helpers.
-- Transaction helpers, ping, reset, graceful end, and a synchronous RAII connection pool.
+- Connection URI parsing through `polycpp::url`.
+- Callback overloads, `polycpp::Promise` wrappers, typed `polycpp::events::EventEmitter` integration, and JSON line `polycpp::stream::Readable` query output.
+- MySQL compressed protocol using `polycpp::zlib`.
+- Explicit-policy LOCAL INFILE uploads through `ConnectionOptions::local_infile_handler`.
+- `COM_CHANGE_USER`, transaction helpers, ping, reset, graceful end, synchronous RAII pools, and pool clusters.
 - Optional real MariaDB/MySQL e2e tests controlled by `MYSQL2_TEST_*` environment variables.
 
 Deferred:
 
-- Compression, server mode, replication/binlog APIs, promise-style JavaScript surface, EventEmitter/callback API, and streaming row APIs.
+- Server mode and replication/binlog APIs.
 - Full charset table parity. The port reuses the existing `iconv-lite` companion for non-core decoding but currently maps only common MySQL charset ids.
-- Prepared statement LRU cache and named TLS profile data from `aws-ssl-profiles`.
-- LOCAL INFILE until an explicit file access callback policy exists.
+- Named TLS profile data from `aws-ssl-profiles`.
+- Native object-mode row streams. `query_stream_json()` intentionally exposes byte chunks containing newline-delimited JSON because polycpp streams currently emit `Buffer` chunks, not arbitrary row objects.
+- Diagnostic-channel tracing and query attributes.
 
 Known divergences:
 
-- C++ API shape is synchronous and typed; it is not an EventEmitter or Promise wrapper.
+- C++ API shape is synchronous and typed first; callback and Promise wrappers execute the same typed operations and settle through polycpp primitives.
 - Native MySQL/MariaDB client SDKs are intentionally not linked.
-- Connection URI parsing is not implemented; callers fill `ConnectionOptions` directly.
+- Node object-mode row streaming is adapted to JSON line byte streams for auditability and `polycpp::stream` compatibility.
 
 ## Prerequisites
 
@@ -134,6 +140,20 @@ pool_options.connection_limit = 10;
 
 auto pool = polycpp::mysql2::create_pool(pool_options);
 auto result = pool.query("SELECT 1 AS one");
+```
+
+Callback, Promise, event, and stream adapters:
+
+```cpp
+conn.on(polycpp::mysql2::events::Connect, [] {});
+
+conn.query("SELECT 1 AS one", [](std::exception_ptr err, polycpp::mysql2::QueryResult result) {
+    if (err) return;
+    (void)result;
+});
+
+auto promise = conn.query_promise("SELECT 1 AS one");
+auto stream = conn.query_stream_json("SELECT id, name FROM users");
 ```
 
 Formatting helpers:

@@ -20,7 +20,7 @@ The C++ companion provides a polycpp-native client that preserves the pure proto
 
 - browser: upstream is Node.js-only; this companion is C++ server/runtime code.
 - node.js: upstream depends on Node Buffer, net, tls, crypto, stream, zlib, timers, process, and EventEmitter. The C++ port replaces those with polycpp or C++ constructs.
-- filesystem: upstream uses filesystem-adjacent behavior for SSL profiles, TLS certificates, and LOCAL INFILE. The C++ port reads TLS certificate/key files only when explicitly configured; LOCAL INFILE is disabled.
+- filesystem: upstream uses filesystem-adjacent behavior for SSL profiles, TLS certificates, and LOCAL INFILE. The C++ port reads TLS certificate/key files only when explicitly configured; LOCAL INFILE is allowed only through an explicit caller-provided buffer handler.
 - network: required. The supported client connects over TCP and can upgrade the connection to TLS.
 - crypto: required for password authentication tokens and RSA password encryption.
 - terminal: not required.
@@ -66,7 +66,7 @@ Top files reviewed:
 - `promise.js`: Promise wrapper equivalents.
 - `typings/mysql/index.d.ts`: TypeScript public contract.
 
-The C++ supported slice maps core connection, query, prepared statement, TLS, pooling, transaction, reset, and utility helpers. Promises, callbacks, stream APIs, pool clusters, compression, and parser cache controls are deferred because they are either Node runtime surfaces or require additional protocol wrappers.
+The C++ supported slice maps core connection, query, prepared statement, TLS, pooling, pool clusters, transaction, reset, change-user, compressed packets, LOCAL INFILE handler hooks, callback overloads, Promise wrappers, typed EventEmitter integration, stream adaptation, URI parsing, and utility helpers. Parser cache controls remain omitted because JavaScript code-generation caches are not meaningful in C++.
 
 ## Important files and why they matter
 
@@ -81,7 +81,7 @@ The C++ supported slice maps core connection, query, prepared statement, TLS, po
 ## Files likely irrelevant to the C++ port
 
 - Benchmark HTTP examples and website assets.
-- Promise wrapper implementation details beyond public API naming.
+- Promise wrapper internals beyond public API naming; the C++ port implements polycpp Promise wrappers directly over typed operations.
 - Generated JavaScript text/binary parser optimization code that exists to avoid V8 overhead; the C++ port uses static parsing.
 - TypeScript declaration internals beyond public option and result shapes.
 
@@ -96,11 +96,11 @@ The C++ supported slice maps core connection, query, prepared statement, TLS, po
 ## Implementation risks discovered from the source layout
 
 - Authentication is security-sensitive and stateful. Unsupported plugins must fail closed rather than silently downgrade.
-- TLS and compression alter the transport after the initial handshake; TLS is implemented and compression must preserve separate compressed packet sequencing when added.
+- TLS and compression alter the transport after the initial handshake; both are implemented and compression must preserve separate compressed packet sequencing.
 - Prepared statements use binary protocol and type encoding; single-result APIs must drain unexpected extra result sets before throwing to keep the connection synchronized.
 - Charset support is broad. A partial charset id map can decode common UTF-8/latin1 cases but is not full mysql2 parity.
 - Upstream uses dynamic JavaScript values and parser generation; the C++ API must define explicit variant behavior.
-- LOCAL INFILE is a file exfiltration boundary and is intentionally unsupported until an explicit callback policy exists.
+- LOCAL INFILE is a file exfiltration boundary. The port supports it only through an explicit callback policy that returns caller-approved `polycpp::Buffer` chunks.
 
 ## Companion repo alignment
 
@@ -117,12 +117,23 @@ The C++ supported slice maps core connection, query, prepared statement, TLS, po
 
 - polycpp core paths inspected: `/data/repo/polycpp/include/polycpp/buffer`, `/data/repo/polycpp/include/polycpp/crypto`, `/data/repo/polycpp/include/polycpp/io`, `/data/repo/polycpp/include/polycpp/zlib`, `/data/repo/polycpp/include/polycpp/tls`
 - polycpp core types/functions selected: `polycpp::Buffer`, `polycpp::crypto::createHash`, `polycpp::crypto::publicEncrypt`, `polycpp::io::EventContext`, `polycpp::io::TcpSocket`, `polycpp::io::TlsContext`, `polycpp::io::TlsStream`, and `polycpp::ssl::X509Cert`
-- polycpp core types/functions rejected: native HTTP request/response/header types are not relevant to MySQL protocol; native MySQL SDKs are not used; polycpp zlib is deferred until compressed packet sequencing is implemented.
+- polycpp core types/functions rejected: native HTTP request/response/header types are not relevant to MySQL protocol; native MySQL SDKs are not used.
 - companion libs inspected for reusable APIs: `iconv-lite`, `sequelize`, `jsonwebtoken`, and smaller HTTP utilities.
 - companion libs selected for reuse: `polycpp::iconv_lite` for non-core charset decoding.
 - companion libs rejected or deferred: no separate `long`, `denque`, `named-placeholders`, `sql-escaper`, or `lru.min` companion is required for the supported scope.
 - new local abstractions introduced: `Connection`, `ConnectionOptions`, `SslOptions`, `PreparedStatement`, `PoolOptions`, `Pool`, `PoolConnection`, `Field`, `Row`, `QueryResult`, `OkPacket`, and private packet cursor helpers.
 - reuse risks or integration gaps: `polycpp::io` is async-first, so this port wraps it with a synchronous API; timeout enforcement is not yet implemented. Full charset parity needs generated MySQL charset id data or deeper `iconv-lite` integration.
+
+## Node parity surface audit
+
+- callback APIs: upstream callback entry points are preserved as `std::function` overloads for connection, query, execute, prepare, transaction, ping, reset, change-user, end, pool, and pool-cluster APIs; they execute the same typed implementation and receive `std::exception_ptr` on failure.
+- Promise APIs: upstream Promise wrapper entry points are mapped to `polycpp::Promise` wrappers over the typed implementation. They settle through polycpp primitives rather than a JavaScript command queue.
+- EventEmitter APIs: connection, pool, and pool-cluster event surfaces are mapped to typed `polycpp::events::EventEmitter` integration. Error-event specializations are registered for connection, pool, and cluster objects.
+- stream APIs: upstream object-mode row streams are adapted to `polycpp::stream::Readable` byte chunks containing newline-delimited JSON rows because current polycpp streams are byte/text oriented, not arbitrary row object chunks.
+- Buffer and binary APIs: packet buffers, binary parameters, binary result columns, and LOCAL INFILE chunks use `polycpp::Buffer` so byte payloads are not downgraded to `std::string`.
+- URL, timer, process, and filesystem APIs: connection URI parsing uses `polycpp::url`; pool wait behavior uses C++ chrono; process globals are not a public C++ surface; filesystem access is limited to explicitly configured TLS certificate/key paths and LOCAL INFILE caller-provided buffers.
+- crypto, compression, TLS, network, and HTTP APIs: auth tokens and RSA encryption use `polycpp::crypto`; compression uses `polycpp::zlib`; TCP/TLS transport uses `polycpp::io` and `polycpp::ssl`; HTTP APIs are not relevant to the MySQL protocol.
+- unsupported Node-specific APIs and audit reason: JavaScript diagnostic channels, native object-mode row chunks, cursor fetch APIs, parser cache controls, server mode, and binlog/replication are deferred or omitted because they require additional protocol families or JavaScript-specific runtime mechanics.
 
 ## External SDK and native driver strategy
 
@@ -144,10 +155,10 @@ The C++ supported slice maps core connection, query, prepared statement, TLS, po
 
 - security-sensitive behavior: password authentication, RSA password encryption, SQL escaping, LOCAL INFILE, TLS, and server-controlled auth plugin names.
 - trust boundary: server packets, SQL/value input from callers, credentials, RSA public keys, and future file streams are untrusted boundaries.
-- supported protocol or algorithm matrix: MySQL protocol v10 handshake; optional TLS upgrade; `mysql_native_password`; `caching_sha2_password` fast auth plus TLS/RSA full auth; `sha256_password` TLS/RSA auth; TLS-gated `mysql_clear_password`; text protocol query results; prepared statement binary protocol; multi-result draining.
-- unsupported behavior and fail-closed policy: `mysql_clear_password` without TLS, LOCAL INFILE, compression, unsupported auth plugins, malformed packets, and unexpected multiple result sets in single-result APIs throw `polycpp::mysql2::Error`.
+- supported protocol or algorithm matrix: MySQL protocol v10 handshake; optional TLS upgrade; compressed packet protocol; `mysql_native_password`; `caching_sha2_password` fast auth plus TLS/RSA full auth; `sha256_password` TLS/RSA auth; TLS-gated `mysql_clear_password`; text protocol query results; prepared statement binary protocol; explicit LOCAL INFILE handler; multi-result draining.
+- unsupported behavior and fail-closed policy: `mysql_clear_password` without TLS, LOCAL INFILE without an explicit handler, unsupported auth plugins, malformed packets, and unexpected multiple result sets in single-result APIs throw `polycpp::mysql2::Error`.
 - key, secret, credential, or user-controlled input handling: password tokens are computed using polycpp crypto; SQL helpers escape string and buffer values; raw SQL requires explicit `raw()` use.
-- misuse cases that must be tested: auth plugin downgrade attempts, malformed length-coded packets, missing named placeholder values, SQL escaping edge bytes, server ERR packets, and unsupported LOCAL INFILE request.
+- misuse cases that must be tested: auth plugin downgrade attempts, malformed length-coded packets, missing named placeholder values, SQL escaping edge bytes, server ERR packets, and LOCAL INFILE requests without an explicit handler.
 
 ## Core use cases
 
@@ -174,21 +185,18 @@ The C++ supported slice maps core connection, query, prepared statement, TLS, po
 
 ## Features to defer
 
-- Compression.
 - Named SSL profile handling.
-- Prepared statement LRU cache.
-- Pool clusters.
-- Streams/EventEmitter-compatible callbacks.
-- LOCAL INFILE.
+- Native object-mode row streams; current stream adapter emits newline-delimited JSON `Buffer` chunks.
 - Server mode and replication/binlog commands.
 - Complete MySQL charset id table.
+- Query attributes, cursor fetch APIs, and diagnostic-channel tracing.
 
 ## v0 scope
 
 - port version: 0.1.0
-- supported APIs: `ConnectionOptions`, `SslOptions`, `Connection`, `PreparedStatement`, `PoolOptions`, `Pool`, `PoolConnection`, `create_connection`, `create_pool`, `query`, `query_all`, `execute`, `execute_all`, `prepare`, `close_statement`, `begin_transaction`, `commit`, `rollback`, `reset`, `ping`, `end`, `escape`, `escape_id`, `format`, `format_named`, `raw`
-- unsupported APIs: promises, callback/EventEmitter surface, streaming rows, compression, server mode, binlog/replication, LOCAL INFILE, pool clusters, parser cache controls, prepared statement LRU cache
-- dependency plan: reuse `iconv-lite`; replace `long` with C++ integer types; replace `denque` with standard containers and a synchronous pool; implement SQL escaping and named placeholders locally; defer SSL profiles, generated parser functions, and LRU prepared-statement cache
-- polycpp modules to use: `Buffer`, `crypto`, `io`, `ssl`, TLS, and the `iconv-lite` companion
+- supported APIs: `ConnectionOptions`, `SslOptions`, `Connection`, `PreparedStatement`, `PoolOptions`, `Pool`, `PoolConnection`, `PoolCluster`, `PoolNamespace`, `create_connection`, `create_pool`, `create_pool_cluster`, `query`, `query_all`, `execute`, `execute_all`, `prepare`, `close_statement`, `begin_transaction`, `commit`, `rollback`, `change_user`, `reset`, `ping`, `end`, `destroy`, `pause`, `resume`, callback overloads, `polycpp::Promise` wrappers, typed `EventEmitter` events, `query_stream_json`, connection URI parsing, compressed protocol, LOCAL INFILE handler, `escape`, `escape_id`, `format`, `format_named`, `raw`
+- unsupported APIs: server mode, binlog/replication, parser cache controls, query attributes, cursor fetch APIs, diagnostic channel tracing, native object-mode row streams
+- dependency plan: reuse `iconv-lite`; replace `long` with C++ integer types; replace `denque` with standard containers and a synchronous pool; implement SQL escaping and named placeholders locally; implement statement cache in-repo; defer SSL profiles and generated JS parser functions
+- polycpp modules to use: `Buffer`, `Promise`, `events`, `stream`, `url`, `zlib`, `crypto`, `io`, `ssl`, TLS, and the `iconv-lite` companion
 - missing polycpp primitives: synchronous TCP/TLS deadline helper and generated MySQL charset id table integration
 - versioning note: port versioning is independent from upstream npm versioning; upstream basis is recorded separately and does not imply parity
