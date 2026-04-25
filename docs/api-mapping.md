@@ -6,13 +6,16 @@
 | `mysql.createConnection(uri)` | `polycpp::mysql2::create_connection(std::string)`, `parse_connection_uri()` | adapted | Uses `polycpp::url` and maps known query options to typed `ConnectionOptions`. |
 | `mysql.connect(options)` | `polycpp::mysql2::create_connection(ConnectionOptions)` | adapted | Alias behavior is represented by the same factory. |
 | `Connection#query(sql, callback)` | `Connection::query(...)`, callback overloads, `query_promise(...)` | adapted | Synchronous typed return is primary; callback and `polycpp::Promise<QueryResult>` wrappers are provided for Node parity. If multiple result sets are returned, packets are drained and an error tells callers to use `query_all`. |
+| query attributes | `Connection::query(sql, QueryAttributes)`, `query_all(sql, QueryAttributes)`, callback and Promise overloads | adapted | Sends `CLIENT_QUERY_ATTRIBUTES` metadata for `COM_QUERY` when the server advertises support. Attribute ordering follows `std::unordered_map` iteration and is not public API. |
 | multiple result callback shape | `Connection::query_all(const std::string&)` | adapted | Returns `std::vector<QueryResult>` for multi-statement and stored-procedure style results. |
 | `Connection#execute(sql, values, callback)` | `Connection::execute(sql, values)`, callback overloads, `execute_promise(...)` | adapted | Uses a connection-local prepared statement cache and binary protocol parameters. |
+| prepared statement query attributes | `Connection::execute(..., QueryAttributes)`, `execute_all(..., QueryAttributes)`, callback and Promise overloads | adapted | Sends named attributes through `COM_STMT_EXECUTE` when the server advertises support. |
 | multi-result execute | `Connection::execute_all(...)` | adapted | Returns all result sets for prepared execution. |
 | `Connection#prepare(sql, callback)` | `Connection::prepare(const std::string&)`, callback overload, `prepare_promise(...)` | adapted | Returns `PreparedStatement` metadata. |
 | `PreparedStatementInfo#execute(values)` | `Connection::execute(statement, values)` | adapted | Explicit connection-owned execution. |
 | `PreparedStatementInfo#close()` | `Connection::close_statement(statement)` | adapted | Sends `COM_STMT_CLOSE`. |
 | `unprepare(sql)` | `Connection::close_statement(sql)` | adapted | Closes and removes a cached prepared statement when present. |
+| server-side prepared statement cursors | `Connection::execute_cursor(...)`, `Connection::fetch(...)`, `StatementCursor` | adapted | Uses `COM_STMT_EXECUTE` cursor flags and `COM_STMT_FETCH`. The cursor object records server status and field metadata. |
 | `createPool`, `Pool` | `polycpp::mysql2::create_pool(PoolOptions)`, `Pool` | adapted | Synchronous RAII pool with callback/Promise wrappers and typed acquire/connection/release/enqueue events. |
 | pool checkout/release | `Pool::get_connection()`, `PoolConnection` | adapted | Move-only RAII checkout handle releases on destruction. |
 | `createPoolCluster`, `PoolCluster` | `polycpp::mysql2::create_pool_cluster(...)`, `PoolCluster`, `PoolNamespace` | adapted | Implements named pools, wildcard matching, RR/RANDOM/ORDER selection, retry/offline/remove behavior, and typed events. |
@@ -34,7 +37,9 @@
 | `mysql.format(sql, values)` | `polycpp::mysql2::format(sql, values)` | adapted | Supports `?` values and `??` identifiers. |
 | `mysql.raw(sql)` | `polycpp::mysql2::raw(sql)` | adapted | Explicit raw SQL variant bypasses escaping. |
 | `namedPlaceholders` option | `polycpp::mysql2::format_named(sql, map)` | adapted | Separate helper rather than connection option. |
-| `ConnectionConfig` | `ConnectionOptions` | adapted | Typed subset of host, port, user, password, database, charset, auth key, SSL, and flags. |
+| `connectAttributes` | `ConnectionOptions::connect_attributes` | adapted | Merged with default client name/version attributes and sent during handshake and `COM_CHANGE_USER`. |
+| `charset`, `charsetNumber` | `ConnectionOptions::charset`, `charset_number`, `get_charset_number`, `get_charset_encoding` | adapted | Uses upstream mysql2 charset/collation ids and `iconv-lite` companion encoding support for non-core string conversions. |
+| `ConnectionConfig` | `ConnectionOptions` | adapted | Typed subset of host, port, user, password, database, charset, auth key, SSL, connect attributes, and flags. |
 | `PoolConfig` | `PoolOptions` | adapted | Connection options plus connection limit and wait timeout. |
 | `FieldPacket` / `ColumnDefinition` | `Field` | adapted | Public immutable metadata struct. |
 | text/binary row object | `Row` | adapted | Variant vector plus name lookup; no JS object prototype behavior. |
@@ -63,4 +68,4 @@ No polycpp HTTP request, response, or header type should be introduced for this 
 - Buffer and binary APIs: mapped to `polycpp::Buffer` for wire packets, binary SQL values, binary result columns, and LOCAL INFILE chunk uploads.
 - URL, timer, process, and filesystem APIs: URI parsing maps to `polycpp::url`; pool wait settings use C++ chrono; process APIs are not public; filesystem access is limited to explicit TLS file options and caller-provided LOCAL INFILE data.
 - Crypto, compression, TLS, network, and HTTP APIs: auth crypto maps to `polycpp::crypto`; compression maps to `polycpp::zlib`; TCP/TLS maps to `polycpp::io`/`polycpp::ssl`; HTTP is not part of this driver boundary.
-- Unsupported or non-meaningful Node-specific APIs and audit reason: native object-mode row chunks, diagnostic channels, parser cache controls, server/binlog APIs, cursor fetch APIs, and query attributes remain deferred or omitted as documented in `docs/divergences.md`.
+- Unsupported or non-meaningful Node-specific APIs and audit reason: native object-mode row chunks, diagnostic channels, parser cache controls, and server/binlog APIs remain deferred or omitted as documented in `docs/divergences.md`.

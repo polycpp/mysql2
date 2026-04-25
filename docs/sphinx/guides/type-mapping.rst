@@ -4,6 +4,7 @@ Type Mapping
 Rows contain ``Value`` variants:
 
 - ``std::monostate`` for SQL ``NULL``.
+- ``bool`` for explicit boolean input values and JSON conversion.
 - ``int64_t`` or ``uint64_t`` for integer columns when they fit the selected policy.
 - ``double`` for float and double columns.
 - ``std::string`` for decoded text, decimal strings, dates, times, datetimes, and JSON text.

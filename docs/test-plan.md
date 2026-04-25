@@ -16,9 +16,10 @@
 ## Integration Tests
 
 - Environment-driven MariaDB/MySQL test using `MYSQL2_TEST_HOST`, `MYSQL2_TEST_PORT`, `MYSQL2_TEST_USER`, `MYSQL2_TEST_PASSWORD`, and `MYSQL2_TEST_DATABASE`.
-- Current e2e coverage connects to MariaDB/MySQL, runs ping, selects scalar values, preserves empty binary values as Buffer, creates a temporary table, inserts rows, selects them back, uses prepared statements and cached execute, tests transactions, resets the connection, changes user state, tests multi-result queries, exercises callback/Promise wrappers, consumes a JSON line stream, verifies compression when enabled, optionally uploads LOCAL INFILE data when the server allows it, exercises the RAII pool, and exercises a single-node pool cluster.
+- Current e2e coverage connects to MariaDB/MySQL, runs ping, selects scalar values, sends query attributes when supported, preserves empty binary values as Buffer, creates a temporary table, inserts rows, selects them back, uses prepared statements, prepared-statement query attributes, server-side cursor fetch, and cached execute, tests transactions, resets the connection, changes user state, tests multi-result queries, exercises callback/Promise wrappers, consumes a JSON line stream, verifies compression when enabled, optionally uploads LOCAL INFILE data when the server allows it, exercises the RAII pool, and exercises a single-node pool cluster.
 - TLS e2e is controlled by `MYSQL2_TEST_SSL`, `MYSQL2_TEST_SSL_REJECT_UNAUTHORIZED`, `MYSQL2_TEST_SSL_VERIFY_IDENTITY`, and `MYSQL2_TEST_SSL_CA_FILE`.
 - MySQL 8 coverage runs against a Dockerized MySQL 8.4 server and validates the default `caching_sha2_password` path.
+- MySQL 8 coverage validates `CLIENT_QUERY_ATTRIBUTES` for both `COM_QUERY` and `COM_STMT_EXECUTE`.
 - Add a dedicated MySQL 8 TLS clear password auth path test if a server/user is configured to require it.
 - Add server ERR packet coverage with invalid SQL and access denied scenarios.
 - Add charset coverage for utf8mb4, latin1, binary, and representative non-UTF encodings through `iconv-lite`.

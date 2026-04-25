@@ -40,9 +40,12 @@ constexpr uint32_t FOUND_ROWS = 0x00000002;
 constexpr uint32_t LONG_FLAG = 0x00000004;
 constexpr uint32_t CONNECT_WITH_DB = 0x00000008;
 constexpr uint32_t COMPRESS = 0x00000020;
+constexpr uint32_t ODBC = 0x00000040;
 constexpr uint32_t LOCAL_FILES = 0x00000080;
+constexpr uint32_t IGNORE_SPACE = 0x00000100;
 constexpr uint32_t PROTOCOL_41 = 0x00000200;
 constexpr uint32_t SSL = 0x00000800;
+constexpr uint32_t IGNORE_SIGPIPE = 0x00001000;
 constexpr uint32_t TRANSACTIONS = 0x00002000;
 constexpr uint32_t RESERVED = 0x00004000;
 constexpr uint32_t SECURE_CONNECTION = 0x00008000;
@@ -66,6 +69,7 @@ constexpr uint8_t PING = 0x0e;
 constexpr uint8_t STMT_PREPARE = 0x16;
 constexpr uint8_t STMT_EXECUTE = 0x17;
 constexpr uint8_t STMT_CLOSE = 0x19;
+constexpr uint8_t STMT_FETCH = 0x1c;
 constexpr uint8_t RESET_CONNECTION = 0x1f;
 }  // namespace command_code
 
@@ -77,9 +81,11 @@ constexpr uint8_t AUTH_MORE_DATA = 0x01;
 constexpr uint8_t AUTH_NEXT_FACTOR = 0x02;
 }  // namespace marker
 
-namespace server_status {
+namespace server_status_flag {
 constexpr uint16_t MORE_RESULTS_EXISTS = 0x0008;
-}  // namespace server_status
+constexpr uint16_t CURSOR_EXISTS = 0x0040;
+constexpr uint16_t LAST_ROW_SENT = 0x0080;
+}  // namespace server_status_flag
 
 constexpr std::size_t kPacketHeaderLength = 4;
 constexpr std::size_t kCompressedPacketHeaderLength = 7;
@@ -494,8 +500,33 @@ void append_lenenc_buffer(std::vector<uint8_t>& out, const Buffer& value) {
     append_bytes(out, value);
 }
 
+Buffer encode_string_for_mysql(std::string_view value, const std::string& encoding) {
+    const auto text = std::string(value);
+    if (encoding.empty() || encoding == "utf8" || encoding == "utf8mb4") {
+        return Buffer::from(text);
+    }
+    if (encoding == "binary") {
+        return Buffer::from(text, "latin1");
+    }
+    if (Buffer::isEncoding(encoding)) {
+        return Buffer::from(text, encoding);
+    }
+    if (iconv_lite::encoding_exists(encoding)) {
+        return iconv_lite::encode(text, encoding);
+    }
+    return Buffer::from(text);
+}
 
-uint8_t charset_number_for_name(const std::string& charset, uint8_t fallback) {
+void append_encoded_string(std::vector<uint8_t>& out, std::string_view value, const std::string& encoding) {
+    append_bytes(out, encode_string_for_mysql(value, encoding));
+}
+
+void append_lenenc_encoded_string(std::vector<uint8_t>& out, std::string_view value, const std::string& encoding) {
+    const auto encoded = encode_string_for_mysql(value, encoding);
+    append_lenenc_buffer(out, encoded);
+}
+
+std::string normalize_charset_label(std::string_view charset) {
     std::string normalized;
     normalized.reserve(charset.size());
     for (const auto ch : charset) {
@@ -503,67 +534,669 @@ uint8_t charset_number_for_name(const std::string& charset, uint8_t fallback) {
             normalized.push_back(static_cast<char>(std::tolower(static_cast<unsigned char>(ch))));
         }
     }
-    if (normalized.empty() || normalized == "utf8mb4" || normalized == "utf8mb4unicodeci") return 224;
-    if (normalized == "utf8" || normalized == "utf8generalci") return 33;
-    if (normalized == "latin1" || normalized == "latin1swedishci") return 8;
-    if (normalized == "ascii" || normalized == "asciigeneralci") return 11;
-    if (normalized == "binary") return 63;
-    if (charset == "utf8mb4") return fallback;
+    return normalized;
+}
+
+const std::unordered_map<std::string, uint16_t>& charset_number_map() {
+    static const std::unordered_map<std::string, uint16_t> map = {
+        {"armscii8", 32},
+        {"armscii8bin", 64},
+        {"armscii8generalci", 32},
+        {"ascii", 11},
+        {"asciibin", 65},
+        {"asciigeneralci", 11},
+        {"big5", 1},
+        {"big5bin", 84},
+        {"big5chineseci", 1},
+        {"binary", 63},
+        {"cesu8", 33},
+        {"cp1250", 26},
+        {"cp1250bin", 66},
+        {"cp1250croatianci", 44},
+        {"cp1250czechcs", 34},
+        {"cp1250generalci", 26},
+        {"cp1250polishci", 99},
+        {"cp1251", 51},
+        {"cp1251bin", 50},
+        {"cp1251bulgarianci", 14},
+        {"cp1251generalci", 51},
+        {"cp1251generalcs", 52},
+        {"cp1251ukrainianci", 23},
+        {"cp1256", 57},
+        {"cp1256bin", 67},
+        {"cp1256generalci", 57},
+        {"cp1257", 59},
+        {"cp1257bin", 58},
+        {"cp1257generalci", 59},
+        {"cp1257lithuanianci", 29},
+        {"cp850", 4},
+        {"cp850bin", 80},
+        {"cp850generalci", 4},
+        {"cp852", 40},
+        {"cp852bin", 81},
+        {"cp852generalci", 40},
+        {"cp866", 36},
+        {"cp866bin", 68},
+        {"cp866generalci", 36},
+        {"cp932", 95},
+        {"cp932bin", 96},
+        {"cp932japaneseci", 95},
+        {"dec8", 3},
+        {"dec8bin", 69},
+        {"dec8swedishci", 3},
+        {"eucjp", 12},
+        {"eucjpms", 97},
+        {"eucjpmsbin", 98},
+        {"eucjpmsjapaneseci", 97},
+        {"euckr", 19},
+        {"euckrbin", 85},
+        {"euckrkoreanci", 19},
+        {"gb18030", 248},
+        {"gb18030bin", 249},
+        {"gb18030chineseci", 248},
+        {"gb18030unicode520ci", 250},
+        {"gb2312", 24},
+        {"gb2312bin", 86},
+        {"gb2312chineseci", 24},
+        {"gbk", 28},
+        {"gbkbin", 87},
+        {"gbkchineseci", 28},
+        {"geostd8", 92},
+        {"geostd8bin", 93},
+        {"geostd8generalci", 92},
+        {"greek", 25},
+        {"greekbin", 70},
+        {"greekgeneralci", 25},
+        {"hebrew", 16},
+        {"hebrewbin", 71},
+        {"hebrewgeneralci", 16},
+        {"hp8", 6},
+        {"hp8bin", 72},
+        {"hp8englishci", 6},
+        {"keybcs2", 37},
+        {"keybcs2bin", 73},
+        {"keybcs2generalci", 37},
+        {"koi8r", 7},
+        {"koi8rbin", 74},
+        {"koi8rgeneralci", 7},
+        {"koi8u", 22},
+        {"koi8ubin", 75},
+        {"koi8ugeneralci", 22},
+        {"latin1", 8},
+        {"latin1bin", 47},
+        {"latin1danishci", 15},
+        {"latin1generalci", 48},
+        {"latin1generalcs", 49},
+        {"latin1german1ci", 5},
+        {"latin1german2ci", 31},
+        {"latin1spanishci", 94},
+        {"latin1swedishci", 8},
+        {"latin2", 9},
+        {"latin2bin", 77},
+        {"latin2croatianci", 27},
+        {"latin2czechcs", 2},
+        {"latin2generalci", 9},
+        {"latin2hungarianci", 21},
+        {"latin5", 30},
+        {"latin5bin", 78},
+        {"latin5turkishci", 30},
+        {"latin7", 41},
+        {"latin7bin", 79},
+        {"latin7estoniancs", 20},
+        {"latin7generalci", 41},
+        {"latin7generalcs", 42},
+        {"macce", 38},
+        {"maccebin", 43},
+        {"maccegeneralci", 38},
+        {"macintosh", 38},
+        {"macroman", 39},
+        {"macromanbin", 53},
+        {"macromangeneralci", 39},
+        {"sjis", 13},
+        {"sjisbin", 88},
+        {"sjisjapaneseci", 13},
+        {"swe7", 10},
+        {"swe7bin", 82},
+        {"swe7swedishci", 10},
+        {"tis620", 18},
+        {"tis620bin", 89},
+        {"tis620thaici", 18},
+        {"ucs2", 35},
+        {"ucs2bin", 90},
+        {"ucs2croatianci", 149},
+        {"ucs2czechci", 138},
+        {"ucs2danishci", 139},
+        {"ucs2esperantoci", 145},
+        {"ucs2estonianci", 134},
+        {"ucs2generalci", 35},
+        {"ucs2generalmysql500ci", 159},
+        {"ucs2german2ci", 148},
+        {"ucs2hungarianci", 146},
+        {"ucs2icelandicci", 129},
+        {"ucs2latvianci", 130},
+        {"ucs2lithuanianci", 140},
+        {"ucs2persianci", 144},
+        {"ucs2polishci", 133},
+        {"ucs2romanci", 143},
+        {"ucs2romanianci", 131},
+        {"ucs2sinhalaci", 147},
+        {"ucs2slovakci", 141},
+        {"ucs2slovenianci", 132},
+        {"ucs2spanish2ci", 142},
+        {"ucs2spanishci", 135},
+        {"ucs2swedishci", 136},
+        {"ucs2turkishci", 137},
+        {"ucs2unicode520ci", 150},
+        {"ucs2unicodeci", 128},
+        {"ucs2vietnameseci", 151},
+        {"ujis", 12},
+        {"ujisbin", 91},
+        {"ujisjapaneseci", 12},
+        {"utf16", 54},
+        {"utf16bin", 55},
+        {"utf16croatianci", 122},
+        {"utf16czechci", 111},
+        {"utf16danishci", 112},
+        {"utf16esperantoci", 118},
+        {"utf16estonianci", 107},
+        {"utf16generalci", 54},
+        {"utf16german2ci", 121},
+        {"utf16hungarianci", 119},
+        {"utf16icelandicci", 102},
+        {"utf16latvianci", 103},
+        {"utf16le", 56},
+        {"utf16lebin", 62},
+        {"utf16legeneralci", 56},
+        {"utf16lithuanianci", 113},
+        {"utf16persianci", 117},
+        {"utf16polishci", 106},
+        {"utf16romanci", 116},
+        {"utf16romanianci", 104},
+        {"utf16sinhalaci", 120},
+        {"utf16slovakci", 114},
+        {"utf16slovenianci", 105},
+        {"utf16spanish2ci", 115},
+        {"utf16spanishci", 108},
+        {"utf16swedishci", 109},
+        {"utf16turkishci", 110},
+        {"utf16unicode520ci", 123},
+        {"utf16unicodeci", 101},
+        {"utf16vietnameseci", 124},
+        {"utf32", 60},
+        {"utf32bin", 61},
+        {"utf32croatianci", 181},
+        {"utf32czechci", 170},
+        {"utf32danishci", 171},
+        {"utf32esperantoci", 177},
+        {"utf32estonianci", 166},
+        {"utf32generalci", 60},
+        {"utf32german2ci", 180},
+        {"utf32hungarianci", 178},
+        {"utf32icelandicci", 161},
+        {"utf32latvianci", 162},
+        {"utf32lithuanianci", 172},
+        {"utf32persianci", 176},
+        {"utf32polishci", 165},
+        {"utf32romanci", 175},
+        {"utf32romanianci", 163},
+        {"utf32sinhalaci", 179},
+        {"utf32slovakci", 173},
+        {"utf32slovenianci", 164},
+        {"utf32spanish2ci", 174},
+        {"utf32spanishci", 167},
+        {"utf32swedishci", 168},
+        {"utf32turkishci", 169},
+        {"utf32unicode520ci", 182},
+        {"utf32unicodeci", 160},
+        {"utf32vietnameseci", 183},
+        {"utf8", 33},
+        {"utf8bin", 83},
+        {"utf8croatianci", 213},
+        {"utf8czechci", 202},
+        {"utf8danishci", 203},
+        {"utf8esperantoci", 209},
+        {"utf8estonianci", 198},
+        {"utf8general50ci", 253},
+        {"utf8generalci", 33},
+        {"utf8generalmysql500ci", 223},
+        {"utf8german2ci", 212},
+        {"utf8hungarianci", 210},
+        {"utf8icelandicci", 193},
+        {"utf8latvianci", 194},
+        {"utf8lithuanianci", 204},
+        {"utf8mb3", 33},
+        {"utf8mb4", 224},
+        {"utf8mb40900aici", 255},
+        {"utf8mb40900asci", 305},
+        {"utf8mb40900ascs", 278},
+        {"utf8mb40900bin", 309},
+        {"utf8mb4bin", 46},
+        {"utf8mb4croatianci", 245},
+        {"utf8mb4cs0900aici", 266},
+        {"utf8mb4cs0900ascs", 289},
+        {"utf8mb4czechci", 234},
+        {"utf8mb4da0900aici", 267},
+        {"utf8mb4da0900ascs", 290},
+        {"utf8mb4danishci", 235},
+        {"utf8mb4depb0900aici", 256},
+        {"utf8mb4depb0900ascs", 279},
+        {"utf8mb4eo0900aici", 273},
+        {"utf8mb4eo0900ascs", 296},
+        {"utf8mb4es0900aici", 263},
+        {"utf8mb4es0900ascs", 286},
+        {"utf8mb4esperantoci", 241},
+        {"utf8mb4estonianci", 230},
+        {"utf8mb4estrad0900aici", 270},
+        {"utf8mb4estrad0900ascs", 293},
+        {"utf8mb4et0900aici", 262},
+        {"utf8mb4et0900ascs", 285},
+        {"utf8mb4generalci", 45},
+        {"utf8mb4german2ci", 244},
+        {"utf8mb4hr0900aici", 275},
+        {"utf8mb4hr0900ascs", 298},
+        {"utf8mb4hu0900aici", 274},
+        {"utf8mb4hu0900ascs", 297},
+        {"utf8mb4hungarianci", 242},
+        {"utf8mb4icelandicci", 225},
+        {"utf8mb4is0900aici", 257},
+        {"utf8mb4is0900ascs", 280},
+        {"utf8mb4ja0900ascs", 303},
+        {"utf8mb4ja0900ascsks", 304},
+        {"utf8mb4la0900aici", 271},
+        {"utf8mb4la0900ascs", 294},
+        {"utf8mb4latvianci", 226},
+        {"utf8mb4lithuanianci", 236},
+        {"utf8mb4lt0900aici", 268},
+        {"utf8mb4lt0900ascs", 291},
+        {"utf8mb4lv0900aici", 258},
+        {"utf8mb4lv0900ascs", 281},
+        {"utf8mb4persianci", 240},
+        {"utf8mb4pl0900aici", 261},
+        {"utf8mb4pl0900ascs", 284},
+        {"utf8mb4polishci", 229},
+        {"utf8mb4ro0900aici", 259},
+        {"utf8mb4ro0900ascs", 282},
+        {"utf8mb4romanci", 239},
+        {"utf8mb4romanianci", 227},
+        {"utf8mb4ru0900aici", 306},
+        {"utf8mb4ru0900ascs", 307},
+        {"utf8mb4sinhalaci", 243},
+        {"utf8mb4sk0900aici", 269},
+        {"utf8mb4sk0900ascs", 292},
+        {"utf8mb4sl0900aici", 260},
+        {"utf8mb4sl0900ascs", 283},
+        {"utf8mb4slovakci", 237},
+        {"utf8mb4slovenianci", 228},
+        {"utf8mb4spanish2ci", 238},
+        {"utf8mb4spanishci", 231},
+        {"utf8mb4sv0900aici", 264},
+        {"utf8mb4sv0900ascs", 287},
+        {"utf8mb4swedishci", 232},
+        {"utf8mb4tr0900aici", 265},
+        {"utf8mb4tr0900ascs", 288},
+        {"utf8mb4turkishci", 233},
+        {"utf8mb4unicode520ci", 246},
+        {"utf8mb4unicodeci", 224},
+        {"utf8mb4vi0900aici", 277},
+        {"utf8mb4vi0900ascs", 300},
+        {"utf8mb4vietnameseci", 247},
+        {"utf8mb4zh0900ascs", 308},
+        {"utf8persianci", 208},
+        {"utf8polishci", 197},
+        {"utf8romanci", 207},
+        {"utf8romanianci", 195},
+        {"utf8sinhalaci", 211},
+        {"utf8slovakci", 205},
+        {"utf8slovenianci", 196},
+        {"utf8spanish2ci", 206},
+        {"utf8spanishci", 199},
+        {"utf8swedishci", 200},
+        {"utf8tolowerci", 76},
+        {"utf8turkishci", 201},
+        {"utf8unicode520ci", 214},
+        {"utf8unicodeci", 192},
+        {"utf8vietnameseci", 215},
+    };
+    return map;
+}
+
+uint16_t charset_number_for_name(const std::string& charset, uint16_t fallback) {
+    const auto normalized = normalize_charset_label(charset);
+    if (normalized.empty()) return fallback;
+    const auto& map = charset_number_map();
+    const auto it = map.find(normalized);
+    if (it != map.end()) return it->second;
     throw Error("unsupported charset option: " + charset);
 }
 
+const std::vector<std::string>& charset_encoding_table() {
+    static const std::vector<std::string> table = {
+        "utf8", // 0
+        "big5", // 1
+        "latin2", // 2
+        "dec8", // 3
+        "cp850", // 4
+        "latin1", // 5
+        "hp8", // 6
+        "koi8r", // 7
+        "latin1", // 8
+        "latin2", // 9
+        "swe7", // 10
+        "ascii", // 11
+        "eucjp", // 12
+        "sjis", // 13
+        "cp1251", // 14
+        "latin1", // 15
+        "hebrew", // 16
+        "utf8", // 17
+        "tis620", // 18
+        "euckr", // 19
+        "latin7", // 20
+        "latin2", // 21
+        "koi8u", // 22
+        "cp1251", // 23
+        "gb2312", // 24
+        "greek", // 25
+        "cp1250", // 26
+        "latin2", // 27
+        "gbk", // 28
+        "cp1257", // 29
+        "latin5", // 30
+        "latin1", // 31
+        "armscii8", // 32
+        "cesu8", // 33
+        "cp1250", // 34
+        "ucs2", // 35
+        "cp866", // 36
+        "keybcs2", // 37
+        "macintosh", // 38
+        "macroman", // 39
+        "cp852", // 40
+        "latin7", // 41
+        "latin7", // 42
+        "macintosh", // 43
+        "cp1250", // 44
+        "utf8", // 45
+        "utf8", // 46
+        "latin1", // 47
+        "latin1", // 48
+        "latin1", // 49
+        "cp1251", // 50
+        "cp1251", // 51
+        "cp1251", // 52
+        "macroman", // 53
+        "utf16", // 54
+        "utf16", // 55
+        "utf16-le", // 56
+        "cp1256", // 57
+        "cp1257", // 58
+        "cp1257", // 59
+        "utf32", // 60
+        "utf32", // 61
+        "utf16-le", // 62
+        "binary", // 63
+        "armscii8", // 64
+        "ascii", // 65
+        "cp1250", // 66
+        "cp1256", // 67
+        "cp866", // 68
+        "dec8", // 69
+        "greek", // 70
+        "hebrew", // 71
+        "hp8", // 72
+        "keybcs2", // 73
+        "koi8r", // 74
+        "koi8u", // 75
+        "cesu8", // 76
+        "latin2", // 77
+        "latin5", // 78
+        "latin7", // 79
+        "cp850", // 80
+        "cp852", // 81
+        "swe7", // 82
+        "cesu8", // 83
+        "big5", // 84
+        "euckr", // 85
+        "gb2312", // 86
+        "gbk", // 87
+        "sjis", // 88
+        "tis620", // 89
+        "ucs2", // 90
+        "eucjp", // 91
+        "geostd8", // 92
+        "geostd8", // 93
+        "latin1", // 94
+        "cp932", // 95
+        "cp932", // 96
+        "eucjpms", // 97
+        "eucjpms", // 98
+        "cp1250", // 99
+        "utf16", // 100
+        "utf16", // 101
+        "utf16", // 102
+        "utf16", // 103
+        "utf16", // 104
+        "utf16", // 105
+        "utf16", // 106
+        "utf16", // 107
+        "utf16", // 108
+        "utf16", // 109
+        "utf16", // 110
+        "utf16", // 111
+        "utf16", // 112
+        "utf16", // 113
+        "utf16", // 114
+        "utf16", // 115
+        "utf16", // 116
+        "utf16", // 117
+        "utf16", // 118
+        "utf16", // 119
+        "utf16", // 120
+        "utf16", // 121
+        "utf16", // 122
+        "utf16", // 123
+        "utf16", // 124
+        "utf8", // 125
+        "utf8", // 126
+        "utf8", // 127
+        "ucs2", // 128
+        "ucs2", // 129
+        "ucs2", // 130
+        "ucs2", // 131
+        "ucs2", // 132
+        "ucs2", // 133
+        "ucs2", // 134
+        "ucs2", // 135
+        "ucs2", // 136
+        "ucs2", // 137
+        "ucs2", // 138
+        "ucs2", // 139
+        "ucs2", // 140
+        "ucs2", // 141
+        "ucs2", // 142
+        "ucs2", // 143
+        "ucs2", // 144
+        "ucs2", // 145
+        "ucs2", // 146
+        "ucs2", // 147
+        "ucs2", // 148
+        "ucs2", // 149
+        "ucs2", // 150
+        "ucs2", // 151
+        "utf8", // 152
+        "utf8", // 153
+        "utf8", // 154
+        "utf8", // 155
+        "utf8", // 156
+        "utf8", // 157
+        "utf8", // 158
+        "ucs2", // 159
+        "utf32", // 160
+        "utf32", // 161
+        "utf32", // 162
+        "utf32", // 163
+        "utf32", // 164
+        "utf32", // 165
+        "utf32", // 166
+        "utf32", // 167
+        "utf32", // 168
+        "utf32", // 169
+        "utf32", // 170
+        "utf32", // 171
+        "utf32", // 172
+        "utf32", // 173
+        "utf32", // 174
+        "utf32", // 175
+        "utf32", // 176
+        "utf32", // 177
+        "utf32", // 178
+        "utf32", // 179
+        "utf32", // 180
+        "utf32", // 181
+        "utf32", // 182
+        "utf32", // 183
+        "utf8", // 184
+        "utf8", // 185
+        "utf8", // 186
+        "utf8", // 187
+        "utf8", // 188
+        "utf8", // 189
+        "utf8", // 190
+        "utf8", // 191
+        "cesu8", // 192
+        "cesu8", // 193
+        "cesu8", // 194
+        "cesu8", // 195
+        "cesu8", // 196
+        "cesu8", // 197
+        "cesu8", // 198
+        "cesu8", // 199
+        "cesu8", // 200
+        "cesu8", // 201
+        "cesu8", // 202
+        "cesu8", // 203
+        "cesu8", // 204
+        "cesu8", // 205
+        "cesu8", // 206
+        "cesu8", // 207
+        "cesu8", // 208
+        "cesu8", // 209
+        "cesu8", // 210
+        "cesu8", // 211
+        "cesu8", // 212
+        "cesu8", // 213
+        "cesu8", // 214
+        "cesu8", // 215
+        "utf8", // 216
+        "utf8", // 217
+        "utf8", // 218
+        "utf8", // 219
+        "utf8", // 220
+        "utf8", // 221
+        "utf8", // 222
+        "cesu8", // 223
+        "utf8", // 224
+        "utf8", // 225
+        "utf8", // 226
+        "utf8", // 227
+        "utf8", // 228
+        "utf8", // 229
+        "utf8", // 230
+        "utf8", // 231
+        "utf8", // 232
+        "utf8", // 233
+        "utf8", // 234
+        "utf8", // 235
+        "utf8", // 236
+        "utf8", // 237
+        "utf8", // 238
+        "utf8", // 239
+        "utf8", // 240
+        "utf8", // 241
+        "utf8", // 242
+        "utf8", // 243
+        "utf8", // 244
+        "utf8", // 245
+        "utf8", // 246
+        "utf8", // 247
+        "gb18030", // 248
+        "gb18030", // 249
+        "gb18030", // 250
+        "utf8", // 251
+        "utf8", // 252
+        "utf8", // 253
+        "utf8", // 254
+        "utf8", // 255
+        "utf8", // 256
+        "utf8", // 257
+        "utf8", // 258
+        "utf8", // 259
+        "utf8", // 260
+        "utf8", // 261
+        "utf8", // 262
+        "utf8", // 263
+        "utf8", // 264
+        "utf8", // 265
+        "utf8", // 266
+        "utf8", // 267
+        "utf8", // 268
+        "utf8", // 269
+        "utf8", // 270
+        "utf8", // 271
+        "utf8", // 272
+        "utf8", // 273
+        "utf8", // 274
+        "utf8", // 275
+        "utf8", // 276
+        "utf8", // 277
+        "utf8", // 278
+        "utf8", // 279
+        "utf8", // 280
+        "utf8", // 281
+        "utf8", // 282
+        "utf8", // 283
+        "utf8", // 284
+        "utf8", // 285
+        "utf8", // 286
+        "utf8", // 287
+        "utf8", // 288
+        "utf8", // 289
+        "utf8", // 290
+        "utf8", // 291
+        "utf8", // 292
+        "utf8", // 293
+        "utf8", // 294
+        "utf8", // 295
+        "utf8", // 296
+        "utf8", // 297
+        "utf8", // 298
+        "utf8", // 299
+        "utf8", // 300
+        "utf8", // 301
+        "utf8", // 302
+        "utf8", // 303
+        "utf8", // 304
+        "utf8", // 305
+        "utf8", // 306
+        "utf8", // 307
+        "utf8", // 308
+        "utf8", // 309
+    };
+    return table;
+}
+
 std::string charset_encoding(uint16_t charset) {
-    switch (charset) {
-        case 8:
-        case 47:
-        case 48:
-        case 49:
-        case 94:
-            return "latin1";
-        case 11:
-        case 65:
-            return "ascii";
-        case 33:
-        case 45:
-        case 46:
-        case 76:
-        case 83:
-        case 192:
-        case 193:
-        case 194:
-        case 195:
-        case 199:
-        case 200:
-        case 201:
-        case 202:
-        case 203:
-        case 204:
-        case 205:
-        case 206:
-        case 207:
-        case 208:
-        case 209:
-        case 210:
-        case 211:
-        case 212:
-        case 213:
-        case 214:
-        case 215:
-        case 223:
-        case 224:
-        case 225:
-        case 226:
-        case 227:
-        case 228:
-        case 229:
-        case 230:
-        case 255:
-            return "utf8";
-        case 63:
-            return "binary";
-        default:
-            return "utf8";
+    const auto& table = charset_encoding_table();
+    if (charset < table.size() && !table[charset].empty()) return table[charset];
+    return "utf8";
+}
+
+uint8_t handshake_charset_byte(uint16_t charset) {
+    if (charset > 255) {
+        throw Error("charset number " + std::to_string(charset) +
+                    " cannot be used in the one-byte MySQL handshake charset field");
     }
+    return static_cast<uint8_t>(charset);
 }
 
 struct Handshake {
@@ -631,7 +1264,11 @@ uint32_t build_client_flags(const ConnectionOptions& options, const Handshake& h
     uint32_t desired = client_flag::LONG_PASSWORD |
                        client_flag::FOUND_ROWS |
                        client_flag::LONG_FLAG |
+                       client_flag::ODBC |
+                       client_flag::LOCAL_FILES |
+                       client_flag::IGNORE_SPACE |
                        client_flag::PROTOCOL_41 |
+                       client_flag::IGNORE_SIGPIPE |
                        client_flag::TRANSACTIONS |
                        client_flag::RESERVED |
                        client_flag::SECURE_CONNECTION |
@@ -639,7 +1276,9 @@ uint32_t build_client_flags(const ConnectionOptions& options, const Handshake& h
                        client_flag::PS_MULTI_RESULTS |
                        client_flag::PLUGIN_AUTH |
                        client_flag::PLUGIN_AUTH_LENENC_CLIENT_DATA |
-                       client_flag::SESSION_TRACK;
+                       client_flag::SESSION_TRACK |
+                       client_flag::CONNECT_ATTRS |
+                       client_flag::CLIENT_QUERY_ATTRIBUTES;
     if (!options.database.empty()) {
         desired |= client_flag::CONNECT_WITH_DB;
     }
@@ -651,9 +1290,6 @@ uint32_t build_client_flags(const ConnectionOptions& options, const Handshake& h
     }
     if (options.compress) {
         desired |= client_flag::COMPRESS;
-    }
-    if (options.local_infile_handler) {
-        desired |= client_flag::LOCAL_FILES;
     }
     desired |= handshake.capability_flags & client_flag::MULTI_FACTOR_AUTHENTICATION;
     auto flags = desired & handshake.capability_flags;
@@ -694,6 +1330,24 @@ Buffer calculate_auth_token(const std::string& plugin, const std::string& passwo
     return mysql_native_password_token(password, scramble);
 }
 
+void append_connect_attributes(std::vector<uint8_t>& out, const ConnectionOptions& options, const std::string& encoding) {
+    std::map<std::string, std::string> attributes = {
+        {"_client_name", "polycpp-mysql2"},
+        {"_client_version", "0.1.0"},
+    };
+    for (const auto& [key, value] : options.connect_attributes) {
+        attributes[key] = value;
+    }
+
+    std::vector<uint8_t> encoded_attributes;
+    for (const auto& [key, value] : attributes) {
+        append_lenenc_encoded_string(encoded_attributes, key, encoding);
+        append_lenenc_encoded_string(encoded_attributes, value, encoding);
+    }
+    append_lenenc_int(out, encoded_attributes.size());
+    out.insert(out.end(), encoded_attributes.begin(), encoded_attributes.end());
+}
+
 Buffer build_handshake_response(const ConnectionOptions& options,
                                 const Handshake& handshake,
                                 uint32_t client_flags,
@@ -703,7 +1357,7 @@ Buffer build_handshake_response(const ConnectionOptions& options,
     out.reserve(128 + options.user.size() + options.database.size() + auth_token.length());
     append_u32_le(out, client_flags);
     append_u32_le(out, 0);  // max packet size: 0 means default/no client-side cap.
-    append_u8(out, options.charset_number);
+    append_u8(out, handshake_charset_byte(options.charset_number));
     out.insert(out.end(), 23, 0);
     append_null_string(out, options.user);
     if (client_flags & client_flag::PLUGIN_AUTH_LENENC_CLIENT_DATA) {
@@ -724,6 +1378,9 @@ Buffer build_handshake_response(const ConnectionOptions& options,
     if (client_flags & client_flag::PLUGIN_AUTH) {
         append_null_string(out, auth_plugin_name);
     }
+    if (client_flags & client_flag::CONNECT_ATTRS) {
+        append_connect_attributes(out, options, "utf8");
+    }
     return buffer_from_bytes(out);
 }
 
@@ -732,7 +1389,7 @@ Buffer build_ssl_request(const ConnectionOptions& options, uint32_t client_flags
     out.reserve(32);
     append_u32_le(out, client_flags | client_flag::SSL);
     append_u32_le(out, 0);  // max packet size: 0 means default/no client-side cap.
-    append_u8(out, options.charset_number);
+    append_u8(out, handshake_charset_byte(options.charset_number));
     out.insert(out.end(), 23, 0);
     return buffer_from_bytes(out);
 }
@@ -759,6 +1416,9 @@ Buffer build_change_user_payload(const ConnectionOptions& options,
     append_u16_le(out, options.charset_number);
     if (client_flags & client_flag::PLUGIN_AUTH) {
         append_null_string(out, auth_plugin_name);
+    }
+    if (client_flags & client_flag::CONNECT_ATTRS) {
+        append_connect_attributes(out, options, charset_encoding(options.charset_number));
     }
     return buffer_from_bytes(out);
 }
@@ -811,6 +1471,20 @@ OkPacket parse_ok_packet(const Buffer& payload, uint32_t server_flags) {
         if (end > start) {
             ok.changed_rows = static_cast<uint64_t>(std::stoull(ok.info.substr(start, end - start)));
         }
+    }
+    return ok;
+}
+
+OkPacket parse_resultset_end_packet(const Buffer& payload, uint32_t server_flags) {
+    if (is_ok_packet(payload)) {
+        return parse_ok_packet(payload, server_flags);
+    }
+    OkPacket ok;
+    if (is_eof_packet(payload) && payload.length() >= 5) {
+        PacketCursor eof(payload);
+        eof.read_u8();
+        ok.warning_count = eof.read_u16_le();
+        ok.server_status = eof.read_u16_le();
     }
     return ok;
 }
@@ -1134,32 +1808,35 @@ std::vector<Field> read_definition_packets(auto& read_packet, std::size_t count,
     return definitions;
 }
 
-Buffer build_stmt_prepare_payload(const std::string& sql) {
+Buffer build_stmt_prepare_payload(const std::string& sql, const std::string& encoding) {
     std::vector<uint8_t> payload;
     payload.reserve(sql.size() + 1);
     append_u8(payload, command_code::STMT_PREPARE);
-    append_string(payload, sql);
+    append_encoded_string(payload, sql, encoding);
     return buffer_from_bytes(payload);
 }
 
-void append_bound_value(std::vector<uint8_t>& payload, const Value& value) {
+void append_bound_value(std::vector<uint8_t>& payload, const Value& value, const std::string& encoding) {
     struct Visitor {
         std::vector<uint8_t>& payload;
+        const std::string& encoding;
         void operator()(std::monostate) const {}
+        void operator()(bool value) const { append_u8(payload, value ? 1 : 0); }
         void operator()(int64_t value) const { append_u64_le(payload, static_cast<uint64_t>(value)); }
         void operator()(uint64_t value) const { append_u64_le(payload, value); }
         void operator()(double value) const { append_double_le(payload, value); }
-        void operator()(const std::string& value) const { append_lenenc_string(payload, value); }
+        void operator()(const std::string& value) const { append_lenenc_encoded_string(payload, value, encoding); }
         void operator()(const Buffer& value) const { append_lenenc_buffer(payload, value); }
         void operator()(const RawSql&) const { throw Error("raw SQL values cannot be used as prepared statement parameters"); }
     };
-    std::visit(Visitor{payload}, value);
+    std::visit(Visitor{payload, encoding}, value);
 }
 
 std::pair<uint8_t, uint8_t> bound_type(const Value& value) {
     using namespace constants::column_type;
     struct Visitor {
         std::pair<uint8_t, uint8_t> operator()(std::monostate) const { return {NULL_TYPE, 0}; }
+        std::pair<uint8_t, uint8_t> operator()(bool) const { return {TINY, 0}; }
         std::pair<uint8_t, uint8_t> operator()(int64_t) const { return {LONGLONG, 0}; }
         std::pair<uint8_t, uint8_t> operator()(uint64_t) const { return {LONGLONG, 0x80}; }
         std::pair<uint8_t, uint8_t> operator()(double) const { return {DOUBLE, 0}; }
@@ -1172,44 +1849,132 @@ std::pair<uint8_t, uint8_t> bound_type(const Value& value) {
     return std::visit(Visitor{}, value);
 }
 
-Buffer build_stmt_execute_payload(uint32_t statement_id, std::size_t parameter_count, const std::vector<Value>& values) {
+bool is_null_value(const Value& value) {
+    return std::holds_alternative<std::monostate>(value);
+}
+
+Buffer build_stmt_execute_payload(uint32_t statement_id,
+                                  std::size_t parameter_count,
+                                  const std::vector<Value>& values,
+                                  const QueryAttributes& attributes,
+                                  const std::string& encoding,
+                                  uint32_t client_flags,
+                                  CursorType cursor_type) {
     if (values.size() != parameter_count) {
         throw Error("prepared statement expected " + std::to_string(parameter_count) +
                     " parameters, got " + std::to_string(values.size()));
     }
+    const bool use_query_attributes = (client_flags & client_flag::CLIENT_QUERY_ATTRIBUTES) != 0;
+    if (!attributes.empty() && !use_query_attributes) {
+        throw Error("server does not support query attributes for COM_STMT_EXECUTE");
+    }
+    const std::size_t total_params = values.size() + (use_query_attributes ? attributes.size() : 0);
     std::vector<uint8_t> payload;
-    payload.reserve(16 + values.size() * 16);
+    payload.reserve(16 + total_params * 16);
     append_u8(payload, command_code::STMT_EXECUTE);
     append_u32_le(payload, statement_id);
-    append_u8(payload, 0);     // CURSOR_TYPE_NO_CURSOR
+    auto cursor_flags = static_cast<uint8_t>(cursor_type);
+    if (use_query_attributes) {
+        cursor_flags |= 0x08;  // PARAMETER_COUNT_AVAILABLE
+    }
+    append_u8(payload, cursor_flags);
     append_u32_le(payload, 1); // iteration count
-    if (!values.empty()) {
-        const std::size_t null_bitmap_length = (values.size() + 7) / 8;
+    if (use_query_attributes) {
+        append_lenenc_int(payload, total_params);
+    }
+    if (total_params > 0) {
+        std::vector<const Value*> all_values;
+        all_values.reserve(total_params);
+        for (const auto& value : values) all_values.push_back(&value);
+        std::vector<std::string> attribute_names;
+        attribute_names.reserve(attributes.size());
+        if (use_query_attributes) {
+            for (const auto& [name, value] : attributes) {
+                attribute_names.push_back(name);
+                all_values.push_back(&value);
+            }
+        }
+        const std::size_t null_bitmap_length = (total_params + 7) / 8;
         std::vector<uint8_t> null_bitmap(null_bitmap_length, 0);
-        for (std::size_t i = 0; i < values.size(); ++i) {
-            if (std::holds_alternative<std::monostate>(values[i])) {
+        for (std::size_t i = 0; i < all_values.size(); ++i) {
+            if (is_null_value(*all_values[i])) {
                 null_bitmap[i / 8] |= static_cast<uint8_t>(1u << (i % 8));
             }
         }
         payload.insert(payload.end(), null_bitmap.begin(), null_bitmap.end());
         append_u8(payload, 1); // new-params-bound-flag
-        for (const auto& value : values) {
-            const auto [type, flags] = bound_type(value);
+        for (std::size_t i = 0; i < all_values.size(); ++i) {
+            const auto [type, flags] = bound_type(*all_values[i]);
             append_u8(payload, type);
             append_u8(payload, flags);
+            if (use_query_attributes) {
+                const auto name = i < values.size() ? std::string_view{} : std::string_view(attribute_names[i - values.size()]);
+                append_lenenc_encoded_string(payload, name, encoding);
+            }
         }
-        for (const auto& value : values) {
-            if (!std::holds_alternative<std::monostate>(value)) {
-                append_bound_value(payload, value);
+        for (const auto* value : all_values) {
+            if (!is_null_value(*value)) {
+                append_bound_value(payload, *value, encoding);
             }
         }
     }
     return buffer_from_bytes(payload);
 }
 
+Buffer build_query_payload(const std::string& sql,
+                           const QueryAttributes& attributes,
+                           const std::string& encoding,
+                           uint32_t client_flags) {
+    const bool use_query_attributes = (client_flags & client_flag::CLIENT_QUERY_ATTRIBUTES) != 0;
+    if (!attributes.empty() && !use_query_attributes) {
+        throw Error("server does not support query attributes for COM_QUERY");
+    }
+
+    std::vector<uint8_t> payload;
+    payload.reserve(1 + sql.size() + attributes.size() * 16);
+    append_u8(payload, command_code::QUERY);
+    if (use_query_attributes) {
+        append_lenenc_int(payload, attributes.size());
+        append_lenenc_int(payload, 1);  // parameter_set_count
+        if (!attributes.empty()) {
+            std::vector<const Value*> values;
+            values.reserve(attributes.size());
+            std::vector<std::string> names;
+            names.reserve(attributes.size());
+            for (const auto& [name, value] : attributes) {
+                names.push_back(name);
+                values.push_back(&value);
+            }
+            const std::size_t null_bitmap_length = (values.size() + 7) / 8;
+            std::vector<uint8_t> null_bitmap(null_bitmap_length, 0);
+            for (std::size_t i = 0; i < values.size(); ++i) {
+                if (is_null_value(*values[i])) {
+                    null_bitmap[i / 8] |= static_cast<uint8_t>(1u << (i % 8));
+                }
+            }
+            payload.insert(payload.end(), null_bitmap.begin(), null_bitmap.end());
+            append_u8(payload, 1);  // new_params_bind_flag
+            for (std::size_t i = 0; i < values.size(); ++i) {
+                const auto [type, flags] = bound_type(*values[i]);
+                append_u8(payload, type);
+                append_u8(payload, flags);
+                append_lenenc_encoded_string(payload, names[i], encoding);
+            }
+            for (const auto* value : values) {
+                if (!is_null_value(*value)) {
+                    append_bound_value(payload, *value, encoding);
+                }
+            }
+        }
+    }
+    append_encoded_string(payload, sql, encoding);
+    return buffer_from_bytes(payload);
+}
+
 std::string value_to_string(const Value& value) {
     struct Visitor {
         std::string operator()(std::monostate) const { return "NULL"; }
+        std::string operator()(bool value) const { return value ? "true" : "false"; }
         std::string operator()(int64_t value) const { return std::to_string(value); }
         std::string operator()(uint64_t value) const { return std::to_string(value); }
         std::string operator()(double value) const {
@@ -1287,7 +2052,15 @@ public:
     }
 
     QueryResult query(const std::string& sql) {
-        auto results = query_all(sql);
+        auto results = query_all(sql, {});
+        if (results.size() != 1) {
+            throw Error("query returned multiple result sets; use query_all");
+        }
+        return std::move(results.front());
+    }
+
+    QueryResult query(const std::string& sql, const QueryAttributes& attributes) {
+        auto results = query_all(sql, attributes);
         if (results.size() != 1) {
             throw Error("query returned multiple result sets; use query_all");
         }
@@ -1295,18 +2068,18 @@ public:
     }
 
     std::vector<QueryResult> query_all(const std::string& sql) {
+        return query_all(sql, {});
+    }
+
+    std::vector<QueryResult> query_all(const std::string& sql, const QueryAttributes& attributes) {
         ensure_connected();
-        std::vector<uint8_t> payload;
-        payload.reserve(sql.size() + 1);
-        append_u8(payload, command_code::QUERY);
-        append_string(payload, sql);
-        write_packet(buffer_from_bytes(payload), 0);
+        write_packet(build_query_payload(sql, attributes, client_encoding_, client_flags_), 0);
         return read_query_results(false);
     }
 
     PreparedStatement prepare(const std::string& sql) {
         ensure_connected();
-        write_packet(build_stmt_prepare_payload(sql), 0);
+        write_packet(build_stmt_prepare_payload(sql, client_encoding_), 0);
         const auto frame = read_packet();
         if (is_err_packet(frame.payload)) {
             throw parse_error_packet(frame.payload);
@@ -1370,7 +2143,15 @@ public:
     }
 
     QueryResult execute(const PreparedStatement& statement, const std::vector<Value>& values) {
-        auto results = execute_all(statement, values);
+        auto results = execute_all(statement, values, {});
+        if (results.size() != 1) {
+            throw Error("execute returned multiple result sets; use execute_all");
+        }
+        return std::move(results.front());
+    }
+
+    QueryResult execute(const PreparedStatement& statement, const std::vector<Value>& values, const QueryAttributes& attributes) {
+        auto results = execute_all(statement, values, attributes);
         if (results.size() != 1) {
             throw Error("execute returned multiple result sets; use execute_all");
         }
@@ -1378,11 +2159,21 @@ public:
     }
 
     std::vector<QueryResult> execute_all(const PreparedStatement& statement, const std::vector<Value>& values) {
+        return execute_all(statement, values, {});
+    }
+
+    std::vector<QueryResult> execute_all(const PreparedStatement& statement, const std::vector<Value>& values, const QueryAttributes& attributes) {
         ensure_connected();
         if (statement.id == 0) {
             throw Error("cannot execute an empty prepared statement");
         }
-        write_packet(build_stmt_execute_payload(statement.id, statement.parameters.size(), values), 0);
+        write_packet(build_stmt_execute_payload(statement.id,
+                                                statement.parameters.size(),
+                                                values,
+                                                attributes,
+                                                client_encoding_,
+                                                client_flags_,
+                                                CursorType::None), 0);
         return read_query_results(true);
     }
 
@@ -1391,9 +2182,88 @@ public:
         return execute(statement, values);
     }
 
+    QueryResult execute(const std::string& sql, const std::vector<Value>& values, const QueryAttributes& attributes) {
+        auto statement = prepare_cached(sql);
+        return execute(statement, values, attributes);
+    }
+
     std::vector<QueryResult> execute_all(const std::string& sql, const std::vector<Value>& values) {
         auto statement = prepare_cached(sql);
         return execute_all(statement, values);
+    }
+
+    std::vector<QueryResult> execute_all(const std::string& sql, const std::vector<Value>& values, const QueryAttributes& attributes) {
+        auto statement = prepare_cached(sql);
+        return execute_all(statement, values, attributes);
+    }
+
+    StatementCursor execute_cursor(const PreparedStatement& statement,
+                                   const std::vector<Value>& values,
+                                   const QueryAttributes& attributes,
+                                   CursorType cursor_type) {
+        ensure_connected();
+        if (statement.id == 0) {
+            throw Error("cannot execute an empty prepared statement cursor");
+        }
+        if (cursor_type == CursorType::None) {
+            cursor_type = CursorType::ReadOnly;
+        }
+        write_packet(build_stmt_execute_payload(statement.id,
+                                                statement.parameters.size(),
+                                                values,
+                                                attributes,
+                                                client_encoding_,
+                                                client_flags_,
+                                                cursor_type), 0);
+        auto result = read_query_result(true);
+        StatementCursor cursor;
+        cursor.statement = statement;
+        cursor.fields = result.fields;
+        cursor.server_status = result.ok.server_status;
+        return cursor;
+    }
+
+    StatementCursor execute_cursor(const std::string& sql,
+                                   const std::vector<Value>& values,
+                                   const QueryAttributes& attributes,
+                                   CursorType cursor_type) {
+        auto statement = prepare_cached(sql);
+        return execute_cursor(statement, values, attributes, cursor_type);
+    }
+
+    QueryResult fetch(StatementCursor& cursor, uint32_t row_count) {
+        ensure_connected();
+        if (cursor.statement.id == 0) {
+            throw Error("cannot fetch from an empty prepared statement cursor");
+        }
+        if (!cursor.open()) {
+            QueryResult result;
+            result.fields = cursor.fields;
+            result.ok.server_status = cursor.server_status;
+            return result;
+        }
+        std::vector<uint8_t> payload;
+        payload.reserve(9);
+        append_u8(payload, command_code::STMT_FETCH);
+        append_u32_le(payload, cursor.statement.id);
+        append_u32_le(payload, row_count == 0 ? 1 : row_count);
+        write_packet(buffer_from_bytes(payload), 0);
+
+        QueryResult result;
+        result.fields = cursor.fields;
+        while (true) {
+            const auto row_frame = read_packet();
+            if (is_err_packet(row_frame.payload)) {
+                throw parse_error_packet(row_frame.payload);
+            }
+            if (is_eof_packet(row_frame.payload)) {
+                result.ok = parse_resultset_end_packet(row_frame.payload, server_capability_flags_);
+                cursor.server_status = result.ok.server_status;
+                break;
+            }
+            result.rows.push_back(parse_binary_row(row_frame.payload, result.fields, options_));
+        }
+        return result;
     }
 
     void close_statement(const PreparedStatement& statement) {
@@ -1487,6 +2357,9 @@ public:
         if (options.database.empty()) {
             options.database = options_.database;
         }
+        if (options.connect_attributes.empty()) {
+            options.connect_attributes = options_.connect_attributes;
+        }
         const auto scramble = handshake_.scramble();
         const auto plugin = choose_auth_plugin(handshake_.auth_plugin_name, tls_active_, options.enable_cleartext_plugin || options_.enable_cleartext_plugin);
         const auto token = calculate_auth_token(plugin, options.password, scramble);
@@ -1499,6 +2372,7 @@ public:
         options_.database = std::move(options.database);
         options_.charset = std::move(options.charset);
         options_.charset_number = options.charset_number;
+        options_.connect_attributes = std::move(options.connect_attributes);
         options_.enable_cleartext_plugin = options.enable_cleartext_plugin || options_.enable_cleartext_plugin;
         client_encoding_ = charset_encoding(options_.charset_number);
     }
@@ -1975,7 +2849,7 @@ private:
         std::vector<QueryResult> results;
         while (true) {
             auto result = read_query_result(binary_rows);
-            const bool has_more = (result.ok.server_status & server_status::MORE_RESULTS_EXISTS) != 0;
+            const bool has_more = (result.ok.server_status & server_status_flag::MORE_RESULTS_EXISTS) != 0;
             results.push_back(std::move(result));
             if (!has_more) {
                 break;
@@ -2016,6 +2890,10 @@ private:
         if (!is_eof_packet(fields_end.payload) && !is_ok_packet(fields_end.payload)) {
             throw Error("expected EOF/OK packet after column definitions");
         }
+        result.ok = parse_resultset_end_packet(fields_end.payload, server_capability_flags_);
+        if ((result.ok.server_status & server_status_flag::CURSOR_EXISTS) != 0) {
+            return result;
+        }
 
         while (true) {
             const auto row_frame = read_packet();
@@ -2023,12 +2901,7 @@ private:
                 throw parse_error_packet(row_frame.payload);
             }
             if (is_eof_packet(row_frame.payload)) {
-                if (row_frame.payload.length() >= 5) {
-                    PacketCursor eof(row_frame.payload);
-                    eof.read_u8();
-                    result.ok.warning_count = eof.read_u16_le();
-                    result.ok.server_status = eof.read_u16_le();
-                }
+                result.ok = parse_resultset_end_packet(row_frame.payload, server_capability_flags_);
                 break;
             }
             result.rows.push_back(binary_rows
@@ -2129,11 +3002,18 @@ const Value& Row::at(const std::string& name) const {
 
 bool QueryResult::has_rows() const noexcept { return !fields.empty(); }
 
+bool StatementCursor::open() const noexcept {
+    return statement.id != 0 && (server_status & server_status_flag::CURSOR_EXISTS) != 0 &&
+           (server_status & server_status_flag::LAST_ROW_SENT) == 0;
+}
+
 JsonValue value_to_json(const Value& value) {
     return std::visit([](const auto& item) -> JsonValue {
         using T = std::decay_t<decltype(item)>;
         if constexpr (std::is_same_v<T, std::monostate>) {
             return JsonValue(nullptr);
+        } else if constexpr (std::is_same_v<T, bool>) {
+            return JsonValue(item);
         } else if constexpr (std::is_same_v<T, int64_t>) {
             constexpr int64_t max_safe = 9007199254740991LL;
             constexpr int64_t min_safe = -9007199254740991LL;
@@ -2219,6 +3099,8 @@ std::string escape(const std::string& value) {
 }
 
 std::string escape(const char* value) { return value == nullptr ? "NULL" : escape(std::string(value)); }
+
+std::string escape(bool value) { return value ? "true" : "false"; }
 
 std::string escape(double value) {
     if (!std::isfinite(value)) return "NULL";
@@ -2372,7 +3254,7 @@ ConnectionOptions parse_connection_uri(const std::string& uri) {
     }
     for (const auto& [key, value] : parsed.searchParams.entries()) {
         if (key == "charset") options.charset = value;
-        else if (key == "charsetNumber") options.charset_number = static_cast<uint8_t>(std::stoul(value));
+        else if (key == "charsetNumber") options.charset_number = static_cast<uint16_t>(std::stoul(value));
         else if (key == "connectTimeout" || key == "connect_timeout_ms") options.connect_timeout_ms = static_cast<uint32_t>(std::stoul(value));
         else if (key == "maxPreparedStatements" || key == "max_prepared_statements") options.max_prepared_statements = static_cast<std::size_t>(std::stoull(value));
         else if (key == "multipleStatements" || key == "multiple_statements") options.multiple_statements = parse_bool_option(value);
@@ -2391,6 +3273,14 @@ ConnectionOptions parse_connection_uri(const std::string& uri) {
     }
     options.charset_number = charset_number_for_name(options.charset, options.charset_number);
     return options;
+}
+
+uint16_t get_charset_number(const std::string& charset) {
+    return charset_number_for_name(charset, 224);
+}
+
+std::string get_charset_encoding(uint16_t charset_number) {
+    return charset_encoding(charset_number);
 }
 
 template <typename T, typename F>
@@ -2484,9 +3374,27 @@ QueryResult Connection::query(const std::string& sql) {
     }
 }
 
+QueryResult Connection::query(const std::string& sql, const QueryAttributes& attributes) {
+    try {
+        return impl_->query(sql, attributes);
+    } catch (const Error& error) {
+        impl_->emit_error(error);
+        throw;
+    }
+}
+
 void Connection::query(const std::string& sql, QueryCallback callback) {
     try {
         auto result = query(sql);
+        if (callback) callback(nullptr, std::move(result));
+    } catch (...) {
+        if (callback) callback(std::current_exception(), QueryResult{});
+    }
+}
+
+void Connection::query(const std::string& sql, const QueryAttributes& attributes, QueryCallback callback) {
+    try {
+        auto result = query(sql, attributes);
         if (callback) callback(nullptr, std::move(result));
     } catch (...) {
         if (callback) callback(std::current_exception(), QueryResult{});
@@ -2497,9 +3405,22 @@ Promise<QueryResult> Connection::query_promise(const std::string& sql) {
     return promise_from<QueryResult>([this, sql] { return query(sql); });
 }
 
+Promise<QueryResult> Connection::query_promise(const std::string& sql, const QueryAttributes& attributes) {
+    return promise_from<QueryResult>([this, sql, attributes] { return query(sql, attributes); });
+}
+
 std::vector<QueryResult> Connection::query_all(const std::string& sql) {
     try {
         return impl_->query_all(sql);
+    } catch (const Error& error) {
+        impl_->emit_error(error);
+        throw;
+    }
+}
+
+std::vector<QueryResult> Connection::query_all(const std::string& sql, const QueryAttributes& attributes) {
+    try {
+        return impl_->query_all(sql, attributes);
     } catch (const Error& error) {
         impl_->emit_error(error);
         throw;
@@ -2515,8 +3436,21 @@ void Connection::query_all(const std::string& sql, QueryAllCallback callback) {
     }
 }
 
+void Connection::query_all(const std::string& sql, const QueryAttributes& attributes, QueryAllCallback callback) {
+    try {
+        auto result = query_all(sql, attributes);
+        if (callback) callback(nullptr, std::move(result));
+    } catch (...) {
+        if (callback) callback(std::current_exception(), {});
+    }
+}
+
 Promise<std::vector<QueryResult>> Connection::query_all_promise(const std::string& sql) {
     return promise_from<std::vector<QueryResult>>([this, sql] { return query_all(sql); });
+}
+
+Promise<std::vector<QueryResult>> Connection::query_all_promise(const std::string& sql, const QueryAttributes& attributes) {
+    return promise_from<std::vector<QueryResult>>([this, sql, attributes] { return query_all(sql, attributes); });
 }
 
 stream::Readable Connection::query_stream_json(const std::string& sql) {
@@ -2560,9 +3494,32 @@ QueryResult Connection::execute(const PreparedStatement& statement, const std::v
     }
 }
 
+QueryResult Connection::execute(const PreparedStatement& statement,
+                                const std::vector<Value>& values,
+                                const QueryAttributes& attributes) {
+    try {
+        return impl_->execute(statement, values, attributes);
+    } catch (const Error& error) {
+        impl_->emit_error(error);
+        throw;
+    }
+}
+
 void Connection::execute(const PreparedStatement& statement, const std::vector<Value>& values, QueryCallback callback) {
     try {
         auto result = execute(statement, values);
+        if (callback) callback(nullptr, std::move(result));
+    } catch (...) {
+        if (callback) callback(std::current_exception(), QueryResult{});
+    }
+}
+
+void Connection::execute(const PreparedStatement& statement,
+                         const std::vector<Value>& values,
+                         const QueryAttributes& attributes,
+                         QueryCallback callback) {
+    try {
+        auto result = execute(statement, values, attributes);
         if (callback) callback(nullptr, std::move(result));
     } catch (...) {
         if (callback) callback(std::current_exception(), QueryResult{});
@@ -2573,9 +3530,26 @@ Promise<QueryResult> Connection::execute_promise(const PreparedStatement& statem
     return promise_from<QueryResult>([this, statement, values] { return execute(statement, values); });
 }
 
+Promise<QueryResult> Connection::execute_promise(const PreparedStatement& statement,
+                                                 const std::vector<Value>& values,
+                                                 const QueryAttributes& attributes) {
+    return promise_from<QueryResult>([this, statement, values, attributes] { return execute(statement, values, attributes); });
+}
+
 std::vector<QueryResult> Connection::execute_all(const PreparedStatement& statement, const std::vector<Value>& values) {
     try {
         return impl_->execute_all(statement, values);
+    } catch (const Error& error) {
+        impl_->emit_error(error);
+        throw;
+    }
+}
+
+std::vector<QueryResult> Connection::execute_all(const PreparedStatement& statement,
+                                                 const std::vector<Value>& values,
+                                                 const QueryAttributes& attributes) {
+    try {
+        return impl_->execute_all(statement, values, attributes);
     } catch (const Error& error) {
         impl_->emit_error(error);
         throw;
@@ -2591,13 +3565,44 @@ void Connection::execute_all(const PreparedStatement& statement, const std::vect
     }
 }
 
+void Connection::execute_all(const PreparedStatement& statement,
+                             const std::vector<Value>& values,
+                             const QueryAttributes& attributes,
+                             QueryAllCallback callback) {
+    try {
+        auto result = execute_all(statement, values, attributes);
+        if (callback) callback(nullptr, std::move(result));
+    } catch (...) {
+        if (callback) callback(std::current_exception(), {});
+    }
+}
+
 Promise<std::vector<QueryResult>> Connection::execute_all_promise(const PreparedStatement& statement, const std::vector<Value>& values) {
     return promise_from<std::vector<QueryResult>>([this, statement, values] { return execute_all(statement, values); });
+}
+
+Promise<std::vector<QueryResult>> Connection::execute_all_promise(const PreparedStatement& statement,
+                                                                  const std::vector<Value>& values,
+                                                                  const QueryAttributes& attributes) {
+    return promise_from<std::vector<QueryResult>>([this, statement, values, attributes] {
+        return execute_all(statement, values, attributes);
+    });
 }
 
 QueryResult Connection::execute(const std::string& sql, const std::vector<Value>& values) {
     try {
         return impl_->execute(sql, values);
+    } catch (const Error& error) {
+        impl_->emit_error(error);
+        throw;
+    }
+}
+
+QueryResult Connection::execute(const std::string& sql,
+                                const std::vector<Value>& values,
+                                const QueryAttributes& attributes) {
+    try {
+        return impl_->execute(sql, values, attributes);
     } catch (const Error& error) {
         impl_->emit_error(error);
         throw;
@@ -2613,13 +3618,42 @@ void Connection::execute(const std::string& sql, const std::vector<Value>& value
     }
 }
 
+void Connection::execute(const std::string& sql,
+                         const std::vector<Value>& values,
+                         const QueryAttributes& attributes,
+                         QueryCallback callback) {
+    try {
+        auto result = execute(sql, values, attributes);
+        if (callback) callback(nullptr, std::move(result));
+    } catch (...) {
+        if (callback) callback(std::current_exception(), QueryResult{});
+    }
+}
+
 Promise<QueryResult> Connection::execute_promise(const std::string& sql, const std::vector<Value>& values) {
     return promise_from<QueryResult>([this, sql, values] { return execute(sql, values); });
+}
+
+Promise<QueryResult> Connection::execute_promise(const std::string& sql,
+                                                 const std::vector<Value>& values,
+                                                 const QueryAttributes& attributes) {
+    return promise_from<QueryResult>([this, sql, values, attributes] { return execute(sql, values, attributes); });
 }
 
 std::vector<QueryResult> Connection::execute_all(const std::string& sql, const std::vector<Value>& values) {
     try {
         return impl_->execute_all(sql, values);
+    } catch (const Error& error) {
+        impl_->emit_error(error);
+        throw;
+    }
+}
+
+std::vector<QueryResult> Connection::execute_all(const std::string& sql,
+                                                 const std::vector<Value>& values,
+                                                 const QueryAttributes& attributes) {
+    try {
+        return impl_->execute_all(sql, values, attributes);
     } catch (const Error& error) {
         impl_->emit_error(error);
         throw;
@@ -2635,8 +3669,61 @@ void Connection::execute_all(const std::string& sql, const std::vector<Value>& v
     }
 }
 
+void Connection::execute_all(const std::string& sql,
+                             const std::vector<Value>& values,
+                             const QueryAttributes& attributes,
+                             QueryAllCallback callback) {
+    try {
+        auto result = execute_all(sql, values, attributes);
+        if (callback) callback(nullptr, std::move(result));
+    } catch (...) {
+        if (callback) callback(std::current_exception(), {});
+    }
+}
+
 Promise<std::vector<QueryResult>> Connection::execute_all_promise(const std::string& sql, const std::vector<Value>& values) {
     return promise_from<std::vector<QueryResult>>([this, sql, values] { return execute_all(sql, values); });
+}
+
+Promise<std::vector<QueryResult>> Connection::execute_all_promise(const std::string& sql,
+                                                                  const std::vector<Value>& values,
+                                                                  const QueryAttributes& attributes) {
+    return promise_from<std::vector<QueryResult>>([this, sql, values, attributes] {
+        return execute_all(sql, values, attributes);
+    });
+}
+
+StatementCursor Connection::execute_cursor(const PreparedStatement& statement,
+                                           const std::vector<Value>& values,
+                                           const QueryAttributes& attributes,
+                                           CursorType cursor_type) {
+    try {
+        return impl_->execute_cursor(statement, values, attributes, cursor_type);
+    } catch (const Error& error) {
+        impl_->emit_error(error);
+        throw;
+    }
+}
+
+StatementCursor Connection::execute_cursor(const std::string& sql,
+                                           const std::vector<Value>& values,
+                                           const QueryAttributes& attributes,
+                                           CursorType cursor_type) {
+    try {
+        return impl_->execute_cursor(sql, values, attributes, cursor_type);
+    } catch (const Error& error) {
+        impl_->emit_error(error);
+        throw;
+    }
+}
+
+QueryResult Connection::fetch(StatementCursor& cursor, uint32_t row_count) {
+    try {
+        return impl_->fetch(cursor, row_count);
+    } catch (const Error& error) {
+        impl_->emit_error(error);
+        throw;
+    }
 }
 
 void Connection::close_statement(const PreparedStatement& statement) { impl_->close_statement(statement); }

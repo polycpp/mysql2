@@ -62,11 +62,12 @@ struct ConnectionOptions {
     bool big_number_strings = false;
     bool decimal_numbers = false;
     std::string charset = "utf8mb4";
-    uint8_t charset_number = 224;  // UTF8MB4_UNICODE_CI, matching mysql2 default.
+    uint16_t charset_number = 224;  // UTF8MB4_UNICODE_CI, matching mysql2 default.
     std::string server_public_key_pem;
     bool enable_cleartext_plugin = false;
     bool compress = false;
     std::size_t max_prepared_statements = 16000;
+    std::unordered_map<std::string, std::string> connect_attributes;
     std::function<std::vector<Buffer>(const std::string& path)> local_infile_handler;
     SslOptions ssl;
 };
@@ -93,7 +94,15 @@ struct RawSql {
     std::string sql;
 };
 
-using Value = std::variant<std::monostate, int64_t, uint64_t, double, std::string, Buffer, RawSql>;
+using Value = std::variant<std::monostate, bool, int64_t, uint64_t, double, std::string, Buffer, RawSql>;
+using QueryAttributes = std::unordered_map<std::string, Value>;
+
+enum class CursorType : uint8_t {
+    None = 0,
+    ReadOnly = 1,
+    ForUpdate = 2,
+    Scrollable = 3
+};
 
 struct Row {
     std::vector<Value> values;
@@ -127,6 +136,14 @@ struct PreparedStatement {
     std::string query;
     std::vector<Field> parameters;
     std::vector<Field> columns;
+};
+
+struct StatementCursor {
+    PreparedStatement statement;
+    std::vector<Field> fields;
+    uint16_t server_status = 0;
+
+    bool open() const noexcept;
 };
 
 struct PoolOptions {
@@ -171,6 +188,7 @@ std::string escape(const Value& value);
 std::string escape(std::nullptr_t);
 std::string escape(const std::string& value);
 std::string escape(const char* value);
+std::string escape(bool value);
 std::string escape(double value);
 std::string escape(int64_t value);
 std::string escape(uint64_t value);
@@ -180,6 +198,8 @@ std::string format_named(const std::string& sql, const std::unordered_map<std::s
 JsonValue value_to_json(const Value& value);
 std::string row_to_json_line(const Row& row, const std::vector<Field>& fields);
 ConnectionOptions parse_connection_uri(const std::string& uri);
+uint16_t get_charset_number(const std::string& charset);
+std::string get_charset_encoding(uint16_t charset_number);
 
 class Connection : public events::EventEmitterForwarder {
 public:
@@ -197,27 +217,54 @@ public:
     void connect(VoidCallback callback);
     Promise<void> connect_promise();
     QueryResult query(const std::string& sql);
+    QueryResult query(const std::string& sql, const QueryAttributes& attributes);
     void query(const std::string& sql, QueryCallback callback);
+    void query(const std::string& sql, const QueryAttributes& attributes, QueryCallback callback);
     Promise<QueryResult> query_promise(const std::string& sql);
+    Promise<QueryResult> query_promise(const std::string& sql, const QueryAttributes& attributes);
     std::vector<QueryResult> query_all(const std::string& sql);
+    std::vector<QueryResult> query_all(const std::string& sql, const QueryAttributes& attributes);
     void query_all(const std::string& sql, QueryAllCallback callback);
+    void query_all(const std::string& sql, const QueryAttributes& attributes, QueryAllCallback callback);
     Promise<std::vector<QueryResult>> query_all_promise(const std::string& sql);
+    Promise<std::vector<QueryResult>> query_all_promise(const std::string& sql, const QueryAttributes& attributes);
     stream::Readable query_stream_json(const std::string& sql);
     PreparedStatement prepare(const std::string& sql);
     void prepare(const std::string& sql, PrepareCallback callback);
     Promise<PreparedStatement> prepare_promise(const std::string& sql);
     QueryResult execute(const PreparedStatement& statement, const std::vector<Value>& values = {});
+    QueryResult execute(const PreparedStatement& statement, const std::vector<Value>& values, const QueryAttributes& attributes);
     void execute(const PreparedStatement& statement, const std::vector<Value>& values, QueryCallback callback);
+    void execute(const PreparedStatement& statement, const std::vector<Value>& values, const QueryAttributes& attributes, QueryCallback callback);
     Promise<QueryResult> execute_promise(const PreparedStatement& statement, const std::vector<Value>& values = {});
+    Promise<QueryResult> execute_promise(const PreparedStatement& statement, const std::vector<Value>& values, const QueryAttributes& attributes);
     std::vector<QueryResult> execute_all(const PreparedStatement& statement, const std::vector<Value>& values = {});
+    std::vector<QueryResult> execute_all(const PreparedStatement& statement, const std::vector<Value>& values, const QueryAttributes& attributes);
     void execute_all(const PreparedStatement& statement, const std::vector<Value>& values, QueryAllCallback callback);
+    void execute_all(const PreparedStatement& statement, const std::vector<Value>& values, const QueryAttributes& attributes, QueryAllCallback callback);
     Promise<std::vector<QueryResult>> execute_all_promise(const PreparedStatement& statement, const std::vector<Value>& values = {});
+    Promise<std::vector<QueryResult>> execute_all_promise(const PreparedStatement& statement, const std::vector<Value>& values, const QueryAttributes& attributes);
     QueryResult execute(const std::string& sql, const std::vector<Value>& values = {});
+    QueryResult execute(const std::string& sql, const std::vector<Value>& values, const QueryAttributes& attributes);
     void execute(const std::string& sql, const std::vector<Value>& values, QueryCallback callback);
+    void execute(const std::string& sql, const std::vector<Value>& values, const QueryAttributes& attributes, QueryCallback callback);
     Promise<QueryResult> execute_promise(const std::string& sql, const std::vector<Value>& values = {});
+    Promise<QueryResult> execute_promise(const std::string& sql, const std::vector<Value>& values, const QueryAttributes& attributes);
     std::vector<QueryResult> execute_all(const std::string& sql, const std::vector<Value>& values = {});
+    std::vector<QueryResult> execute_all(const std::string& sql, const std::vector<Value>& values, const QueryAttributes& attributes);
     void execute_all(const std::string& sql, const std::vector<Value>& values, QueryAllCallback callback);
+    void execute_all(const std::string& sql, const std::vector<Value>& values, const QueryAttributes& attributes, QueryAllCallback callback);
     Promise<std::vector<QueryResult>> execute_all_promise(const std::string& sql, const std::vector<Value>& values = {});
+    Promise<std::vector<QueryResult>> execute_all_promise(const std::string& sql, const std::vector<Value>& values, const QueryAttributes& attributes);
+    StatementCursor execute_cursor(const PreparedStatement& statement,
+                                   const std::vector<Value>& values = {},
+                                   const QueryAttributes& attributes = {},
+                                   CursorType cursor_type = CursorType::ReadOnly);
+    StatementCursor execute_cursor(const std::string& sql,
+                                   const std::vector<Value>& values = {},
+                                   const QueryAttributes& attributes = {},
+                                   CursorType cursor_type = CursorType::ReadOnly);
+    QueryResult fetch(StatementCursor& cursor, uint32_t row_count);
     void close_statement(const PreparedStatement& statement);
     void close_statement(const std::string& sql);
     OkPacket begin_transaction();

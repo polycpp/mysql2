@@ -23,10 +23,14 @@ Implemented:
 - `COM_QUERY` text protocol for result sets and OK packets.
 - Prepared statements using `COM_STMT_PREPARE`, `COM_STMT_EXECUTE`, binary rows, and `COM_STMT_CLOSE`.
 - Prepared-statement execution cache with explicit `close_statement(sql)` / `close_statement(statement)` invalidation.
+- Query attributes for `COM_QUERY` and `COM_STMT_EXECUTE` when the server advertises `CLIENT_QUERY_ATTRIBUTES`.
+- Server-side prepared-statement cursors through `execute_cursor(...)` and `fetch(...)`.
 - Explicit multi-result APIs with `query_all` and `execute_all`; single-result APIs drain and throw if multiple result sets are returned.
 - Text and binary row decoding into C++ variants, including binary string/blob preservation as `polycpp::Buffer`.
+- MySQL charset/collation id mapping with non-core string conversion delegated to the existing `iconv-lite` companion.
 - SQL `escape`, `escape_id`, positional `format`, and named placeholder formatting helpers.
 - Connection URI parsing through `polycpp::url`.
+- Connection attributes in the initial handshake and `COM_CHANGE_USER`.
 - Callback overloads, `polycpp::Promise` wrappers, typed `polycpp::events::EventEmitter` integration, and JSON line `polycpp::stream::Readable` query output.
 - MySQL compressed protocol using `polycpp::zlib`.
 - Explicit-policy LOCAL INFILE uploads through `ConnectionOptions::local_infile_handler`.
@@ -36,16 +40,17 @@ Implemented:
 Deferred:
 
 - Server mode and replication/binlog APIs.
-- Full charset table parity. The port reuses the existing `iconv-lite` companion for non-core decoding but currently maps only common MySQL charset ids.
 - Named TLS profile data from `aws-ssl-profiles`.
 - Native object-mode row streams. `query_stream_json()` intentionally exposes byte chunks containing newline-delimited JSON because polycpp streams currently emit `Buffer` chunks, not arbitrary row objects.
-- Diagnostic-channel tracing and query attributes.
+- Diagnostic-channel tracing.
+- Parser code-generation/cache controls, which are JavaScript optimization hooks rather than required C++ API.
 
 Known divergences:
 
 - C++ API shape is synchronous and typed first; callback and Promise wrappers execute the same typed operations and settle through polycpp primitives.
 - Native MySQL/MariaDB client SDKs are intentionally not linked.
 - Node object-mode row streaming is adapted to JSON line byte streams for auditability and `polycpp::stream` compatibility.
+- Query attributes use `std::unordered_map`, so attribute wire order is not a public contract.
 
 ## Prerequisites
 
@@ -116,6 +121,23 @@ Prepared statement:
 auto stmt = conn.prepare("SELECT id, name FROM users WHERE id > ?");
 auto result = conn.execute(stmt, {int64_t{10}});
 conn.close_statement(stmt);
+```
+
+Query attributes and cursors:
+
+```cpp
+auto traced = conn.query(
+    "SELECT 1 AS one",
+    {{"trace_id", std::string("audit-123")}, {"sampled", true}});
+
+auto cursor = conn.execute_cursor("SELECT id FROM users ORDER BY id");
+while (cursor.open()) {
+    auto batch = conn.fetch(cursor, 100);
+    for (const auto& row : batch.rows) {
+        (void)row;
+    }
+}
+conn.close_statement(cursor.statement);
 ```
 
 TLS:

@@ -127,7 +127,7 @@ python3 /data/work/libgen/scripts/analyze-upstream-js.py /data/work/lib/mysql2 /
 - Keep the public C++ API synchronous to make integration tests deterministic.
 - Fail closed on unsupported auth plugins, LOCAL INFILE without an explicit handler, TLS-only cleartext auth, malformed packets, unexpected multi-results in single-result APIs, and server ERR packets.
 - Record deferred features explicitly rather than implying upstream parity.
-- Reuse `iconv-lite` companion for charset decoding, but document incomplete charset id mapping.
+- Reuse `iconv-lite` companion for charset decoding and keep upstream mysql2 charset/collation id mappings in this repo.
 
 ## Analyzer warnings
 

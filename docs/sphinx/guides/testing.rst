@@ -37,6 +37,7 @@ TLS e2e
 Current coverage
 ----------------
 
-The integration test covers connection, ping, text rows, binary values,
-prepared statements, transactions, reset, multi-result queries, pooling, and
-optional TLS.
+The integration test covers connection, ping, text rows, binary values, query
+attributes when the server supports them, prepared statements, server-side
+cursor fetch, transactions, reset, multi-result queries, compression, LOCAL
+INFILE policy, pooling, pool clusters, and optional TLS.

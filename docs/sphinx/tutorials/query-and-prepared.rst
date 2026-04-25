@@ -55,12 +55,44 @@ Use one-shot execution when reuse is not needed:
        "SELECT ? AS label, ? AS none_value",
        {std::string("prepared"), std::monostate{}});
 
+Attach query attributes
+-----------------------
+
+MySQL 8 can accept named query attributes. The port sends them when the server
+advertises ``CLIENT_QUERY_ATTRIBUTES``; older servers fail closed if attributes
+are requested.
+
+.. code-block:: cpp
+
+   auto result = conn.query(
+       "SELECT 1 AS one",
+       {{"trace_id", std::string("audit-123")}, {"sampled", true}});
+
+   auto prepared = conn.execute(
+       "SELECT ? AS label",
+       {std::string("prepared")},
+       {{"trace_id", std::string("audit-124")}});
+
+Fetch through a server-side cursor
+----------------------------------
+
+.. code-block:: cpp
+
+   auto cursor = conn.execute_cursor("SELECT id FROM users ORDER BY id");
+   while (cursor.open()) {
+       auto batch = conn.fetch(cursor, 100);
+       for (const auto& row : batch.rows) {
+           (void)row;
+       }
+   }
+   conn.close_statement(cursor.statement);
+
 Handle result values
 --------------------
 
-``Value`` is a variant containing ``std::monostate``, signed/unsigned integer,
-``double``, ``std::string``, ``polycpp::Buffer``, or ``RawSql`` for formatter
-input.
+``Value`` is a variant containing ``std::monostate``, ``bool``,
+signed/unsigned integer, ``double``, ``std::string``, ``polycpp::Buffer``, or
+``RawSql`` for formatter input.
 
 Binary string and blob columns are returned as ``polycpp::Buffer``. Text
 columns are decoded according to field charset metadata where supported.

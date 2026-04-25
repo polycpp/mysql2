@@ -1,6 +1,7 @@
 #include <gtest/gtest.h>
 
 #include <cstdlib>
+#include <iostream>
 #include <string>
 
 #include <polycpp/event_loop.hpp>
@@ -8,8 +9,28 @@
 
 namespace mysql2 = polycpp::mysql2;
 
+namespace {
+
+void trace_step(const char* step) {
+    if (std::getenv("MYSQL2_TEST_TRACE")) {
+        std::cerr << "[mysql2-test] " << step << '\n';
+    }
+}
+
+void trace_result(const char* step, const mysql2::QueryResult& result) {
+    if (std::getenv("MYSQL2_TEST_TRACE")) {
+        std::cerr << "[mysql2-test] " << step << " fields=" << result.fields.size()
+                  << " rows=" << result.rows.size()
+                  << " status=0x" << std::hex << result.ok.server_status << std::dec << '\n';
+    }
+}
+
+}  // namespace
+
 TEST(sql_escape, scalar_values) {
     EXPECT_EQ(mysql2::escape(nullptr), "NULL");
+    EXPECT_EQ(mysql2::escape(true), "true");
+    EXPECT_EQ(mysql2::escape(false), "false");
     EXPECT_EQ(mysql2::escape(int64_t{-42}), "-42");
     EXPECT_EQ(mysql2::escape(uint64_t{42}), "42");
     EXPECT_EQ(mysql2::escape(std::string("O'Reilly\\book\n")), "'O\\'Reilly\\\\book\\n'");
@@ -22,8 +43,13 @@ TEST(sql_escape, scalar_values) {
 TEST(connection_options, charset_name_sets_charset_number) {
     mysql2::ConnectionOptions options;
     options.charset = "latin1";
+    trace_step("create connection");
     mysql2::Connection connection(options);
     EXPECT_EQ(connection.options().charset_number, 8);
+    EXPECT_EQ(mysql2::get_charset_number("GB18030_CHINESE_CI"), 248);
+    EXPECT_EQ(mysql2::get_charset_number("utf8mb4_0900_ai_ci"), 255);
+    EXPECT_EQ(mysql2::get_charset_encoding(248), "gb18030");
+    EXPECT_EQ(mysql2::get_charset_encoding(95), "cp932");
 }
 
 TEST(connection_options, parse_connection_uri) {
@@ -106,6 +132,7 @@ TEST(mysql2_integration, query_against_real_database_when_configured) {
     connection.on(mysql2::event::Connect, [&](const mysql2::ConnectionInfo& info) {
         connect_event_seen = info.connection_id > 0 && !info.server_version.empty();
     });
+    trace_step("connect");
     connection.connect();
     EXPECT_TRUE(connection.connected());
     EXPECT_TRUE(connect_event_seen);
@@ -113,9 +140,11 @@ TEST(mysql2_integration, query_against_real_database_when_configured) {
     EXPECT_GT(connection.connection_id(), 0u);
     EXPECT_FALSE(connection.server_version().empty());
 
+    trace_step("ping");
     const auto pong = connection.ping();
     EXPECT_EQ(pong.warning_count, 0u);
 
+    trace_step("simple query");
     const auto result = connection.query("SELECT 1 AS one, 'two' AS two, NULL AS none");
     ASSERT_TRUE(result.has_rows());
     ASSERT_EQ(result.fields.size(), 3u);
@@ -124,7 +153,53 @@ TEST(mysql2_integration, query_against_real_database_when_configured) {
     EXPECT_EQ(std::get<std::string>(result.rows[0].at("two")), "two");
     EXPECT_TRUE(std::holds_alternative<std::monostate>(result.rows[0].at("none")));
 
+    constexpr uint32_t client_query_attributes = 0x08000000;
+    if ((connection.server_capability_flags() & client_query_attributes) != 0) {
+        trace_step("query attributes query");
+        const auto attr_result = connection.query(
+            "SELECT 16 AS attr_probe",
+            {{"trace", std::string("polycpp")}, {"flag", true}, {"count", int64_t{5}}, {"empty", std::monostate{}}});
+        ASSERT_EQ(attr_result.rows.size(), 1u);
+        EXPECT_EQ(std::get<int64_t>(attr_result.rows[0].at("attr_probe")), 16);
+
+        trace_step("query attributes execute");
+        const auto attr_exec = connection.execute(
+            "SELECT ? AS param_value",
+            {int64_t{17}},
+            {{"trace", std::string("execute")}, {"flag", true}});
+        trace_result("query attributes execute result", attr_exec);
+        ASSERT_EQ(attr_exec.rows.size(), 1u);
+        EXPECT_EQ(std::get<int64_t>(attr_exec.rows[0].at("param_value")), 17);
+
+        bool attr_callback_seen = false;
+        connection.query(
+            "SELECT 18 AS attr_callback",
+            {{"trace", std::string("callback")}},
+            [&](std::exception_ptr error, mysql2::QueryResult callback_result) {
+                EXPECT_EQ(error, nullptr);
+                ASSERT_EQ(callback_result.rows.size(), 1u);
+                EXPECT_EQ(std::get<int64_t>(callback_result.rows[0].at("attr_callback")), 18);
+                attr_callback_seen = true;
+            });
+        EXPECT_TRUE(attr_callback_seen);
+
+        bool attr_promise_seen = false;
+        auto attr_promise = connection.execute_promise(
+            "SELECT ? AS attr_promise",
+            {int64_t{19}},
+            {{"trace", std::string("promise")}});
+        attr_promise.then([&](const mysql2::QueryResult& promise_result) {
+            ASSERT_EQ(promise_result.rows.size(), 1u);
+            EXPECT_EQ(std::get<int64_t>(promise_result.rows[0].at("attr_promise")), 19);
+            attr_promise_seen = true;
+        });
+        polycpp::EventLoop::instance().restart();
+        polycpp::EventLoop::instance().run();
+        EXPECT_TRUE(attr_promise_seen);
+    }
+
     bool callback_seen = false;
+    trace_step("callback query");
     connection.query("SELECT 6 AS six", [&](std::exception_ptr error, mysql2::QueryResult callback_result) {
         EXPECT_EQ(error, nullptr);
         ASSERT_EQ(callback_result.rows.size(), 1u);
@@ -134,6 +209,7 @@ TEST(mysql2_integration, query_against_real_database_when_configured) {
     EXPECT_TRUE(callback_seen);
 
     bool promise_seen = false;
+    trace_step("promise query");
     auto promise = connection.query_promise("SELECT 7 AS seven");
     promise.then([&](const mysql2::QueryResult& promise_result) {
         ASSERT_EQ(promise_result.rows.size(), 1u);
@@ -144,17 +220,20 @@ TEST(mysql2_integration, query_against_real_database_when_configured) {
     polycpp::EventLoop::instance().run();
     EXPECT_TRUE(promise_seen);
 
+    trace_step("json stream query");
     auto json_stream = connection.query_stream_json("SELECT 8 AS eight");
     polycpp::EventLoop::instance().restart();
     const auto json_chunks = json_stream.toArray();
     ASSERT_EQ(json_chunks.size(), 1u);
     EXPECT_EQ(json_chunks[0].toString(), R"({"eight":8})" "\n");
 
+    trace_step("empty value query");
     const auto empty_first = connection.query("SELECT '' AS empty_string, X'' AS empty_blob");
     ASSERT_EQ(empty_first.rows.size(), 1u);
     EXPECT_EQ(std::get<std::string>(empty_first.rows[0].at("empty_string")), "");
     EXPECT_EQ(std::get<mysql2::Buffer>(empty_first.rows[0].at("empty_blob")).length(), 0u);
 
+    trace_step("create temp table");
     const auto ddl = connection.query("CREATE TEMPORARY TABLE polycpp_mysql2_t (id INT PRIMARY KEY, name VARCHAR(64))");
     EXPECT_FALSE(ddl.has_rows());
     const auto insert = connection.query("INSERT INTO polycpp_mysql2_t VALUES (1, 'alice'), (2, 'bob')");
@@ -164,6 +243,21 @@ TEST(mysql2_integration, query_against_real_database_when_configured) {
     EXPECT_EQ(std::get<int64_t>(rows.rows[1].at("id")), 2);
     EXPECT_EQ(std::get<std::string>(rows.rows[1].at("name")), "bob");
 
+    trace_step("execute cursor");
+    auto cursor = connection.execute_cursor("SELECT id FROM polycpp_mysql2_t ORDER BY id");
+    if (cursor.open()) {
+        trace_step("cursor fetch first");
+        const auto first_fetch = connection.fetch(cursor, 1);
+        ASSERT_EQ(first_fetch.rows.size(), 1u);
+        EXPECT_EQ(std::get<int64_t>(first_fetch.rows[0].at("id")), 1);
+        trace_step("cursor fetch remaining");
+        const auto remaining_fetch = connection.fetch(cursor, 16);
+        ASSERT_GE(remaining_fetch.rows.size(), 1u);
+        EXPECT_FALSE(cursor.open());
+    }
+    connection.close_statement(cursor.statement);
+
+    trace_step("prepare insert");
     auto insert_stmt = connection.prepare("INSERT INTO polycpp_mysql2_t VALUES (?, ?)");
     EXPECT_EQ(insert_stmt.parameters.size(), 2u);
     const auto prepared_insert = connection.execute(insert_stmt, {int64_t{3}, std::string("carol")});

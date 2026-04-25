@@ -7,8 +7,8 @@ Core types
 ----------
 
 ``ConnectionOptions``
-    Host, port, credentials, database, charset, auth, multiple-statement, and
-    TLS options.
+    Host, port, credentials, database, charset, auth, connect attributes,
+    multiple-statement, and TLS options.
 
 ``SslOptions``
     TLS enablement, CA/certificate/key material, trust store loading, and
@@ -20,6 +20,12 @@ Core types
 
 ``PreparedStatement``
     Server-side prepared statement id plus parameter and column metadata.
+
+``StatementCursor``
+    Server-side prepared-statement cursor metadata used with ``fetch``.
+
+``QueryAttributes``
+    Named query metadata values sent when the server advertises support.
 
 ``PoolOptions``, ``Pool``, ``PoolConnection``
     Synchronous RAII connection pooling.
@@ -41,6 +47,9 @@ Free functions
 
 ``escape``, ``escape_id``, ``format``, ``format_named``, ``raw``
     SQL formatting helpers.
+
+``get_charset_number``, ``get_charset_encoding``
+    Helpers for MySQL charset/collation ids and encoding names.
 
 Generated namespace reference
 -----------------------------

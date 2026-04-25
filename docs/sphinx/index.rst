@@ -11,7 +11,7 @@ Supported scope
 
 - TCP and optional TLS connections.
 - MySQL protocol handshake and common auth plugins.
-- Text queries, prepared statements, binary result rows, and explicit multi-result APIs.
+- Text queries, query attributes, prepared statements, binary result rows, cursor fetch, and explicit multi-result APIs.
 - Typed rows using ``std::variant`` values.
 - Transactions, ping, reset, change-user, graceful shutdown, synchronous RAII pools, and pool clusters.
 - Callback overloads, ``polycpp::Promise`` wrappers, typed events, connection URI parsing, compression, and LOCAL INFILE handler hooks.
@@ -21,10 +21,11 @@ Supported scope
 Not full upstream parity
 ------------------------
 
-The JavaScript server, binlog/replication, diagnostics, query-attribute, cursor,
+The JavaScript server, binlog/replication, diagnostics, parser cache controls,
 and native object-mode row stream APIs are intentionally not part of the current
-C++ surface. Callback, Promise, EventEmitter, compression, LOCAL INFILE, URI,
-and pool-cluster surfaces are implemented with C++ adaptations. See
+C++ surface. Callback, Promise, EventEmitter, query attributes, cursor fetch,
+compression, LOCAL INFILE, URI, and pool-cluster surfaces are implemented with
+C++ adaptations. See
 ``docs/divergences.md`` in the repository for the detailed list.
 
 .. code-block:: cpp
