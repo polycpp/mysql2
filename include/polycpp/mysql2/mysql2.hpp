@@ -2,6 +2,7 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <memory>
 #include <optional>
 #include <stdexcept>
 #include <string>
@@ -28,6 +29,20 @@ private:
     std::string sql_state_;
 };
 
+struct SslOptions {
+    bool enabled = false;
+    bool reject_unauthorized = true;
+    bool verify_identity = true;
+    bool load_default_verify_paths = true;
+    std::string ca_pem;
+    std::string ca_file;
+    std::string cert_pem;
+    std::string cert_file;
+    std::string key_pem;
+    std::string key_file;
+    std::string key_passphrase;
+};
+
 struct ConnectionOptions {
     std::string host = "127.0.0.1";
     uint16_t port = 3306;
@@ -43,6 +58,8 @@ struct ConnectionOptions {
     std::string charset = "utf8mb4";
     uint8_t charset_number = 224;  // UTF8MB4_UNICODE_CI, matching mysql2 default.
     std::string server_public_key_pem;
+    bool enable_cleartext_plugin = false;
+    SslOptions ssl;
 };
 
 struct Field {
@@ -94,6 +111,19 @@ struct QueryResult {
     bool has_rows() const noexcept;
 };
 
+struct PreparedStatement {
+    uint32_t id = 0;
+    std::string query;
+    std::vector<Field> parameters;
+    std::vector<Field> columns;
+};
+
+struct PoolOptions {
+    ConnectionOptions connection;
+    std::size_t connection_limit = 10;
+    uint32_t wait_timeout_ms = 10000;
+};
+
 RawSql raw(std::string sql);
 std::string escape(const Value& value);
 std::string escape(std::nullptr_t);
@@ -120,10 +150,22 @@ public:
 
     void connect();
     QueryResult query(const std::string& sql);
+    std::vector<QueryResult> query_all(const std::string& sql);
+    PreparedStatement prepare(const std::string& sql);
+    QueryResult execute(const PreparedStatement& statement, const std::vector<Value>& values = {});
+    std::vector<QueryResult> execute_all(const PreparedStatement& statement, const std::vector<Value>& values = {});
+    QueryResult execute(const std::string& sql, const std::vector<Value>& values = {});
+    std::vector<QueryResult> execute_all(const std::string& sql, const std::vector<Value>& values = {});
+    void close_statement(const PreparedStatement& statement);
+    OkPacket begin_transaction();
+    OkPacket commit();
+    OkPacket rollback();
     OkPacket ping();
+    void reset();
     void end();
 
     bool connected() const noexcept;
+    bool encrypted() const noexcept;
     const ConnectionOptions& options() const noexcept;
     const std::string& server_version() const noexcept;
     uint32_t connection_id() const noexcept;
@@ -134,7 +176,62 @@ private:
     Impl* impl_ = nullptr;
 };
 
+class PoolImpl;
+
+class PoolConnection {
+public:
+    ~PoolConnection();
+
+    PoolConnection(PoolConnection&&) noexcept;
+    PoolConnection& operator=(PoolConnection&&) noexcept;
+
+    PoolConnection(const PoolConnection&) = delete;
+    PoolConnection& operator=(const PoolConnection&) = delete;
+
+    Connection& get();
+    const Connection& get() const;
+    Connection* operator->();
+    const Connection* operator->() const;
+    Connection& operator*();
+    const Connection& operator*() const;
+    explicit operator bool() const noexcept;
+    void release();
+
+private:
+    friend class PoolImpl;
+    PoolConnection(std::shared_ptr<PoolImpl> pool, std::shared_ptr<Connection> connection);
+
+    std::shared_ptr<PoolImpl> pool_;
+    std::shared_ptr<Connection> connection_;
+};
+
+class Pool {
+public:
+    explicit Pool(PoolOptions options);
+    ~Pool();
+
+    Pool(Pool&&) noexcept;
+    Pool& operator=(Pool&&) noexcept;
+
+    Pool(const Pool&) = delete;
+    Pool& operator=(const Pool&) = delete;
+
+    PoolConnection get_connection();
+    QueryResult query(const std::string& sql);
+    std::vector<QueryResult> query_all(const std::string& sql);
+    QueryResult execute(const std::string& sql, const std::vector<Value>& values = {});
+    std::vector<QueryResult> execute_all(const std::string& sql, const std::vector<Value>& values = {});
+    void end();
+
+    std::size_t total_count() const noexcept;
+    std::size_t idle_count() const noexcept;
+
+private:
+    std::shared_ptr<PoolImpl> impl_;
+};
+
 Connection create_connection(ConnectionOptions options);
+Pool create_pool(PoolOptions options);
 QueryResult query(ConnectionOptions options, const std::string& sql);
 
 namespace constants {

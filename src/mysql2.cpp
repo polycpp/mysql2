@@ -4,16 +4,22 @@
 #include <polycpp/iconv_lite/iconv_lite.hpp>
 #include <polycpp/io/event_context.hpp>
 #include <polycpp/io/tcp_socket.hpp>
+#include <polycpp/io/tls_context.hpp>
+#include <polycpp/io/tls_stream.hpp>
+#include <polycpp/ssl/x509_cert.hpp>
 
 #include <algorithm>
 #include <cctype>
 #include <cstdlib>
 #include <array>
 #include <charconv>
+#include <chrono>
 #include <cmath>
+#include <condition_variable>
 #include <cstring>
 #include <limits>
 #include <memory>
+#include <mutex>
 #include <optional>
 #include <sstream>
 #include <system_error>
@@ -35,6 +41,7 @@ constexpr uint32_t RESERVED = 0x00004000;
 constexpr uint32_t SECURE_CONNECTION = 0x00008000;
 constexpr uint32_t MULTI_STATEMENTS = 0x00010000;
 constexpr uint32_t MULTI_RESULTS = 0x00020000;
+constexpr uint32_t PS_MULTI_RESULTS = 0x00040000;
 constexpr uint32_t PLUGIN_AUTH = 0x00080000;
 constexpr uint32_t CONNECT_ATTRS = 0x00100000;
 constexpr uint32_t PLUGIN_AUTH_LENENC_CLIENT_DATA = 0x00200000;
@@ -48,6 +55,10 @@ namespace command_code {
 constexpr uint8_t QUIT = 0x01;
 constexpr uint8_t QUERY = 0x03;
 constexpr uint8_t PING = 0x0e;
+constexpr uint8_t STMT_PREPARE = 0x16;
+constexpr uint8_t STMT_EXECUTE = 0x17;
+constexpr uint8_t STMT_CLOSE = 0x19;
+constexpr uint8_t RESET_CONNECTION = 0x1f;
 }  // namespace command_code
 
 namespace marker {
@@ -57,6 +68,10 @@ constexpr uint8_t EOF_PACKET = 0xfe;
 constexpr uint8_t AUTH_MORE_DATA = 0x01;
 constexpr uint8_t AUTH_NEXT_FACTOR = 0x02;
 }  // namespace marker
+
+namespace server_status {
+constexpr uint16_t MORE_RESULTS_EXISTS = 0x0008;
+}  // namespace server_status
 
 constexpr std::size_t kPacketHeaderLength = 4;
 constexpr std::size_t kMaxPacketPayloadLength = 0x00ffffff;
@@ -250,6 +265,38 @@ public:
         return value;
     }
 
+    int8_t read_i8() {
+        return static_cast<int8_t>(read_u8());
+    }
+
+    int16_t read_i16_le() {
+        return static_cast<int16_t>(read_u16_le());
+    }
+
+    int32_t read_i32_le() {
+        return static_cast<int32_t>(read_u32_le());
+    }
+
+    int64_t read_i64_le() {
+        return static_cast<int64_t>(read_u64_le());
+    }
+
+    float read_float_le() {
+        ensure(4);
+        float value = 0;
+        std::memcpy(&value, payload_.data() + offset_, 4);
+        offset_ += 4;
+        return value;
+    }
+
+    double read_double_le() {
+        ensure(8);
+        double value = 0;
+        std::memcpy(&value, payload_.data() + offset_, 8);
+        offset_ += 8;
+        return value;
+    }
+
     Buffer read_buffer(std::size_t length) {
         ensure(length);
         auto out = payload_.slice(offset_, offset_ + length);
@@ -374,6 +421,19 @@ void append_u32_le(std::vector<uint8_t>& out, uint32_t value) {
     out.push_back(static_cast<uint8_t>((value >> 8) & 0xff));
     out.push_back(static_cast<uint8_t>((value >> 16) & 0xff));
     out.push_back(static_cast<uint8_t>((value >> 24) & 0xff));
+}
+
+void append_u64_le(std::vector<uint8_t>& out, uint64_t value) {
+    for (int i = 0; i < 8; ++i) {
+        out.push_back(static_cast<uint8_t>((value >> (8 * i)) & 0xff));
+    }
+}
+
+void append_double_le(std::vector<uint8_t>& out, double value) {
+    static_assert(sizeof(double) == 8);
+    std::array<uint8_t, 8> bytes{};
+    std::memcpy(bytes.data(), &value, bytes.size());
+    out.insert(out.end(), bytes.begin(), bytes.end());
 }
 
 void append_lenenc_int(std::vector<uint8_t>& out, uint64_t value) {
@@ -558,6 +618,7 @@ uint32_t build_client_flags(const ConnectionOptions& options, const Handshake& h
                        client_flag::RESERVED |
                        client_flag::SECURE_CONNECTION |
                        client_flag::MULTI_RESULTS |
+                       client_flag::PS_MULTI_RESULTS |
                        client_flag::PLUGIN_AUTH |
                        client_flag::PLUGIN_AUTH_LENENC_CLIENT_DATA |
                        client_flag::SESSION_TRACK;
@@ -567,12 +628,25 @@ uint32_t build_client_flags(const ConnectionOptions& options, const Handshake& h
     if (options.multiple_statements) {
         desired |= client_flag::MULTI_STATEMENTS;
     }
+    if (options.ssl.enabled) {
+        desired |= client_flag::SSL;
+    }
     desired |= handshake.capability_flags & client_flag::MULTI_FACTOR_AUTHENTICATION;
-    return desired & handshake.capability_flags;
+    auto flags = desired & handshake.capability_flags;
+    if (options.multiple_statements) {
+        flags |= client_flag::MULTI_STATEMENTS;
+    }
+    return flags;
 }
 
-std::string choose_auth_plugin(const std::string& server_plugin) {
+std::string choose_auth_plugin(const std::string& server_plugin, bool secure_connection, bool enable_cleartext_plugin) {
     if (server_plugin == "mysql_native_password" || server_plugin == "caching_sha2_password") {
+        return server_plugin;
+    }
+    if (server_plugin == "sha256_password" && secure_connection) {
+        return server_plugin;
+    }
+    if (server_plugin == "mysql_clear_password" && secure_connection && enable_cleartext_plugin) {
         return server_plugin;
     }
     if (server_plugin.empty()) {
@@ -627,6 +701,25 @@ Buffer build_handshake_response(const ConnectionOptions& options,
         append_null_string(out, auth_plugin_name);
     }
     return buffer_from_bytes(out);
+}
+
+Buffer build_ssl_request(const ConnectionOptions& options, uint32_t client_flags) {
+    std::vector<uint8_t> out;
+    out.reserve(32);
+    append_u32_le(out, client_flags | client_flag::SSL);
+    append_u32_le(out, 0);  // max packet size: 0 means default/no client-side cap.
+    append_u8(out, options.charset_number);
+    out.insert(out.end(), 23, 0);
+    return buffer_from_bytes(out);
+}
+
+bool looks_like_ip_address(const std::string& host) {
+    if (host.empty()) {
+        return false;
+    }
+    return std::all_of(host.begin(), host.end(), [](unsigned char c) {
+        return std::isdigit(c) || c == '.' || c == ':';
+    });
 }
 
 Error parse_error_packet(const Buffer& payload) {
@@ -702,6 +795,11 @@ bool field_is_blob(uint8_t type) {
            type == GEOMETRY || type == VECTOR || type == BIT;
 }
 
+bool field_is_string_like(uint8_t type) {
+    using namespace constants::column_type;
+    return type == VARCHAR || type == VAR_STRING || type == STRING || type == ENUM || type == SET;
+}
+
 bool parse_int64(std::string_view text, int64_t& out) {
     auto first = text.data();
     auto last = text.data() + text.size();
@@ -724,11 +822,15 @@ bool parse_double_value(const std::string& text, double& out) {
 
 Value parse_text_value(const Field& field, const Buffer& bytes, const ConnectionOptions& options) {
     using namespace constants::column_type;
-    if (field_is_blob(field.column_type) && (field.character_set == 63 || field.is_binary())) {
+    if (field.column_type != JSON &&
+        (field_is_blob(field.column_type) || field_is_string_like(field.column_type)) &&
+        (field.character_set == 63 || field.is_binary())) {
         return bytes;
     }
 
-    const auto text = PacketCursor::decode_buffer(bytes, field.encoding.empty() ? "utf8" : field.encoding);
+    const auto text = PacketCursor::decode_buffer(
+        bytes,
+        field.column_type == JSON ? "utf8" : (field.encoding.empty() ? "utf8" : field.encoding));
     switch (field.column_type) {
         case TINY:
         case SHORT:
@@ -792,6 +894,269 @@ Row parse_text_row(const Buffer& payload, const std::vector<Field>& fields, cons
     return row;
 }
 
+std::string two_digits(uint32_t value) {
+    std::string out;
+    out.push_back(static_cast<char>('0' + ((value / 10) % 10)));
+    out.push_back(static_cast<char>('0' + (value % 10)));
+    return out;
+}
+
+std::string four_digits(uint32_t value) {
+    std::string out;
+    out.push_back(static_cast<char>('0' + ((value / 1000) % 10)));
+    out.push_back(static_cast<char>('0' + ((value / 100) % 10)));
+    out.push_back(static_cast<char>('0' + ((value / 10) % 10)));
+    out.push_back(static_cast<char>('0' + (value % 10)));
+    return out;
+}
+
+std::string format_mysql_datetime(uint16_t year,
+                                  uint8_t month,
+                                  uint8_t day,
+                                  uint8_t hour,
+                                  uint8_t minute,
+                                  uint8_t second,
+                                  uint32_t micros,
+                                  bool date_only) {
+    std::string out = four_digits(year) + "-" + two_digits(month) + "-" + two_digits(day);
+    if (!date_only) {
+        out += " " + two_digits(hour) + ":" + two_digits(minute) + ":" + two_digits(second);
+        if (micros != 0) {
+            std::string frac = std::to_string(1000000 + micros).substr(1);
+            while (!frac.empty() && frac.back() == '0') frac.pop_back();
+            out += "." + frac;
+        }
+    }
+    return out;
+}
+
+std::string parse_binary_datetime(PacketCursor& cursor, uint8_t column_type) {
+    const auto length = cursor.read_u8();
+    if (length == 0) {
+        return column_type == constants::column_type::DATE ? "0000-00-00" : "0000-00-00 00:00:00";
+    }
+    if (length != 4 && length != 7 && length != 11) {
+        throw Error("malformed binary date/datetime value");
+    }
+    const auto year = cursor.read_u16_le();
+    const auto month = cursor.read_u8();
+    const auto day = cursor.read_u8();
+    uint8_t hour = 0;
+    uint8_t minute = 0;
+    uint8_t second = 0;
+    uint32_t micros = 0;
+    if (length >= 7) {
+        hour = cursor.read_u8();
+        minute = cursor.read_u8();
+        second = cursor.read_u8();
+    }
+    if (length == 11) {
+        micros = cursor.read_u32_le();
+    }
+    return format_mysql_datetime(year, month, day, hour, minute, second, micros, column_type == constants::column_type::DATE);
+}
+
+std::string parse_binary_time(PacketCursor& cursor) {
+    const auto length = cursor.read_u8();
+    if (length == 0) {
+        return "00:00:00";
+    }
+    if (length != 8 && length != 12) {
+        throw Error("malformed binary time value");
+    }
+    const bool negative = cursor.read_u8() != 0;
+    const auto days = cursor.read_u32_le();
+    const auto hours = cursor.read_u8();
+    const auto minutes = cursor.read_u8();
+    const auto seconds = cursor.read_u8();
+    uint32_t micros = 0;
+    if (length == 12) {
+        micros = cursor.read_u32_le();
+    }
+    std::string out = negative ? "-" : "";
+    out += std::to_string(days * 24 + hours) + ":" + two_digits(minutes) + ":" + two_digits(seconds);
+    if (micros != 0) {
+        std::string frac = std::to_string(1000000 + micros).substr(1);
+        while (!frac.empty() && frac.back() == '0') frac.pop_back();
+        out += "." + frac;
+    }
+    return out;
+}
+
+Value parse_binary_value(PacketCursor& cursor, const Field& field, const ConnectionOptions& options) {
+    using namespace constants::column_type;
+    switch (field.column_type) {
+        case TINY:
+            return field.is_unsigned() ? Value{static_cast<uint64_t>(cursor.read_u8())}
+                                       : Value{static_cast<int64_t>(cursor.read_i8())};
+        case SHORT:
+        case YEAR:
+            return field.is_unsigned() ? Value{static_cast<uint64_t>(cursor.read_u16_le())}
+                                       : Value{static_cast<int64_t>(cursor.read_i16_le())};
+        case LONG:
+        case INT24:
+            return field.is_unsigned() ? Value{static_cast<uint64_t>(cursor.read_u32_le())}
+                                       : Value{static_cast<int64_t>(cursor.read_i32_le())};
+        case LONGLONG:
+            if (field.is_unsigned()) {
+                return cursor.read_u64_le();
+            }
+            return cursor.read_i64_le();
+        case FLOAT:
+            return static_cast<double>(cursor.read_float_le());
+        case DOUBLE:
+            return cursor.read_double_le();
+        case DATE:
+        case DATETIME:
+        case TIMESTAMP:
+        case NEWDATE:
+            return parse_binary_datetime(cursor, field.column_type);
+        case TIME:
+            return parse_binary_time(cursor);
+        case DECIMAL:
+        case NEWDECIMAL:
+        case VARCHAR:
+        case VAR_STRING:
+        case STRING:
+        case JSON:
+        case ENUM:
+        case SET:
+        case TINY_BLOB:
+        case MEDIUM_BLOB:
+        case LONG_BLOB:
+        case BLOB:
+        case GEOMETRY:
+        case VECTOR:
+        case BIT: {
+            const auto bytes = cursor.read_lenenc_buffer();
+            if (!bytes) return std::monostate{};
+            return parse_text_value(field, *bytes, options);
+        }
+        case NULL_TYPE:
+            return std::monostate{};
+        default: {
+            const auto bytes = cursor.read_lenenc_buffer();
+            if (!bytes) return std::monostate{};
+            return PacketCursor::decode_buffer(*bytes, field.encoding.empty() ? "utf8" : field.encoding);
+        }
+    }
+}
+
+Row parse_binary_row(const Buffer& payload, const std::vector<Field>& fields, const ConnectionOptions& options) {
+    PacketCursor cursor(payload);
+    if (cursor.read_u8() != 0) {
+        throw Error("malformed binary row packet");
+    }
+    const std::size_t null_bitmap_length = (fields.size() + 7 + 2) / 8;
+    const auto null_bitmap = cursor.read_buffer(null_bitmap_length);
+    Row row;
+    row.values.reserve(fields.size());
+    for (std::size_t i = 0; i < fields.size(); ++i) {
+        const auto bit = i + 2;
+        const bool is_null = (null_bitmap[bit / 8] & (1u << (bit % 8))) != 0;
+        if (is_null) {
+            row.values.emplace_back(std::monostate{});
+        } else {
+            row.values.emplace_back(parse_binary_value(cursor, fields[i], options));
+        }
+        row.index_by_name.emplace(fields[i].name, i);
+    }
+    return row;
+}
+
+std::vector<Field> read_definition_packets(auto& read_packet, std::size_t count, const std::string& client_encoding) {
+    std::vector<Field> definitions;
+    definitions.reserve(count);
+    for (std::size_t i = 0; i < count; ++i) {
+        const auto frame = read_packet();
+        if (is_err_packet(frame.payload)) {
+            throw parse_error_packet(frame.payload);
+        }
+        if (is_eof_packet(frame.payload) || is_ok_packet(frame.payload)) {
+            break;
+        }
+        definitions.push_back(parse_column_definition(frame.payload, client_encoding));
+    }
+    const auto end = read_packet();
+    if (!is_eof_packet(end.payload) && !is_ok_packet(end.payload)) {
+        throw Error("expected EOF/OK packet after prepared statement definitions");
+    }
+    return definitions;
+}
+
+Buffer build_stmt_prepare_payload(const std::string& sql) {
+    std::vector<uint8_t> payload;
+    payload.reserve(sql.size() + 1);
+    append_u8(payload, command_code::STMT_PREPARE);
+    append_string(payload, sql);
+    return buffer_from_bytes(payload);
+}
+
+void append_bound_value(std::vector<uint8_t>& payload, const Value& value) {
+    struct Visitor {
+        std::vector<uint8_t>& payload;
+        void operator()(std::monostate) const {}
+        void operator()(int64_t value) const { append_u64_le(payload, static_cast<uint64_t>(value)); }
+        void operator()(uint64_t value) const { append_u64_le(payload, value); }
+        void operator()(double value) const { append_double_le(payload, value); }
+        void operator()(const std::string& value) const { append_lenenc_string(payload, value); }
+        void operator()(const Buffer& value) const { append_lenenc_buffer(payload, value); }
+        void operator()(const RawSql&) const { throw Error("raw SQL values cannot be used as prepared statement parameters"); }
+    };
+    std::visit(Visitor{payload}, value);
+}
+
+std::pair<uint8_t, uint8_t> bound_type(const Value& value) {
+    using namespace constants::column_type;
+    struct Visitor {
+        std::pair<uint8_t, uint8_t> operator()(std::monostate) const { return {NULL_TYPE, 0}; }
+        std::pair<uint8_t, uint8_t> operator()(int64_t) const { return {LONGLONG, 0}; }
+        std::pair<uint8_t, uint8_t> operator()(uint64_t) const { return {LONGLONG, 0x80}; }
+        std::pair<uint8_t, uint8_t> operator()(double) const { return {DOUBLE, 0}; }
+        std::pair<uint8_t, uint8_t> operator()(const std::string&) const { return {VAR_STRING, 0}; }
+        std::pair<uint8_t, uint8_t> operator()(const Buffer&) const { return {BLOB, 0}; }
+        std::pair<uint8_t, uint8_t> operator()(const RawSql&) const {
+            throw Error("raw SQL values cannot be used as prepared statement parameters");
+        }
+    };
+    return std::visit(Visitor{}, value);
+}
+
+Buffer build_stmt_execute_payload(uint32_t statement_id, std::size_t parameter_count, const std::vector<Value>& values) {
+    if (values.size() != parameter_count) {
+        throw Error("prepared statement expected " + std::to_string(parameter_count) +
+                    " parameters, got " + std::to_string(values.size()));
+    }
+    std::vector<uint8_t> payload;
+    payload.reserve(16 + values.size() * 16);
+    append_u8(payload, command_code::STMT_EXECUTE);
+    append_u32_le(payload, statement_id);
+    append_u8(payload, 0);     // CURSOR_TYPE_NO_CURSOR
+    append_u32_le(payload, 1); // iteration count
+    if (!values.empty()) {
+        const std::size_t null_bitmap_length = (values.size() + 7) / 8;
+        std::vector<uint8_t> null_bitmap(null_bitmap_length, 0);
+        for (std::size_t i = 0; i < values.size(); ++i) {
+            if (std::holds_alternative<std::monostate>(values[i])) {
+                null_bitmap[i / 8] |= static_cast<uint8_t>(1u << (i % 8));
+            }
+        }
+        payload.insert(payload.end(), null_bitmap.begin(), null_bitmap.end());
+        append_u8(payload, 1); // new-params-bound-flag
+        for (const auto& value : values) {
+            const auto [type, flags] = bound_type(value);
+            append_u8(payload, type);
+            append_u8(payload, flags);
+        }
+        for (const auto& value : values) {
+            if (!std::holds_alternative<std::monostate>(value)) {
+                append_bound_value(payload, value);
+            }
+        }
+    }
+    return buffer_from_bytes(payload);
+}
+
 std::string value_to_string(const Value& value) {
     struct Visitor {
         std::string operator()(std::monostate) const { return "NULL"; }
@@ -851,23 +1216,135 @@ public:
         server_capability_flags_ = handshake_.capability_flags;
         client_encoding_ = charset_encoding(options_.charset_number);
 
-        const auto scramble = handshake_.scramble();
-        const auto plugin = choose_auth_plugin(handshake_.auth_plugin_name);
         auto client_flags = build_client_flags(options_, handshake_);
+        if (options_.ssl.enabled) {
+            if ((client_flags & client_flag::SSL) == 0) {
+                throw Error("server does not advertise SSL support");
+            }
+            write_packet(build_ssl_request(options_, client_flags), 1);
+            upgrade_to_tls();
+        }
+
+        const auto scramble = handshake_.scramble();
+        const auto plugin = choose_auth_plugin(handshake_.auth_plugin_name, tls_active_, options_.enable_cleartext_plugin);
         auto token = calculate_auth_token(plugin, options_.password, scramble);
-        write_packet(build_handshake_response(options_, handshake_, client_flags, plugin, token), 1);
-        handle_auth_result(plugin, scramble, 2);
+        write_packet(build_handshake_response(options_, handshake_, client_flags, plugin, token), tls_active_ ? 2 : 1);
+        handle_auth_result(plugin, scramble, tls_active_ ? 3 : 2);
         connected_ = true;
     }
 
     QueryResult query(const std::string& sql) {
+        auto results = query_all(sql);
+        if (results.size() != 1) {
+            throw Error("query returned multiple result sets; use query_all");
+        }
+        return std::move(results.front());
+    }
+
+    std::vector<QueryResult> query_all(const std::string& sql) {
         ensure_connected();
         std::vector<uint8_t> payload;
         payload.reserve(sql.size() + 1);
         append_u8(payload, command_code::QUERY);
         append_string(payload, sql);
         write_packet(buffer_from_bytes(payload), 0);
-        return read_query_result();
+        return read_query_results(false);
+    }
+
+    PreparedStatement prepare(const std::string& sql) {
+        ensure_connected();
+        write_packet(build_stmt_prepare_payload(sql), 0);
+        const auto frame = read_packet();
+        if (is_err_packet(frame.payload)) {
+            throw parse_error_packet(frame.payload);
+        }
+        PacketCursor cursor(frame.payload);
+        if (cursor.read_u8() != 0) {
+            throw Error("unexpected packet for COM_STMT_PREPARE");
+        }
+        PreparedStatement statement;
+        statement.query = sql;
+        statement.id = cursor.read_u32_le();
+        const auto column_count = cursor.read_u16_le();
+        const auto parameter_count = cursor.read_u16_le();
+        cursor.skip(1); // reserved filler
+        if (cursor.has_more()) {
+            cursor.read_u16_le(); // warning count
+        }
+        if (parameter_count > 0) {
+            auto next = [this]() { return read_packet(); };
+            statement.parameters = read_definition_packets(next, parameter_count, client_encoding_);
+        }
+        if (column_count > 0) {
+            auto next = [this]() { return read_packet(); };
+            statement.columns = read_definition_packets(next, column_count, client_encoding_);
+        }
+        return statement;
+    }
+
+    QueryResult execute(const PreparedStatement& statement, const std::vector<Value>& values) {
+        auto results = execute_all(statement, values);
+        if (results.size() != 1) {
+            throw Error("execute returned multiple result sets; use execute_all");
+        }
+        return std::move(results.front());
+    }
+
+    std::vector<QueryResult> execute_all(const PreparedStatement& statement, const std::vector<Value>& values) {
+        ensure_connected();
+        if (statement.id == 0) {
+            throw Error("cannot execute an empty prepared statement");
+        }
+        write_packet(build_stmt_execute_payload(statement.id, statement.parameters.size(), values), 0);
+        return read_query_results(true);
+    }
+
+    QueryResult execute(const std::string& sql, const std::vector<Value>& values) {
+        auto statement = prepare(sql);
+        try {
+            auto result = execute(statement, values);
+            close_statement(statement);
+            return result;
+        } catch (...) {
+            close_statement(statement);
+            throw;
+        }
+    }
+
+    std::vector<QueryResult> execute_all(const std::string& sql, const std::vector<Value>& values) {
+        auto statement = prepare(sql);
+        try {
+            auto results = execute_all(statement, values);
+            close_statement(statement);
+            return results;
+        } catch (...) {
+            close_statement(statement);
+            throw;
+        }
+    }
+
+    void close_statement(const PreparedStatement& statement) {
+        ensure_connected();
+        if (statement.id == 0) {
+            return;
+        }
+        std::vector<uint8_t> payload;
+        payload.reserve(5);
+        append_u8(payload, command_code::STMT_CLOSE);
+        append_u32_le(payload, statement.id);
+        write_packet(buffer_from_bytes(payload), 0);
+    }
+
+    OkPacket begin_transaction() {
+        return query("START TRANSACTION").ok;
+    }
+
+    OkPacket commit() {
+        return query("COMMIT").ok;
+    }
+
+    OkPacket rollback() {
+        return query("ROLLBACK").ok;
     }
 
     OkPacket ping() {
@@ -883,25 +1360,37 @@ public:
         return parse_ok_packet(frame.payload, server_capability_flags_);
     }
 
+    void reset() {
+        ensure_connected();
+        write_packet(Buffer::from({command_code::RESET_CONNECTION}), 0);
+        const auto frame = read_packet();
+        if (is_err_packet(frame.payload)) {
+            throw parse_error_packet(frame.payload);
+        }
+        if (!is_ok_packet(frame.payload)) {
+            throw Error("unexpected packet for COM_RESET_CONNECTION");
+        }
+    }
+
     void end() noexcept {
-        if (!connected_ && !socket_.isOpen()) {
+        if (!connected_ && !transport_is_open()) {
             return;
         }
         try {
-            if (socket_.isOpen()) {
+            if (transport_is_open()) {
                 if (connected_) {
                     write_packet(Buffer::from({command_code::QUIT}), 0);
                 }
-                std::error_code ec;
-                socket_.shutdown(2, ec);
-                socket_.close(ec);
+                close_transport();
             }
         } catch (...) {
         }
         connected_ = false;
+        tls_active_ = false;
     }
 
     bool connected() const noexcept { return connected_; }
+    bool encrypted() const noexcept { return tls_active_; }
     const ConnectionOptions& options() const noexcept { return options_; }
     const std::string& server_version() const noexcept { return server_version_; }
     uint32_t connection_id() const noexcept { return connection_id_; }
@@ -914,39 +1403,164 @@ private:
         }
     }
 
-    std::vector<uint8_t> read_exact(std::size_t length) {
-        std::vector<uint8_t> data(length);
+    void configure_tls_context(io::TlsContext& tls_context) {
+        tls_context.setDefaultOptions();
+        if (!options_.ssl.key_passphrase.empty()) {
+            const auto passphrase = options_.ssl.key_passphrase;
+            tls_context.setPasswordCallback([passphrase]() { return passphrase; });
+        }
+        if (options_.ssl.reject_unauthorized) {
+            tls_context.setVerifyMode(1);
+            if (options_.ssl.load_default_verify_paths) {
+                tls_context.loadDefaultVerifyPaths();
+            }
+            if (!options_.ssl.ca_pem.empty()) {
+                tls_context.addCertificateAuthorityPem(options_.ssl.ca_pem);
+            }
+            if (!options_.ssl.ca_file.empty()) {
+                tls_context.loadVerifyFile(options_.ssl.ca_file);
+            }
+        } else {
+            tls_context.setVerifyMode(0);
+            tls_context.setVerifyCallbackAcceptAll();
+        }
+        if (!options_.ssl.cert_pem.empty()) {
+            tls_context.useCertificateChainPem(options_.ssl.cert_pem);
+        }
+        if (!options_.ssl.cert_file.empty()) {
+            tls_context.useCertificateChainFile(options_.ssl.cert_file);
+        }
+        if (!options_.ssl.key_pem.empty()) {
+            tls_context.usePrivateKeyPem(options_.ssl.key_pem);
+        }
+        if (!options_.ssl.key_file.empty()) {
+            tls_context.usePrivateKeyFile(options_.ssl.key_file);
+        }
+    }
+
+    void upgrade_to_tls() {
+        tls_context_ = std::make_unique<io::TlsContext>(io::TlsContext::Method::kTLSClient);
+        configure_tls_context(*tls_context_);
+        tls_stream_ = std::make_unique<io::TlsStream>(std::move(socket_), *tls_context_);
+        if (!looks_like_ip_address(options_.host)) {
+            tls_stream_->sslConnection().setHostname(options_.host);
+        }
+
         ctx_.restart();
         std::error_code ec;
-        std::size_t bytes = 0;
-        socket_.asyncRead(data.data(), data.size(), [&](std::error_code error, std::size_t n) {
-            ec = error;
-            bytes = n;
-        });
+        tls_stream_->asyncHandshake(false, [&](std::error_code error) { ec = error; });
         ctx_.run();
         if (ec) {
-            throw Error("socket read failed: " + ec.message());
+            throw Error("TLS handshake failed: " + ec.message());
         }
-        if (bytes != length) {
-            throw Error("socket read ended before the requested packet bytes were available");
+
+        if (options_.ssl.reject_unauthorized) {
+            const auto verify_result = tls_stream_->sslConnection().getVerifyResult();
+            if (verify_result != 0) {
+                throw Error("TLS certificate verification failed: " +
+                            ssl::SslConnection::verifyErrorString(verify_result));
+            }
+            if (options_.ssl.verify_identity && !looks_like_ip_address(options_.host)) {
+                auto* peer = tls_stream_->sslConnection().peerCertificateHandle();
+                if (peer == nullptr) {
+                    throw Error("TLS peer did not provide a certificate");
+                }
+                auto cert = ssl::X509Cert::fromHandle(peer);
+                if (!cert.checkHost(options_.host)) {
+                    throw Error("TLS certificate host mismatch for " + options_.host);
+                }
+            } else if (options_.ssl.verify_identity && looks_like_ip_address(options_.host)) {
+                auto* peer = tls_stream_->sslConnection().peerCertificateHandle();
+                if (peer == nullptr) {
+                    throw Error("TLS peer did not provide a certificate");
+                }
+                auto cert = ssl::X509Cert::fromHandle(peer);
+                if (!cert.checkIP(options_.host)) {
+                    throw Error("TLS certificate IP mismatch for " + options_.host);
+                }
+            }
+        }
+        tls_active_ = true;
+    }
+
+    bool transport_is_open() const noexcept {
+        return tls_stream_ ? tls_stream_->isOpen() : socket_.isOpen();
+    }
+
+    void close_transport() noexcept {
+        std::error_code ec;
+        if (tls_stream_) {
+            try {
+                ctx_.restart();
+                tls_stream_->asyncShutdown([&](std::error_code error) { ec = error; });
+                ctx_.run();
+            } catch (...) {
+            }
+            tls_stream_->close(ec);
+            tls_stream_.reset();
+            tls_context_.reset();
+            return;
+        }
+        socket_.shutdown(2, ec);
+        socket_.close(ec);
+    }
+
+    std::vector<uint8_t> read_exact(std::size_t length) {
+        std::vector<uint8_t> data(length);
+        std::size_t offset = 0;
+        while (offset < length) {
+            ctx_.restart();
+            std::error_code ec;
+            std::size_t bytes = 0;
+            const auto remaining = length - offset;
+            if (tls_stream_) {
+                tls_stream_->asyncReadSome(data.data() + offset, remaining, [&](std::error_code error, std::size_t n) {
+                    ec = error;
+                    bytes = n;
+                });
+            } else {
+                socket_.asyncRead(data.data() + offset, remaining, [&](std::error_code error, std::size_t n) {
+                    ec = error;
+                    bytes = n;
+                });
+            }
+            ctx_.run();
+            if (ec) {
+                throw Error("socket read failed: " + ec.message());
+            }
+            if (bytes == 0) {
+                throw Error("socket read ended before the requested packet bytes were available");
+            }
+            offset += bytes;
         }
         return data;
     }
 
     void write_all(const uint8_t* data, std::size_t length) {
-        ctx_.restart();
-        std::error_code ec;
-        std::size_t bytes = 0;
-        socket_.asyncWrite(data, length, [&](std::error_code error, std::size_t n) {
-            ec = error;
-            bytes = n;
-        });
-        ctx_.run();
-        if (ec) {
-            throw Error("socket write failed: " + ec.message());
-        }
-        if (bytes != length) {
-            throw Error("socket write ended before the full packet was written");
+        std::size_t offset = 0;
+        while (offset < length) {
+            ctx_.restart();
+            std::error_code ec;
+            std::size_t bytes = 0;
+            if (tls_stream_) {
+                tls_stream_->asyncWrite(data + offset, length - offset, [&](std::error_code error, std::size_t n) {
+                    ec = error;
+                    bytes = n;
+                });
+            } else {
+                socket_.asyncWrite(data + offset, length - offset, [&](std::error_code error, std::size_t n) {
+                    ec = error;
+                    bytes = n;
+                });
+            }
+            ctx_.run();
+            if (ec) {
+                throw Error("socket write failed: " + ec.message());
+            }
+            if (bytes == 0) {
+                throw Error("socket write ended before the full packet was written");
+            }
+            offset += bytes;
         }
     }
 
@@ -1032,6 +1646,10 @@ private:
                     if (data.length() == 1 && data[0] == 4) {
                         if (options_.password.empty()) {
                             write_packet(Buffer{}, next_client_sequence);
+                        } else if (tls_active_) {
+                            std::string clear = options_.password;
+                            clear.push_back('\0');
+                            write_packet(buffer_from_string(clear), next_client_sequence);
                         } else if (!options_.server_public_key_pem.empty()) {
                             write_packet(encrypt_password_with_rsa(options_.password, current_scramble, options_.server_public_key_pem), next_client_sequence);
                         } else {
@@ -1073,18 +1691,41 @@ private:
             if (options_.password.empty()) {
                 return Buffer{};
             }
+            if (tls_active_) {
+                std::string clear = options_.password;
+                clear.push_back('\0');
+                return buffer_from_string(clear);
+            }
             if (!options_.server_public_key_pem.empty()) {
                 return encrypt_password_with_rsa(options_.password, plugin_data, options_.server_public_key_pem);
             }
             return Buffer::from({0x01});
         }
         if (plugin == "mysql_clear_password") {
-            throw Error("mysql_clear_password is not supported without TLS in this port");
+            if (!tls_active_ || !options_.enable_cleartext_plugin) {
+                throw Error("mysql_clear_password requires TLS and enable_cleartext_plugin");
+            }
+            std::string clear = options_.password;
+            clear.push_back('\0');
+            return buffer_from_string(clear);
         }
         throw Error("unsupported authentication plugin: " + plugin);
     }
 
-    QueryResult read_query_result() {
+    std::vector<QueryResult> read_query_results(bool binary_rows) {
+        std::vector<QueryResult> results;
+        while (true) {
+            auto result = read_query_result(binary_rows);
+            const bool has_more = (result.ok.server_status & server_status::MORE_RESULTS_EXISTS) != 0;
+            results.push_back(std::move(result));
+            if (!has_more) {
+                break;
+            }
+        }
+        return results;
+    }
+
+    QueryResult read_query_result(bool binary_rows) {
         const auto first = read_packet();
         if (is_err_packet(first.payload)) {
             throw parse_error_packet(first.payload);
@@ -1122,10 +1763,8 @@ private:
             if (is_err_packet(row_frame.payload)) {
                 throw parse_error_packet(row_frame.payload);
             }
-            if (is_eof_packet(row_frame.payload) || is_ok_packet(row_frame.payload)) {
-                if (is_ok_packet(row_frame.payload)) {
-                    result.ok = parse_ok_packet(row_frame.payload, server_capability_flags_);
-                } else if (row_frame.payload.length() >= 5) {
+            if (is_eof_packet(row_frame.payload)) {
+                if (row_frame.payload.length() >= 5) {
                     PacketCursor eof(row_frame.payload);
                     eof.read_u8();
                     result.ok.warning_count = eof.read_u16_le();
@@ -1133,7 +1772,9 @@ private:
                 }
                 break;
             }
-            result.rows.push_back(parse_text_row(row_frame.payload, result.fields, options_));
+            result.rows.push_back(binary_rows
+                ? parse_binary_row(row_frame.payload, result.fields, options_)
+                : parse_text_row(row_frame.payload, result.fields, options_));
         }
         return result;
     }
@@ -1141,7 +1782,10 @@ private:
     ConnectionOptions options_;
     EventContext ctx_;
     io::TcpSocket socket_;
+    std::unique_ptr<io::TlsContext> tls_context_;
+    std::unique_ptr<io::TlsStream> tls_stream_;
     bool connected_ = false;
+    bool tls_active_ = false;
     Handshake handshake_;
     std::string server_version_;
     uint32_t connection_id_ = 0;
@@ -1326,11 +1970,43 @@ void Connection::connect() { impl_->connect(); }
 
 QueryResult Connection::query(const std::string& sql) { return impl_->query(sql); }
 
+std::vector<QueryResult> Connection::query_all(const std::string& sql) { return impl_->query_all(sql); }
+
+PreparedStatement Connection::prepare(const std::string& sql) { return impl_->prepare(sql); }
+
+QueryResult Connection::execute(const PreparedStatement& statement, const std::vector<Value>& values) {
+    return impl_->execute(statement, values);
+}
+
+std::vector<QueryResult> Connection::execute_all(const PreparedStatement& statement, const std::vector<Value>& values) {
+    return impl_->execute_all(statement, values);
+}
+
+QueryResult Connection::execute(const std::string& sql, const std::vector<Value>& values) {
+    return impl_->execute(sql, values);
+}
+
+std::vector<QueryResult> Connection::execute_all(const std::string& sql, const std::vector<Value>& values) {
+    return impl_->execute_all(sql, values);
+}
+
+void Connection::close_statement(const PreparedStatement& statement) { impl_->close_statement(statement); }
+
+OkPacket Connection::begin_transaction() { return impl_->begin_transaction(); }
+
+OkPacket Connection::commit() { return impl_->commit(); }
+
+OkPacket Connection::rollback() { return impl_->rollback(); }
+
 OkPacket Connection::ping() { return impl_->ping(); }
+
+void Connection::reset() { impl_->reset(); }
 
 void Connection::end() { impl_->end(); }
 
 bool Connection::connected() const noexcept { return impl_ && impl_->connected(); }
+
+bool Connection::encrypted() const noexcept { return impl_ && impl_->encrypted(); }
 
 const ConnectionOptions& Connection::options() const noexcept { return impl_->options(); }
 
@@ -1340,10 +2016,209 @@ uint32_t Connection::connection_id() const noexcept { return impl_->connection_i
 
 uint32_t Connection::server_capability_flags() const noexcept { return impl_->server_capability_flags(); }
 
+class PoolImpl : public std::enable_shared_from_this<PoolImpl> {
+public:
+    explicit PoolImpl(PoolOptions options) : options_(std::move(options)) {
+        if (options_.connection_limit == 0) {
+            throw Error("pool connection_limit must be greater than zero");
+        }
+    }
+
+    ~PoolImpl() {
+        end();
+    }
+
+    PoolConnection acquire() {
+        std::unique_lock<std::mutex> lock(mutex_);
+        if (closed_) {
+            throw Error("pool is closed");
+        }
+
+        if (!idle_.empty()) {
+            auto connection = idle_.back();
+            idle_.pop_back();
+            return PoolConnection(shared_from_this(), connection);
+        }
+
+        if (connections_.size() < options_.connection_limit) {
+            auto connection = std::make_shared<Connection>(options_.connection);
+            connection->connect();
+            connections_.push_back(std::move(connection));
+            return PoolConnection(shared_from_this(), connections_.back());
+        }
+
+        const auto deadline = std::chrono::steady_clock::now() +
+            std::chrono::milliseconds(options_.wait_timeout_ms);
+        while (!closed_ && idle_.empty()) {
+            if (options_.wait_timeout_ms == 0) {
+                available_.wait(lock);
+            } else if (available_.wait_until(lock, deadline) == std::cv_status::timeout) {
+                throw Error("timed out waiting for a pooled mysql2 connection");
+            }
+        }
+        if (closed_) {
+            throw Error("pool is closed");
+        }
+        auto connection = idle_.back();
+        idle_.pop_back();
+        return PoolConnection(shared_from_this(), connection);
+    }
+
+    void release(std::shared_ptr<Connection> connection) noexcept {
+        if (!connection) {
+            return;
+        }
+        std::lock_guard<std::mutex> lock(mutex_);
+        if (closed_) {
+            connection->end();
+            return;
+        }
+        idle_.push_back(connection);
+        available_.notify_one();
+    }
+
+    void end() noexcept {
+        std::lock_guard<std::mutex> lock(mutex_);
+        if (closed_ && connections_.empty()) {
+            return;
+        }
+        closed_ = true;
+        idle_.clear();
+        for (auto& connection : connections_) {
+            if (connection) {
+                connection->end();
+            }
+        }
+        connections_.clear();
+        available_.notify_all();
+    }
+
+    QueryResult query(const std::string& sql) {
+        auto connection = acquire();
+        return connection->query(sql);
+    }
+
+    std::vector<QueryResult> query_all(const std::string& sql) {
+        auto connection = acquire();
+        return connection->query_all(sql);
+    }
+
+    QueryResult execute(const std::string& sql, const std::vector<Value>& values) {
+        auto connection = acquire();
+        return connection->execute(sql, values);
+    }
+
+    std::vector<QueryResult> execute_all(const std::string& sql, const std::vector<Value>& values) {
+        auto connection = acquire();
+        return connection->execute_all(sql, values);
+    }
+
+    std::size_t total_count() const noexcept {
+        std::lock_guard<std::mutex> lock(mutex_);
+        return connections_.size();
+    }
+
+    std::size_t idle_count() const noexcept {
+        std::lock_guard<std::mutex> lock(mutex_);
+        return idle_.size();
+    }
+
+private:
+    PoolOptions options_;
+    mutable std::mutex mutex_;
+    std::condition_variable available_;
+    std::vector<std::shared_ptr<Connection>> connections_;
+    std::vector<std::shared_ptr<Connection>> idle_;
+    bool closed_ = false;
+};
+
+PoolConnection::PoolConnection(std::shared_ptr<PoolImpl> pool, std::shared_ptr<Connection> connection)
+    : pool_(std::move(pool)), connection_(connection) {}
+
+PoolConnection::~PoolConnection() {
+    release();
+}
+
+PoolConnection::PoolConnection(PoolConnection&& other) noexcept
+    : pool_(std::move(other.pool_)), connection_(std::move(other.connection_)) {}
+
+PoolConnection& PoolConnection::operator=(PoolConnection&& other) noexcept {
+    if (this != &other) {
+        release();
+        pool_ = std::move(other.pool_);
+        connection_ = std::move(other.connection_);
+    }
+    return *this;
+}
+
+Connection& PoolConnection::get() {
+    if (!connection_) {
+        throw Error("pooled connection has been released");
+    }
+    return *connection_;
+}
+
+const Connection& PoolConnection::get() const {
+    if (!connection_) {
+        throw Error("pooled connection has been released");
+    }
+    return *connection_;
+}
+
+Connection* PoolConnection::operator->() { return &get(); }
+
+const Connection* PoolConnection::operator->() const { return &get(); }
+
+Connection& PoolConnection::operator*() { return get(); }
+
+const Connection& PoolConnection::operator*() const { return get(); }
+
+PoolConnection::operator bool() const noexcept { return static_cast<bool>(connection_); }
+
+void PoolConnection::release() {
+    if (pool_ && connection_) {
+        pool_->release(connection_);
+        connection_.reset();
+        pool_.reset();
+    }
+}
+
+Pool::Pool(PoolOptions options) : impl_(std::make_shared<PoolImpl>(std::move(options))) {}
+
+Pool::~Pool() = default;
+
+Pool::Pool(Pool&&) noexcept = default;
+
+Pool& Pool::operator=(Pool&&) noexcept = default;
+
+PoolConnection Pool::get_connection() { return impl_->acquire(); }
+
+QueryResult Pool::query(const std::string& sql) { return impl_->query(sql); }
+
+std::vector<QueryResult> Pool::query_all(const std::string& sql) { return impl_->query_all(sql); }
+
+QueryResult Pool::execute(const std::string& sql, const std::vector<Value>& values) {
+    return impl_->execute(sql, values);
+}
+
+std::vector<QueryResult> Pool::execute_all(const std::string& sql, const std::vector<Value>& values) {
+    return impl_->execute_all(sql, values);
+}
+
+void Pool::end() { impl_->end(); }
+
+std::size_t Pool::total_count() const noexcept { return impl_ ? impl_->total_count() : 0; }
+
+std::size_t Pool::idle_count() const noexcept { return impl_ ? impl_->idle_count() : 0; }
+
 Connection create_connection(ConnectionOptions options) {
     Connection connection(std::move(options));
     connection.connect();
     return connection;
+}
+
+Pool create_pool(PoolOptions options) {
+    return Pool(std::move(options));
 }
 
 QueryResult query(ConnectionOptions options, const std::string& sql) {

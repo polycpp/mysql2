@@ -1,24 +1,28 @@
 Examples
 ========
 
-Self-contained programs exercising the main features of mysql2. Each
-released example must compile against the public API only - no private
-headers, no non-exported targets.
+Examples are built only when ``POLYCPP_MYSQL2_BUILD_EXAMPLES=ON`` is passed to
+CMake.
 
-.. toctree::
-   :maxdepth: 1
-
-   planned
-
-Running an example
-------------------
-
-From the repository root:
+Build examples
+--------------
 
 .. code-block:: bash
 
-   cmake -B build -G Ninja
-   cmake --build build --target <example_name>
-   ./build/examples/<example_name>
+   cmake -B build -DPOLYCPP_MYSQL2_BUILD_EXAMPLES=ON
+   cmake --build build --target simple_query
 
-Examples are only built when ``POLYCPP_MYSQL2_BUILD_EXAMPLES=ON`` is passed to CMake.
+simple_query
+------------
+
+``examples/simple_query.cpp`` connects with ``MYSQL2_TEST_*`` environment
+variables and prints a scalar query result.
+
+.. code-block:: bash
+
+   MYSQL2_TEST_HOST=127.0.0.1 \
+   MYSQL2_TEST_PORT=3306 \
+   MYSQL2_TEST_USER=root \
+   MYSQL2_TEST_PASSWORD=secret \
+   MYSQL2_TEST_DATABASE=test \
+   ./build/examples/simple_query

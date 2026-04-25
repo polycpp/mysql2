@@ -17,6 +17,18 @@ int main() {
     options.user = std::getenv("MYSQL2_TEST_USER") ? std::getenv("MYSQL2_TEST_USER") : "root";
     options.password = std::getenv("MYSQL2_TEST_PASSWORD") ? std::getenv("MYSQL2_TEST_PASSWORD") : "";
     options.database = std::getenv("MYSQL2_TEST_DATABASE") ? std::getenv("MYSQL2_TEST_DATABASE") : "";
+    if (std::getenv("MYSQL2_TEST_SSL")) {
+        options.ssl.enabled = true;
+        options.ssl.reject_unauthorized = std::getenv("MYSQL2_TEST_SSL_REJECT_UNAUTHORIZED")
+            ? std::string(std::getenv("MYSQL2_TEST_SSL_REJECT_UNAUTHORIZED")) != "0"
+            : false;
+        options.ssl.verify_identity = std::getenv("MYSQL2_TEST_SSL_VERIFY_IDENTITY")
+            ? std::string(std::getenv("MYSQL2_TEST_SSL_VERIFY_IDENTITY")) != "0"
+            : options.ssl.reject_unauthorized;
+        if (std::getenv("MYSQL2_TEST_SSL_CA_FILE")) {
+            options.ssl.ca_file = std::getenv("MYSQL2_TEST_SSL_CA_FILE");
+        }
+    }
 
     auto connection = polycpp::mysql2::create_connection(options);
     auto result = connection.query("SELECT 1 AS one, 'polycpp' AS label");

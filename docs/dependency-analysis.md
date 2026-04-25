@@ -32,25 +32,25 @@ python3 /data/work/libgen/scripts/analyze-upstream-js.py /data/work/lib/mysql2 /
 | Package | Kind | Requested | Installed | License | License evidence | License impact | License strategy | Affects repo license | Deps | Source files | Node API calls | JS API calls | Recommendation | Rationale |
 |---|---|---|---|---|---|---|---|---|---:|---:|---:|---:|---|---|
 | @types/node | peer | >= 8 | not installed | MIT | npm package metadata license field | dev/test-only | dev/test-only, not shipped | no-dev-only | 0 | 0 | 0 | 0 | omit from C++ port | Type-only package for upstream TypeScript declarations. |
-| aws-ssl-profiles | hard | ^1.1.2 | 1.1.2 | MIT | package.json license field | permissive | permissive dependency ok with notice | no | 0 | 8 | 0 | 0 | deferred or unsupported feature | Only needed for named TLS profile data. TLS is deferred in v0. |
-| denque | hard | ^2.1.0 | 2.1.0 | Apache-2.0 | package.json license field | permissive | permissive dependency ok with notice | no | 0 | 2 | 0 | 5 | implement private helper in this repo | Upstream uses it for command queues; v0 synchronous command flow does not need a dependency. Future queueing can use `std::deque`. |
+| aws-ssl-profiles | hard | ^1.1.2 | 1.1.2 | MIT | package.json license field | permissive | permissive dependency ok with notice | no | 0 | 8 | 0 | 0 | deferred or unsupported feature | Only needed for named TLS profile data. TLS itself is implemented through polycpp TLS options. |
+| denque | hard | ^2.1.0 | 2.1.0 | Apache-2.0 | package.json license field | permissive | permissive dependency ok with notice | no | 0 | 2 | 0 | 5 | implement private helper in this repo | Upstream uses it for command queues; this synchronous port uses standard containers and an RAII pool. |
 | generate-function | hard | ^2.3.1 | 2.3.1 | MIT | package.json license field | permissive | permissive dependency ok with notice | no | 1 | 3 | 1 | 13 | deferred or unsupported feature | Upstream uses generated JS parsers for V8 speed. C++ uses static parsers. |
 | iconv-lite | hard | ^0.7.2 | 0.7.2 | MIT | package.json license field and existing companion license | permissive | use existing companion license | no | 1 | 16 | 37 | 39 | use existing polycpp companion | Existing `/data/work/lib/iconv-lite` companion is linked for charset decoding. |
 | long | hard | ^5.3.2 | 5.3.2 | Apache-2.0 | package.json license field | permissive | permissive dependency ok with notice | no | 0 | 6 | 0 | 20 | implement private helper in this repo | C++ native `int64_t` and `uint64_t` replace JS Long behavior for parsed values. |
-| lru.min | hard | ^1.1.4 | 1.1.4 | MIT | package.json license field | permissive | permissive dependency ok with notice | no | 0 | 4 | 0 | 53 | create separate private polycpp companion repo if reused broadly | Needed for parser and prepared statement caches; v0 does not implement prepared statement cache. |
-| named-placeholders | hard | ^1.1.6 | 1.1.6 | MIT | package.json license field | permissive | permissive dependency ok with notice | no | 1 | 1 | 0 | 7 | implement private helper in this repo | v0 implements a small named placeholder formatter locally against C++ value variants. |
-| sql-escaper | hard | ^1.3.3 | 1.3.3 | MIT | package.json license field | permissive | permissive dependency ok with notice | no | 0 | 5 | 6 | 57 | implement private helper in this repo | v0 implements SQL escape, identifier escape, positional format, and raw SQL locally. |
+| lru.min | hard | ^1.1.4 | 1.1.4 | MIT | package.json license field | permissive | permissive dependency ok with notice | no | 0 | 4 | 0 | 53 | create separate private polycpp companion repo if reused broadly | Needed for upstream parser and prepared statement caches; this port implements prepared statements without an LRU cache. |
+| named-placeholders | hard | ^1.1.6 | 1.1.6 | MIT | package.json license field | permissive | permissive dependency ok with notice | no | 1 | 1 | 0 | 7 | implement private helper in this repo | The port implements a small named placeholder formatter locally against C++ value variants. |
+| sql-escaper | hard | ^1.3.3 | 1.3.3 | MIT | package.json license field | permissive | permissive dependency ok with notice | no | 0 | 5 | 6 | 57 | implement private helper in this repo | The port implements SQL escape, identifier escape, positional format, and raw SQL locally. |
 
 ## Dependency ownership decisions
 
 - `iconv-lite`: use existing polycpp companion and link `polycpp_iconv_lite`.
 - `long`: replace with C++ integer types and explicit string fallback behavior.
-- `denque`: replace with standard containers when an async command queue is added.
+- `denque`: replace with standard containers and synchronous pool bookkeeping.
 - `named-placeholders`: implement small local formatter for `:name` values.
 - `sql-escaper`: implement local SQL escaping utilities and test edge bytes.
 - `lru.min`: defer until prepared-statement cache is implemented; create a separate companion only if multiple ports need it.
-- `generate-function`: omit because C++ parser generation is not needed for v0.
-- `aws-ssl-profiles`: defer with TLS support.
+- `generate-function`: omit because C++ parser generation is not needed.
+- `aws-ssl-profiles`: defer named TLS profile support; direct TLS options are implemented.
 - `@types/node`: omit as type-only upstream metadata.
 
 ## License impact summary
@@ -68,7 +68,7 @@ python3 /data/work/libgen/scripts/analyze-upstream-js.py /data/work/lib/mysql2 /
 - `generate-function` depends on `is-property`.
 - `iconv-lite` depends on `safer-buffer`.
 - `named-placeholders` depends on `lru.min`.
-- No transitive dependency changes the repo license decision for v0 because transitive source is not vendored and only `iconv-lite` is linked through an existing companion.
+- No transitive dependency changes the repo license decision because transitive source is not vendored and only `iconv-lite` is linked through an existing companion.
 
 ## Runtime API usage
 
@@ -90,9 +90,9 @@ python3 /data/work/libgen/scripts/analyze-upstream-js.py /data/work/lib/mysql2 /
 - `Buffer`: heavy packet encoding/decoding; mapped to `polycpp::Buffer`.
 - `crypto`: SHA1/SHA256/RSA public encrypt; mapped to `polycpp::crypto`.
 - `net`: TCP client; mapped to `polycpp::io::TcpSocket`.
-- `tls`: deferred transport upgrade.
+- `tls`: mapped to `polycpp::io::TlsContext`, `polycpp::io::TlsStream`, and `polycpp::ssl::X509Cert`.
 - `zlib`: deferred compression.
-- `events`, `stream`, `process`, `timers`: Node runtime command and callback mechanics; adapted to synchronous C++ v0 API.
+- `events`, `stream`, `process`, `timers`: Node runtime command and callback mechanics; adapted to synchronous C++ API or deferred for streams.
 - `url`: connection URI parsing is deferred.
 
 ### JavaScript API usage
@@ -100,7 +100,7 @@ python3 /data/work/libgen/scripts/analyze-upstream-js.py /data/work/lib/mysql2 /
 - Dynamic object options become `ConnectionOptions`.
 - Dynamic rows become `Row` containing `std::variant` values plus field-name index lookup.
 - Generated JS parsers are replaced by static C++ text-row parsing.
-- Callback and Promise wrappers are omitted from v0.
+- Callback and Promise wrappers are omitted.
 
 ### Framework object boundary usage
 
@@ -111,13 +111,13 @@ python3 /data/work/libgen/scripts/analyze-upstream-js.py /data/work/lib/mysql2 /
 ## Porting decisions
 
 - Implement pure MySQL protocol over polycpp TCP sockets.
-- Keep the public C++ API synchronous for v0 to make integration tests deterministic.
-- Fail closed on unsupported auth plugins, LOCAL INFILE, TLS-only cleartext auth, malformed packets, and server ERR packets.
+- Keep the public C++ API synchronous to make integration tests deterministic.
+- Fail closed on unsupported auth plugins, LOCAL INFILE, TLS-only cleartext auth, malformed packets, unexpected multi-results in single-result APIs, and server ERR packets.
 - Record deferred features explicitly rather than implying upstream parity.
 - Reuse `iconv-lite` companion for charset decoding, but document incomplete charset id mapping.
 
 ## Analyzer warnings
 
-- `aws-ssl-profiles: no entry points found for aws-ssl-profiles`: accepted because TLS profiles are deferred.
+- `aws-ssl-profiles: no entry points found for aws-ssl-profiles`: accepted because named TLS profiles are deferred while direct TLS options are implemented.
 - `is-property: no entry points found for is-property`: accepted because `generate-function` is omitted.
 - `safer-buffer: no entry points found for safer-buffer`: accepted because `iconv-lite` companion owns its own dependency strategy.

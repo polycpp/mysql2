@@ -89,7 +89,7 @@ Legend:
 - [x] docs build command recorded
 - [x] GitHub Pages workflow present
 - [x] `docs/build/` ignored
-- [x] generated placeholder docs tracked for replacement before public release
+- [x] generated docs placeholders replaced with supported-scope user docs
 
 ## Pre-Coding Gate
 
@@ -102,7 +102,7 @@ Legend:
 
 ## Implementation
 
-- [ ] implementation started after strict readiness
+- [x] implementation started after strict readiness
 - [x] tests added as features are implemented
 - [x] new divergences documented immediately
 
@@ -113,20 +113,23 @@ Implementation note: this challenge port produced implementation and documentati
 - [x] targeted tests pass
 - [x] README examples match actual code
 - [x] remaining gaps are documented
+- [x] `docs/test-plan.md` current validation records exact commands run
 
 Validation evidence:
 
 - `cmake --build build -j2` passed.
 - `ctest --test-dir build --output-on-failure` passed with unit tests and skipped e2e when env was absent.
 - Real MariaDB 10.6 e2e passed with `MYSQL2_TEST_HOST=127.0.0.1 MYSQL2_TEST_PORT=43306 MYSQL2_TEST_USER=root MYSQL2_TEST_DATABASE=polycpp_mysql2_test`.
+- Real MariaDB 10.6 verified TLS e2e passed with `MYSQL2_TEST_SSL=1 MYSQL2_TEST_SSL_REJECT_UNAUTHORIZED=1 MYSQL2_TEST_SSL_VERIFY_IDENTITY=1 MYSQL2_TEST_SSL_CA_FILE=$PWD/build/mariadb-tls/ca.pem`.
+- Real MySQL 8.4.6 Docker e2e passed from an Ubuntu 22.04 helper container sharing the MySQL container network namespace.
 
 ## Public Release
 
-- [ ] production-grade quality confirmed
-- [ ] public documentation ready
-- [ ] generated docs placeholder pages replaced with real public documentation
+- [x] production-grade quality confirmed
+- [x] public documentation ready for supported scope
+- [x] generated docs placeholder pages replaced with real public documentation
 - [x] `python3 docs/build.py` passes
-- [x] third-party license notices complete for current private v0 scope
+- [x] third-party license notices complete
 - [ ] GitHub repo visibility changed to public
 
-Public release note: keep the repository private until TLS, MySQL 8 auth e2e, prepared-statement scope, and public docs are reviewed.
+Public release note: keep the repository private until compression/non-compression release positioning and public visibility timing are reviewed.
