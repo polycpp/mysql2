@@ -2185,6 +2185,12 @@ public:
         return std::move(results.front());
     }
 
+    QueryResult query(const QueryOptions& options) {
+        return with_operation_timeout(options.timeout_ms, [this, &options] {
+            return query(options.sql, options.attributes);
+        });
+    }
+
     std::vector<QueryResult> query_all(const std::string& sql) {
         return query_all(sql, {});
     }
@@ -2193,6 +2199,12 @@ public:
         ensure_connected();
         write_packet(build_query_payload(sql, attributes, client_encoding_, client_flags_), 0);
         return read_query_results(false);
+    }
+
+    std::vector<QueryResult> query_all(const QueryOptions& options) {
+        return with_operation_timeout(options.timeout_ms, [this, &options] {
+            return query_all(options.sql, options.attributes);
+        });
     }
 
     PreparedStatement prepare(const std::string& sql) {
@@ -2224,6 +2236,12 @@ public:
             statement.columns = read_definition_packets(next, column_count, client_encoding_);
         }
         return statement;
+    }
+
+    PreparedStatement prepare(const std::string& sql, CommandOptions options) {
+        return with_operation_timeout(options.timeout_ms, [this, &sql] {
+            return prepare(sql);
+        });
     }
 
     PreparedStatement prepare_cached(const std::string& sql) {
@@ -2261,7 +2279,7 @@ public:
     }
 
     QueryResult execute(const PreparedStatement& statement, const std::vector<Value>& values) {
-        auto results = execute_all(statement, values, {});
+        auto results = execute_all(statement, values, QueryAttributes{});
         if (results.size() != 1) {
             throw Error("execute returned multiple result sets; use execute_all");
         }
@@ -2276,8 +2294,17 @@ public:
         return std::move(results.front());
     }
 
+    QueryResult execute(const PreparedStatement& statement,
+                        const std::vector<Value>& values,
+                        const QueryAttributes& attributes,
+                        CommandOptions options) {
+        return with_operation_timeout(options.timeout_ms, [this, &statement, &values, &attributes] {
+            return execute(statement, values, attributes);
+        });
+    }
+
     std::vector<QueryResult> execute_all(const PreparedStatement& statement, const std::vector<Value>& values) {
-        return execute_all(statement, values, {});
+        return execute_all(statement, values, QueryAttributes{});
     }
 
     std::vector<QueryResult> execute_all(const PreparedStatement& statement, const std::vector<Value>& values, const QueryAttributes& attributes) {
@@ -2293,6 +2320,15 @@ public:
                                                 client_flags_,
                                                 CursorType::None), 0);
         return read_query_results(true);
+    }
+
+    std::vector<QueryResult> execute_all(const PreparedStatement& statement,
+                                         const std::vector<Value>& values,
+                                         const QueryAttributes& attributes,
+                                         CommandOptions options) {
+        return with_operation_timeout(options.timeout_ms, [this, &statement, &values, &attributes] {
+            return execute_all(statement, values, attributes);
+        });
     }
 
     QueryResult execute(const std::string& sql, const std::vector<Value>& values) {
@@ -2313,6 +2349,18 @@ public:
     std::vector<QueryResult> execute_all(const std::string& sql, const std::vector<Value>& values, const QueryAttributes& attributes) {
         auto statement = prepare_cached(sql);
         return execute_all(statement, values, attributes);
+    }
+
+    QueryResult execute(const ExecuteOptions& options) {
+        return with_operation_timeout(options.timeout_ms, [this, &options] {
+            return execute(options.sql, options.values, options.attributes);
+        });
+    }
+
+    std::vector<QueryResult> execute_all(const ExecuteOptions& options) {
+        return with_operation_timeout(options.timeout_ms, [this, &options] {
+            return execute_all(options.sql, options.values, options.attributes);
+        });
     }
 
     StatementCursor execute_cursor(const PreparedStatement& statement,
@@ -2382,6 +2430,12 @@ public:
             result.rows.push_back(parse_binary_row(row_frame.payload, result.fields, options_));
         }
         return result;
+    }
+
+    QueryResult fetch(StatementCursor& cursor, uint32_t row_count, CommandOptions options) {
+        return with_operation_timeout(options.timeout_ms, [this, &cursor, row_count] {
+            return fetch(cursor, row_count);
+        });
     }
 
     OkPacket register_slave(const RegisterSlaveOptions& options) {
@@ -2647,6 +2701,51 @@ public:
     void resume() noexcept { paused_ = false; }
 
 private:
+    template <typename Fn>
+    std::invoke_result_t<Fn> with_operation_timeout(uint32_t timeout_ms, Fn&& fn) {
+        const auto previous = operation_timeout_ms_;
+        operation_timeout_ms_ = timeout_ms;
+        try {
+            if constexpr (std::is_void_v<std::invoke_result_t<Fn>>) {
+                std::forward<Fn>(fn)();
+                operation_timeout_ms_ = previous;
+            } else {
+                auto result = std::forward<Fn>(fn)();
+                operation_timeout_ms_ = previous;
+                return result;
+            }
+        } catch (...) {
+            operation_timeout_ms_ = previous;
+            throw;
+        }
+    }
+
+    void abort_transport_for_timeout() noexcept {
+        std::error_code ignored;
+        if (tls_stream_) {
+            tls_stream_->close(ignored);
+        }
+        socket_.close(ignored);
+        connected_ = false;
+        tls_active_ = false;
+        compression_active_ = false;
+    }
+
+    std::unique_ptr<io::Timer> arm_operation_timer(bool& timed_out, bool& completed) {
+        if (operation_timeout_ms_ == 0) {
+            return nullptr;
+        }
+        auto timer = std::make_unique<io::Timer>(ctx_);
+        timer->expiresAfter(std::chrono::milliseconds(operation_timeout_ms_));
+        timer->asyncWait([this, &timed_out, &completed](std::error_code error) {
+            if (!error && !completed) {
+                timed_out = true;
+                abort_transport_for_timeout();
+            }
+        });
+        return timer;
+    }
+
     void ensure_connected() {
         if (!connected_) {
             traced("connect", "", [this] { connect(); });
@@ -2802,19 +2901,35 @@ private:
             ctx_.restart();
             std::error_code ec;
             std::size_t bytes = 0;
+            bool completed = false;
+            bool timed_out = false;
+            auto timer = arm_operation_timer(timed_out, completed);
             const auto remaining = length - offset;
             if (tls_stream_) {
                 tls_stream_->asyncReadSome(data.data() + offset, remaining, [&](std::error_code error, std::size_t n) {
                     ec = error;
                     bytes = n;
+                    completed = true;
+                    if (timer) {
+                        std::error_code ignored;
+                        timer->cancel(ignored);
+                    }
                 });
             } else {
                 socket_.asyncRead(data.data() + offset, remaining, [&](std::error_code error, std::size_t n) {
                     ec = error;
                     bytes = n;
+                    completed = true;
+                    if (timer) {
+                        std::error_code ignored;
+                        timer->cancel(ignored);
+                    }
                 });
             }
             ctx_.run();
+            if (timed_out) {
+                throw Error("mysql2 operation timed out after " + std::to_string(operation_timeout_ms_) + "ms");
+            }
             if (ec) {
                 throw Error("socket read failed: " + ec.message());
             }
@@ -2832,18 +2947,34 @@ private:
             ctx_.restart();
             std::error_code ec;
             std::size_t bytes = 0;
+            bool completed = false;
+            bool timed_out = false;
+            auto timer = arm_operation_timer(timed_out, completed);
             if (tls_stream_) {
                 tls_stream_->asyncWrite(data + offset, length - offset, [&](std::error_code error, std::size_t n) {
                     ec = error;
                     bytes = n;
+                    completed = true;
+                    if (timer) {
+                        std::error_code ignored;
+                        timer->cancel(ignored);
+                    }
                 });
             } else {
                 socket_.asyncWrite(data + offset, length - offset, [&](std::error_code error, std::size_t n) {
                     ec = error;
                     bytes = n;
+                    completed = true;
+                    if (timer) {
+                        std::error_code ignored;
+                        timer->cancel(ignored);
+                    }
                 });
             }
             ctx_.run();
+            if (timed_out) {
+                throw Error("mysql2 operation timed out after " + std::to_string(operation_timeout_ms_) + "ms");
+            }
             if (ec) {
                 throw Error("socket write failed: " + ec.message());
             }
@@ -3225,6 +3356,7 @@ private:
     std::unordered_map<std::string, PreparedStatement> statement_cache_;
     std::deque<std::string> statement_lru_;
     std::string client_encoding_ = "utf8";
+    uint32_t operation_timeout_ms_ = 0;
 };
 
 Error::Error(const std::string& message) : polycpp::Error(message) {}
@@ -3305,6 +3437,37 @@ JsonObject Row::to_json_object(const std::vector<Field>& fields) const {
 
 std::string row_to_json_line(const Row& row, const std::vector<Field>& fields) {
     return JSON::stringify(JsonValue(row.to_json_object(fields))) + "\n";
+}
+
+RowStream::RowStream() = default;
+
+RowStream::RowStream(std::vector<Field> fields, std::vector<Row> rows)
+    : fields_(std::move(fields)), rows_(std::move(rows)) {}
+
+bool RowStream::empty() const noexcept { return offset_ >= rows_.size(); }
+
+std::size_t RowStream::size() const noexcept { return rows_.size(); }
+
+const std::vector<Field>& RowStream::fields() const noexcept { return fields_; }
+
+const std::vector<Row>& RowStream::rows() const noexcept { return rows_; }
+
+std::optional<Row> RowStream::read() {
+    if (offset_ >= rows_.size()) {
+        return std::nullopt;
+    }
+    return rows_[offset_++];
+}
+
+std::vector<Row> RowStream::to_vector() const { return rows_; }
+
+std::vector<Buffer> RowStream::to_json_line_buffers() const {
+    std::vector<Buffer> chunks;
+    chunks.reserve(rows_.size());
+    for (const auto& row : rows_) {
+        chunks.push_back(Buffer::from(row_to_json_line(row, fields_)));
+    }
+    return chunks;
 }
 
 JsonValue QueryResult::to_json() const {
@@ -3673,6 +3836,15 @@ QueryResult Connection::query(const std::string& sql, const QueryAttributes& att
     }
 }
 
+QueryResult Connection::query(const QueryOptions& options) {
+    try {
+        return impl_->traced("query", options.sql, [this, &options] { return impl_->query(options); });
+    } catch (const Error& error) {
+        impl_->emit_error(error);
+        throw;
+    }
+}
+
 void Connection::query(const std::string& sql, QueryCallback callback) {
     try {
         auto result = query(sql);
@@ -3691,12 +3863,25 @@ void Connection::query(const std::string& sql, const QueryAttributes& attributes
     }
 }
 
+void Connection::query(const QueryOptions& options, QueryCallback callback) {
+    try {
+        auto result = query(options);
+        if (callback) callback(nullptr, std::move(result));
+    } catch (...) {
+        if (callback) callback(std::current_exception(), QueryResult{});
+    }
+}
+
 Promise<QueryResult> Connection::query_promise(const std::string& sql) {
     return promise_from<QueryResult>([this, sql] { return query(sql); });
 }
 
 Promise<QueryResult> Connection::query_promise(const std::string& sql, const QueryAttributes& attributes) {
     return promise_from<QueryResult>([this, sql, attributes] { return query(sql, attributes); });
+}
+
+Promise<QueryResult> Connection::query_promise(QueryOptions options) {
+    return promise_from<QueryResult>([this, options = std::move(options)] { return query(options); });
 }
 
 std::vector<QueryResult> Connection::query_all(const std::string& sql) {
@@ -3711,6 +3896,15 @@ std::vector<QueryResult> Connection::query_all(const std::string& sql) {
 std::vector<QueryResult> Connection::query_all(const std::string& sql, const QueryAttributes& attributes) {
     try {
         return impl_->traced("query", sql, [this, &sql, &attributes] { return impl_->query_all(sql, attributes); });
+    } catch (const Error& error) {
+        impl_->emit_error(error);
+        throw;
+    }
+}
+
+std::vector<QueryResult> Connection::query_all(const QueryOptions& options) {
+    try {
+        return impl_->traced("query", options.sql, [this, &options] { return impl_->query_all(options); });
     } catch (const Error& error) {
         impl_->emit_error(error);
         throw;
@@ -3735,6 +3929,15 @@ void Connection::query_all(const std::string& sql, const QueryAttributes& attrib
     }
 }
 
+void Connection::query_all(const QueryOptions& options, QueryAllCallback callback) {
+    try {
+        auto result = query_all(options);
+        if (callback) callback(nullptr, std::move(result));
+    } catch (...) {
+        if (callback) callback(std::current_exception(), {});
+    }
+}
+
 Promise<std::vector<QueryResult>> Connection::query_all_promise(const std::string& sql) {
     return promise_from<std::vector<QueryResult>>([this, sql] { return query_all(sql); });
 }
@@ -3743,19 +3946,42 @@ Promise<std::vector<QueryResult>> Connection::query_all_promise(const std::strin
     return promise_from<std::vector<QueryResult>>([this, sql, attributes] { return query_all(sql, attributes); });
 }
 
-stream::Readable Connection::query_stream_json(const std::string& sql) {
+Promise<std::vector<QueryResult>> Connection::query_all_promise(QueryOptions options) {
+    return promise_from<std::vector<QueryResult>>([this, options = std::move(options)] {
+        return query_all(options);
+    });
+}
+
+RowStream Connection::query_stream(const std::string& sql) {
     auto result = query(sql);
-    std::vector<Buffer> chunks;
-    chunks.reserve(result.rows.size());
-    for (const auto& row : result.rows) {
-        chunks.push_back(Buffer::from(row_to_json_line(row, result.fields)));
-    }
-    return stream::Readable::from(chunks);
+    return RowStream(std::move(result.fields), std::move(result.rows));
+}
+
+RowStream Connection::query_stream(const QueryOptions& options) {
+    auto result = query(options);
+    return RowStream(std::move(result.fields), std::move(result.rows));
+}
+
+stream::Readable Connection::query_stream_json(const std::string& sql) {
+    return stream::Readable::from(query_stream(sql).to_json_line_buffers());
+}
+
+stream::Readable Connection::query_stream_json(const QueryOptions& options) {
+    return stream::Readable::from(query_stream(options).to_json_line_buffers());
 }
 
 PreparedStatement Connection::prepare(const std::string& sql) {
     try {
         return impl_->prepare(sql);
+    } catch (const Error& error) {
+        impl_->emit_error(error);
+        throw;
+    }
+}
+
+PreparedStatement Connection::prepare(const std::string& sql, CommandOptions options) {
+    try {
+        return impl_->prepare(sql, options);
     } catch (const Error& error) {
         impl_->emit_error(error);
         throw;
@@ -3799,6 +4025,31 @@ QueryResult Connection::execute(const PreparedStatement& statement,
     }
 }
 
+QueryResult Connection::execute(const PreparedStatement& statement,
+                                const std::vector<Value>& values,
+                                const QueryAttributes& attributes,
+                                CommandOptions options) {
+    try {
+        return impl_->traced("execute", statement.query, [this, &statement, &values, &attributes, options] {
+            return impl_->execute(statement, values, attributes, options);
+        });
+    } catch (const Error& error) {
+        impl_->emit_error(error);
+        throw;
+    }
+}
+
+QueryResult Connection::execute(const ExecuteOptions& options) {
+    try {
+        return impl_->traced("execute", options.sql, [this, &options] {
+            return impl_->execute(options);
+        });
+    } catch (const Error& error) {
+        impl_->emit_error(error);
+        throw;
+    }
+}
+
 void Connection::execute(const PreparedStatement& statement, const std::vector<Value>& values, QueryCallback callback) {
     try {
         auto result = execute(statement, values);
@@ -3820,6 +4071,15 @@ void Connection::execute(const PreparedStatement& statement,
     }
 }
 
+void Connection::execute(const ExecuteOptions& options, QueryCallback callback) {
+    try {
+        auto result = execute(options);
+        if (callback) callback(nullptr, std::move(result));
+    } catch (...) {
+        if (callback) callback(std::current_exception(), QueryResult{});
+    }
+}
+
 Promise<QueryResult> Connection::execute_promise(const PreparedStatement& statement, const std::vector<Value>& values) {
     return promise_from<QueryResult>([this, statement, values] { return execute(statement, values); });
 }
@@ -3828,6 +4088,10 @@ Promise<QueryResult> Connection::execute_promise(const PreparedStatement& statem
                                                  const std::vector<Value>& values,
                                                  const QueryAttributes& attributes) {
     return promise_from<QueryResult>([this, statement, values, attributes] { return execute(statement, values, attributes); });
+}
+
+Promise<QueryResult> Connection::execute_promise(ExecuteOptions options) {
+    return promise_from<QueryResult>([this, options = std::move(options)] { return execute(options); });
 }
 
 std::vector<QueryResult> Connection::execute_all(const PreparedStatement& statement, const std::vector<Value>& values) {
@@ -3847,6 +4111,31 @@ std::vector<QueryResult> Connection::execute_all(const PreparedStatement& statem
     try {
         return impl_->traced("execute", statement.query, [this, &statement, &values, &attributes] {
             return impl_->execute_all(statement, values, attributes);
+        });
+    } catch (const Error& error) {
+        impl_->emit_error(error);
+        throw;
+    }
+}
+
+std::vector<QueryResult> Connection::execute_all(const PreparedStatement& statement,
+                                                 const std::vector<Value>& values,
+                                                 const QueryAttributes& attributes,
+                                                 CommandOptions options) {
+    try {
+        return impl_->traced("execute", statement.query, [this, &statement, &values, &attributes, options] {
+            return impl_->execute_all(statement, values, attributes, options);
+        });
+    } catch (const Error& error) {
+        impl_->emit_error(error);
+        throw;
+    }
+}
+
+std::vector<QueryResult> Connection::execute_all(const ExecuteOptions& options) {
+    try {
+        return impl_->traced("execute", options.sql, [this, &options] {
+            return impl_->execute_all(options);
         });
     } catch (const Error& error) {
         impl_->emit_error(error);
@@ -3875,6 +4164,15 @@ void Connection::execute_all(const PreparedStatement& statement,
     }
 }
 
+void Connection::execute_all(const ExecuteOptions& options, QueryAllCallback callback) {
+    try {
+        auto result = execute_all(options);
+        if (callback) callback(nullptr, std::move(result));
+    } catch (...) {
+        if (callback) callback(std::current_exception(), {});
+    }
+}
+
 Promise<std::vector<QueryResult>> Connection::execute_all_promise(const PreparedStatement& statement, const std::vector<Value>& values) {
     return promise_from<std::vector<QueryResult>>([this, statement, values] { return execute_all(statement, values); });
 }
@@ -3884,6 +4182,12 @@ Promise<std::vector<QueryResult>> Connection::execute_all_promise(const Prepared
                                                                   const QueryAttributes& attributes) {
     return promise_from<std::vector<QueryResult>>([this, statement, values, attributes] {
         return execute_all(statement, values, attributes);
+    });
+}
+
+Promise<std::vector<QueryResult>> Connection::execute_all_promise(ExecuteOptions options) {
+    return promise_from<std::vector<QueryResult>>([this, options = std::move(options)] {
+        return execute_all(options);
     });
 }
 
@@ -4026,6 +4330,15 @@ StatementCursor Connection::execute_cursor(const std::string& sql,
 QueryResult Connection::fetch(StatementCursor& cursor, uint32_t row_count) {
     try {
         return impl_->fetch(cursor, row_count);
+    } catch (const Error& error) {
+        impl_->emit_error(error);
+        throw;
+    }
+}
+
+QueryResult Connection::fetch(StatementCursor& cursor, uint32_t row_count, CommandOptions options) {
+    try {
+        return impl_->fetch(cursor, row_count, options);
     } catch (const Error& error) {
         impl_->emit_error(error);
         throw;

@@ -30,9 +30,9 @@ Implemented:
 - MySQL charset/collation id mapping with non-core string conversion delegated to the existing `iconv-lite` companion.
 - SQL `escape`, `escape_id`, positional `format`, and named placeholder formatting helpers.
 - Connection URI parsing through `polycpp::url`.
-- Connect timeout enforcement through `polycpp::io::Timer`.
+- Connect timeout and per-command inactivity timeout enforcement through `polycpp::io::Timer`.
 - Connection attributes in the initial handshake and `COM_CHANGE_USER`.
-- Callback overloads, `polycpp::Promise` wrappers, typed `polycpp::events::EventEmitter` integration, trace events, and JSON line `polycpp::stream::Readable` query output.
+- `QueryOptions` / `ExecuteOptions` timeout wrappers, callback overloads, `polycpp::Promise` wrappers, typed `polycpp::events::EventEmitter` integration, trace events, typed `RowStream`, and JSON line `polycpp::stream::Readable` query output.
 - MySQL compressed protocol using `polycpp::zlib`.
 - Explicit-policy LOCAL INFILE uploads through `ConnectionOptions::local_infile_handler`.
 - `COM_CHANGE_USER`, transaction helpers, ping, reset, graceful end, synchronous RAII pools, and pool clusters.
@@ -45,14 +45,14 @@ Deferred:
 
 - Server mode.
 - GTID binlog dump, continuous replication stream abstraction, and full row/table-map event decoding.
-- Native object-mode row streams. `query_stream_json()` intentionally exposes byte chunks containing newline-delimited JSON because polycpp streams currently emit `Buffer` chunks, not arbitrary row objects.
+- Exact Node `Readable` object-mode row chunks. `query_stream(...)` provides a typed C++ row iterator and `query_stream_json()` exposes newline-delimited JSON `Buffer` chunks because polycpp streams currently emit byte/text chunks, not arbitrary row objects.
 
 Known divergences:
 
 - C++ API shape is synchronous and typed first; callback and Promise wrappers execute the same typed operations and settle through polycpp primitives.
 - Native MySQL/MariaDB client SDKs are intentionally not linked.
 - Node diagnostic channels are adapted to typed `event::Trace` events.
-- Node object-mode row streaming is adapted to JSON line byte streams for auditability and `polycpp::stream` compatibility.
+- Node object-mode row streaming is adapted to typed `RowStream` rows plus JSON line byte streams for auditability and `polycpp::stream` compatibility.
 - Parser cache controls are compatibility no-ops because C++ uses static parsers.
 - Query attributes use `std::unordered_map`, so attribute wire order is not a public contract.
 - Bounded binlog dump closes the connection if `max_events` is reached before EOF, because the connection is otherwise left in the replication command stream.
@@ -208,7 +208,12 @@ conn.query("SELECT 1 AS one", [](std::exception_ptr err, polycpp::mysql2::QueryR
 });
 
 auto promise = conn.query_promise("SELECT 1 AS one");
-auto stream = conn.query_stream_json("SELECT id, name FROM users");
+polycpp::mysql2::QueryOptions query_options;
+query_options.sql = "SELECT id, name FROM users";
+query_options.timeout_ms = 5000;
+
+auto rows = conn.query_stream(query_options);
+auto stream = conn.query_stream_json(query_options);
 ```
 
 Formatting helpers:

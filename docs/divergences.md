@@ -13,8 +13,9 @@
 - JavaScript parser code generation is replaced with static C++ parsing.
 - Parser-cache controls are exposed as compatibility/audit hooks, but they do not clear generated parser code because no generated parser cache exists.
 - Node diagnostic channels are adapted to typed `event::Trace` events on `Connection` for connect/query/execute start, success, and error phases.
+- Per-command query/execute inactivity timeout options are adapted to `QueryOptions::timeout_ms`, `ExecuteOptions::timeout_ms`, and `CommandOptions::timeout_ms`. A timeout closes the transport and marks the connection disconnected.
 - Replication commands are bounded synchronous operations. `COM_REGISTER_SLAVE` and `COM_BINLOG_DUMP` are available, with typed parsing for Query, Rotate, FormatDescription, and Xid events and raw-byte fallback for unknown binlog event types.
-- Node object-mode row streams are adapted to newline-delimited JSON byte streams via `polycpp::stream::Readable`, because current polycpp stream chunks are `Buffer`/text rather than arbitrary row objects.
+- Node object-mode row streams are adapted to typed `RowStream` rows plus newline-delimited JSON byte streams via `polycpp::stream::Readable`, because current polycpp stream chunks are `Buffer`/text rather than arbitrary row objects.
 - LOCAL INFILE never opens a path by default. The caller must provide `ConnectionOptions::local_infile_handler`, which receives the server-requested path and returns explicit `polycpp::Buffer` chunks.
 - Query attributes use `QueryAttributes`, an `std::unordered_map<std::string, Value>`. Attribute ordering on the wire is intentionally not a C++ API guarantee.
 - Server-side prepared-statement cursors are explicit `StatementCursor` objects. Callers fetch batches with `Connection::fetch(...)` and close the underlying prepared statement when they are done.
@@ -25,7 +26,7 @@
 
 - Server mode is deferred because it requires a separate server-side connection object, handshake/auth dispatcher, and response-writing API rather than extending the client `Connection`.
 - GTID binlog dump, continuous replication stream abstraction, and full row/table-map event decoding are deferred.
-- Native object-mode row stream chunks are deferred until polycpp stream supports arbitrary typed payload chunks.
+- Exact Node `Readable` object-mode row chunks are deferred until polycpp stream supports arbitrary typed payload chunks.
 
 ## Security-Driven Behavior Changes
 
@@ -38,4 +39,3 @@
 
 - Node.js process tick timing is not modeled.
 - Node Buffer pooling behavior is not replicated; the port uses `polycpp::Buffer`.
-- Per-command query/execute inactivity timeout objects are not modeled. The initial TCP `connect_timeout_ms` is enforced with `polycpp::io::Timer`.

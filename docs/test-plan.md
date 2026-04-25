@@ -14,12 +14,13 @@
 - Binary row parser fixtures should cover numeric, decimal, date/time/datetime, binary string/blob, JSON text, and NULL bitmap behavior.
 - SSL profile helper coverage verifies the generated AWS RDS CA bundle is loadable as PEM strings.
 - Parser-cache compatibility hooks are covered as no-op static-parser controls.
+- Typed `RowStream` coverage verifies row iteration and NDJSON buffer conversion.
 - Binlog packet parser coverage includes QueryEvent fixtures; Rotate, FormatDescription, Xid, and unknown-event fixtures should be added.
 
 ## Integration Tests
 
 - Environment-driven MariaDB/MySQL test using `MYSQL2_TEST_HOST`, `MYSQL2_TEST_PORT`, `MYSQL2_TEST_USER`, `MYSQL2_TEST_PASSWORD`, and `MYSQL2_TEST_DATABASE`.
-- Current e2e coverage connects to MariaDB/MySQL, runs ping, checks typed trace events, selects scalar values, sends query attributes when supported, preserves empty binary values as Buffer, creates a temporary table, inserts rows, selects them back, uses prepared statements, prepared-statement query attributes, server-side cursor fetch, and cached execute, tests transactions, resets the connection, changes user state, tests multi-result queries, exercises callback/Promise wrappers, consumes a JSON line stream, verifies compression when enabled, optionally uploads LOCAL INFILE data when the server allows it, exercises the RAII pool, and exercises a single-node pool cluster.
+- Current e2e coverage connects to MariaDB/MySQL, runs ping, checks typed trace events, selects scalar values, exercises `QueryOptions`/`ExecuteOptions` with command timeouts, sends query attributes when supported, preserves empty binary values as Buffer, creates a temporary table, inserts rows, selects them back, uses prepared statements, prepared-statement query attributes, server-side cursor fetch, and cached execute, tests transactions, resets the connection, changes user state, tests multi-result queries, exercises callback/Promise wrappers, consumes JSON line and typed row stream adapters, verifies compression when enabled, optionally uploads LOCAL INFILE data when the server allows it, exercises the RAII pool, exercises a single-node pool cluster, and verifies that command inactivity timeout closes the connection.
 - TLS e2e is controlled by `MYSQL2_TEST_SSL`, `MYSQL2_TEST_SSL_REJECT_UNAUTHORIZED`, `MYSQL2_TEST_SSL_VERIFY_IDENTITY`, and `MYSQL2_TEST_SSL_CA_FILE`.
 - MySQL 8 coverage runs against a Dockerized MySQL 8.4 server and validates the default `caching_sha2_password` path.
 - MySQL 8 coverage validates `CLIENT_QUERY_ATTRIBUTES` for both `COM_QUERY` and `COM_STMT_EXECUTE`.
@@ -49,6 +50,7 @@
 - Non-finite floating values escape as `NULL`.
 - RSA auth path uses OAEP SHA1 to match upstream caching_sha2_password behavior.
 - Single-result APIs drain additional result sets before throwing so the connection is reusable.
+- Per-command inactivity timeout closes the transport and marks the connection disconnected.
 - Bounded binlog dump closes the connection if `max_events` is reached before EOF, so callers do not accidentally reuse a connection that is still inside a replication stream.
 
 ## Release-Blocking Behaviors
@@ -57,7 +59,7 @@
 - Real MariaDB e2e passes without TLS.
 - Real MariaDB e2e passes with verified TLS.
 - Real MySQL 8 e2e passes before claiming MySQL 8 auth parity.
-- Stream adaptation, compression, LOCAL INFILE policy, callback/Promise wrappers, EventEmitter/trace behavior, bounded binlog behavior, parser-cache compatibility hooks, and SSL profile data remain documented with exact C++ semantics.
+- Stream adaptation, command timeout behavior, compression, LOCAL INFILE policy, callback/Promise wrappers, EventEmitter/trace behavior, bounded binlog behavior, parser-cache compatibility hooks, and SSL profile data remain documented with exact C++ semantics.
 - Third-party license notices are complete.
 - Documentation builds with `python3 docs/build.py`.
 - GitHub repo remains private until production-grade quality and public docs are ready.

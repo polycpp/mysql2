@@ -156,6 +156,17 @@ TEST(rows, json_helpers_and_event_emitter_surface) {
     row.index_by_name = {{"id", 0}, {"name", 1}};
 
     EXPECT_EQ(mysql2::row_to_json_line(row, {id, name}), R"({"id":42,"name":"Ada"})" "\n");
+    mysql2::RowStream row_stream({id, name}, {row});
+    EXPECT_EQ(row_stream.size(), 1u);
+    EXPECT_FALSE(row_stream.empty());
+    auto first = row_stream.read();
+    ASSERT_TRUE(first.has_value());
+    EXPECT_EQ(std::get<int64_t>(first->at("id")), 42);
+    EXPECT_TRUE(row_stream.empty());
+    EXPECT_FALSE(row_stream.read().has_value());
+    const auto chunks = row_stream.to_json_line_buffers();
+    ASSERT_EQ(chunks.size(), 1u);
+    EXPECT_EQ(chunks[0].toString(), R"({"id":42,"name":"Ada"})" "\n");
 
     mysql2::Connection connection;
     bool saw_error = false;
@@ -239,6 +250,23 @@ TEST(mysql2_integration, query_against_real_database_when_configured) {
     EXPECT_TRUE(std::holds_alternative<std::monostate>(result.rows[0].at("none")));
     EXPECT_TRUE(query_trace_seen);
 
+    trace_step("query options");
+    mysql2::QueryOptions query_options;
+    query_options.sql = "SELECT 20 AS option_value";
+    query_options.timeout_ms = 5000;
+    const auto option_result = connection.query(query_options);
+    ASSERT_EQ(option_result.rows.size(), 1u);
+    EXPECT_EQ(std::get<int64_t>(option_result.rows[0].at("option_value")), 20);
+
+    trace_step("execute options");
+    mysql2::ExecuteOptions execute_options;
+    execute_options.sql = "SELECT ? AS option_exec";
+    execute_options.values = {int64_t{21}};
+    execute_options.timeout_ms = 5000;
+    const auto option_exec = connection.execute(execute_options);
+    ASSERT_EQ(option_exec.rows.size(), 1u);
+    EXPECT_EQ(std::get<int64_t>(option_exec.rows[0].at("option_exec")), 21);
+
     constexpr uint32_t client_query_attributes = 0x08000000;
     if ((connection.server_capability_flags() & client_query_attributes) != 0) {
         trace_step("query attributes query");
@@ -312,6 +340,13 @@ TEST(mysql2_integration, query_against_real_database_when_configured) {
     const auto json_chunks = json_stream.toArray();
     ASSERT_EQ(json_chunks.size(), 1u);
     EXPECT_EQ(json_chunks[0].toString(), R"({"eight":8})" "\n");
+
+    trace_step("typed row stream query");
+    auto typed_stream = connection.query_stream("SELECT 9 AS nine");
+    auto typed_row = typed_stream.read();
+    ASSERT_TRUE(typed_row.has_value());
+    EXPECT_EQ(std::get<int64_t>(typed_row->at("nine")), 9);
+    EXPECT_FALSE(typed_stream.read().has_value());
 
     trace_step("empty value query");
     const auto empty_first = connection.query("SELECT '' AS empty_string, X'' AS empty_blob");
@@ -489,6 +524,15 @@ TEST(mysql2_integration, query_against_real_database_when_configured) {
     ASSERT_EQ(clustered.rows.size(), 1u);
     EXPECT_EQ(std::get<int64_t>(clustered.rows[0].at("fifteen")), 15);
     cluster.end();
+
+    trace_step("query timeout");
+    mysql2::Connection timeout_connection(options);
+    timeout_connection.connect();
+    mysql2::QueryOptions timeout_query;
+    timeout_query.sql = "SELECT SLEEP(2)";
+    timeout_query.timeout_ms = 10;
+    EXPECT_THROW(timeout_connection.query(timeout_query), mysql2::Error);
+    EXPECT_FALSE(timeout_connection.connected());
 
     pool.end();
     EXPECT_EQ(pool.total_count(), 0u);

@@ -122,18 +122,18 @@ The C++ supported slice maps core connection, query, query attributes, prepared 
 - companion libs selected for reuse: `polycpp::iconv_lite` for non-core charset decoding.
 - companion libs rejected or deferred: no separate `long`, `denque`, `named-placeholders`, `sql-escaper`, or `lru.min` companion is required for the supported scope.
 - new local abstractions introduced: `Connection`, `ConnectionOptions`, `SslOptions`, `PreparedStatement`, `StatementCursor`, `QueryAttributes`, `PoolOptions`, `Pool`, `PoolConnection`, `Field`, `Row`, `QueryResult`, `OkPacket`, and private packet cursor helpers.
-- reuse risks or integration gaps: `polycpp::io` is async-first, so this port wraps it with a synchronous API; connect timeout enforcement uses `polycpp::io::Timer`, while per-command inactivity timeout objects are still not modeled. Native object-mode stream chunks require a future polycpp stream payload model beyond byte/text buffers.
+- reuse risks or integration gaps: `polycpp::io` is async-first, so this port wraps it with a synchronous API; connect and per-command inactivity timeout enforcement use `polycpp::io::Timer`. Exact Node `Readable` object-mode row chunks require a future polycpp stream payload model beyond byte/text buffers, so this port exposes a typed `RowStream` and an NDJSON byte stream adapter.
 
 ## Node parity surface audit
 
 - callback APIs: upstream callback entry points are preserved as `std::function` overloads for connection, query, execute, prepare, transaction, ping, reset, change-user, register-slave/binlog-dump, end, pool, and pool-cluster APIs; they execute the same typed implementation and receive `std::exception_ptr` on failure.
 - Promise APIs: upstream Promise wrapper entry points are mapped to `polycpp::Promise` wrappers over the typed implementation. They settle through polycpp primitives rather than a JavaScript command queue.
 - EventEmitter APIs: connection, pool, and pool-cluster event surfaces are mapped to typed `polycpp::events::EventEmitter` integration. Error-event specializations are registered for connection, pool, and cluster objects. Node diagnostic channels are adapted to typed `TraceEvent` emissions for connect/query/execute phases.
-- stream APIs: upstream object-mode row streams are adapted to `polycpp::stream::Readable` byte chunks containing newline-delimited JSON rows because current polycpp streams are byte/text oriented, not arbitrary row object chunks.
+- stream APIs: upstream object-mode row streams are adapted to typed `RowStream` rows and `polycpp::stream::Readable` byte chunks containing newline-delimited JSON rows because current polycpp streams are byte/text oriented, not arbitrary row object chunks.
 - Buffer and binary APIs: packet buffers, binary parameters, binary result columns, and LOCAL INFILE chunks use `polycpp::Buffer` so byte payloads are not downgraded to `std::string`.
 - URL, timer, process, and filesystem APIs: connection URI parsing uses `polycpp::url`; connect deadlines use `polycpp::io::Timer`; pool wait behavior uses C++ chrono; process globals are not a public C++ surface; filesystem access is limited to explicitly configured TLS certificate/key paths and LOCAL INFILE caller-provided buffers.
 - crypto, compression, TLS, network, and HTTP APIs: auth tokens and RSA encryption use `polycpp::crypto`; compression uses `polycpp::zlib`; TCP/TLS transport uses `polycpp::io` and `polycpp::ssl`; HTTP APIs are not relevant to the MySQL protocol.
-- unsupported Node-specific APIs and audit reason: native object-mode row chunks, server mode, GTID replication, continuous binlog object streams, and full row-event decoding are deferred because they require additional protocol families or polycpp stream/object primitives.
+- unsupported Node-specific APIs and audit reason: exact Node `Readable` object-mode row chunks, server mode, GTID replication, continuous binlog object streams, and full row-event decoding are deferred because they require additional protocol families or polycpp stream/object primitives.
 
 ## External SDK and native driver strategy
 
@@ -187,14 +187,14 @@ The C++ supported slice maps core connection, query, query attributes, prepared 
 
 - Server mode.
 - GTID binlog dump, continuous replication stream abstraction, and full row/table-map event decoding.
-- Native object-mode row streams; current stream adapter emits newline-delimited JSON `Buffer` chunks.
+- Exact Node `Readable` object-mode row chunks; current C++ adapters expose typed `RowStream` rows and newline-delimited JSON `Buffer` chunks.
 
 ## v0 scope
 
 - port version: 0.1.0
-- supported APIs: `ConnectionOptions`, `SslOptions`, `TraceEvent`, `Connection`, `PreparedStatement`, `StatementCursor`, `QueryAttributes`, `RegisterSlaveOptions`, `BinlogDumpOptions`, `BinlogEvent`, `PoolOptions`, `Pool`, `PoolConnection`, `PoolCluster`, `PoolNamespace`, `create_connection`, `create_pool`, `create_pool_cluster`, `query`, `query_all`, `execute`, `execute_all`, `execute_cursor`, `fetch`, `register_slave`, `binlog_dump`, `parse_binlog_event_packet`, `prepare`, `close_statement`, `begin_transaction`, `commit`, `rollback`, `change_user`, `reset`, `ping`, `end`, `destroy`, `pause`, `resume`, callback overloads, `polycpp::Promise` wrappers, typed `EventEmitter` events, trace events, `query_stream_json`, connection URI parsing, compressed protocol, LOCAL INFILE handler, charset helpers, SSL profile helpers, parser-cache compatibility hooks, `escape`, `escape_id`, `format`, `format_named`, `raw`
-- unsupported APIs: server mode, GTID replication, continuous binlog object streams, full row/table-map event decoding, native object-mode row streams
+- supported APIs: `ConnectionOptions`, `SslOptions`, `TraceEvent`, `CommandOptions`, `QueryOptions`, `ExecuteOptions`, `Connection`, `PreparedStatement`, `StatementCursor`, `QueryAttributes`, `RowStream`, `RegisterSlaveOptions`, `BinlogDumpOptions`, `BinlogEvent`, `PoolOptions`, `Pool`, `PoolConnection`, `PoolCluster`, `PoolNamespace`, `create_connection`, `create_pool`, `create_pool_cluster`, `query`, `query_all`, `execute`, `execute_all`, `execute_cursor`, `fetch`, `register_slave`, `binlog_dump`, `parse_binlog_event_packet`, `prepare`, `close_statement`, `begin_transaction`, `commit`, `rollback`, `change_user`, `reset`, `ping`, `end`, `destroy`, `pause`, `resume`, callback overloads, `polycpp::Promise` wrappers, typed `EventEmitter` events, trace events, `query_stream`, `query_stream_json`, connection URI parsing, command timeouts, compressed protocol, LOCAL INFILE handler, charset helpers, SSL profile helpers, parser-cache compatibility hooks, `escape`, `escape_id`, `format`, `format_named`, `raw`
+- unsupported APIs: server mode, GTID replication, continuous binlog object streams, full row/table-map event decoding, exact Node `Readable` object-mode row chunks
 - dependency plan: reuse `iconv-lite`; replace `long` with C++ integer types; replace `denque` with standard containers and a synchronous pool; implement SQL escaping and named placeholders locally; implement statement cache in-repo; generate AWS RDS CA PEM data from `aws-ssl-profiles`; expose generated JS parser controls as no-op audit hooks
 - polycpp modules to use: `Buffer`, `Promise`, `events`, `stream`, `url`, `zlib`, `crypto`, `io`, `ssl`, TLS, and the `iconv-lite` companion
-- missing polycpp primitives: native typed object-mode stream chunks and a reusable query/execute inactivity-timeout command wrapper
+- missing polycpp primitives: native typed object-mode stream chunks
 - versioning note: port versioning is independent from upstream npm versioning; upstream basis is recorded separately and does not imply parity

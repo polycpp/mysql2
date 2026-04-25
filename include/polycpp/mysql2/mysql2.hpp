@@ -133,6 +133,23 @@ struct QueryResult {
     JsonValue to_json() const;
 };
 
+struct CommandOptions {
+    uint32_t timeout_ms = 0;
+};
+
+struct QueryOptions {
+    std::string sql;
+    QueryAttributes attributes;
+    uint32_t timeout_ms = 0;
+};
+
+struct ExecuteOptions {
+    std::string sql;
+    std::vector<Value> values;
+    QueryAttributes attributes;
+    uint32_t timeout_ms = 0;
+};
+
 struct PreparedStatement {
     uint32_t id = 0;
     std::string query;
@@ -235,6 +252,25 @@ struct BinlogEvent {
     uint64_t xid = 0;
 };
 
+class RowStream {
+public:
+    RowStream();
+    RowStream(std::vector<Field> fields, std::vector<Row> rows);
+
+    bool empty() const noexcept;
+    std::size_t size() const noexcept;
+    const std::vector<Field>& fields() const noexcept;
+    const std::vector<Row>& rows() const noexcept;
+    std::optional<Row> read();
+    std::vector<Row> to_vector() const;
+    std::vector<Buffer> to_json_line_buffers() const;
+
+private:
+    std::vector<Field> fields_;
+    std::vector<Row> rows_;
+    std::size_t offset_ = 0;
+};
+
 using VoidCallback = std::function<void(std::exception_ptr)>;
 using OkCallback = std::function<void(std::exception_ptr, OkPacket)>;
 using QueryCallback = std::function<void(std::exception_ptr, QueryResult)>;
@@ -283,32 +319,56 @@ public:
     Promise<void> connect_promise();
     QueryResult query(const std::string& sql);
     QueryResult query(const std::string& sql, const QueryAttributes& attributes);
+    QueryResult query(const QueryOptions& options);
     void query(const std::string& sql, QueryCallback callback);
     void query(const std::string& sql, const QueryAttributes& attributes, QueryCallback callback);
+    void query(const QueryOptions& options, QueryCallback callback);
     Promise<QueryResult> query_promise(const std::string& sql);
     Promise<QueryResult> query_promise(const std::string& sql, const QueryAttributes& attributes);
+    Promise<QueryResult> query_promise(QueryOptions options);
     std::vector<QueryResult> query_all(const std::string& sql);
     std::vector<QueryResult> query_all(const std::string& sql, const QueryAttributes& attributes);
+    std::vector<QueryResult> query_all(const QueryOptions& options);
     void query_all(const std::string& sql, QueryAllCallback callback);
     void query_all(const std::string& sql, const QueryAttributes& attributes, QueryAllCallback callback);
+    void query_all(const QueryOptions& options, QueryAllCallback callback);
     Promise<std::vector<QueryResult>> query_all_promise(const std::string& sql);
     Promise<std::vector<QueryResult>> query_all_promise(const std::string& sql, const QueryAttributes& attributes);
+    Promise<std::vector<QueryResult>> query_all_promise(QueryOptions options);
+    RowStream query_stream(const std::string& sql);
+    RowStream query_stream(const QueryOptions& options);
     stream::Readable query_stream_json(const std::string& sql);
+    stream::Readable query_stream_json(const QueryOptions& options);
     PreparedStatement prepare(const std::string& sql);
+    PreparedStatement prepare(const std::string& sql, CommandOptions options);
     void prepare(const std::string& sql, PrepareCallback callback);
     Promise<PreparedStatement> prepare_promise(const std::string& sql);
     QueryResult execute(const PreparedStatement& statement, const std::vector<Value>& values = {});
     QueryResult execute(const PreparedStatement& statement, const std::vector<Value>& values, const QueryAttributes& attributes);
+    QueryResult execute(const PreparedStatement& statement,
+                        const std::vector<Value>& values,
+                        const QueryAttributes& attributes,
+                        CommandOptions options);
+    QueryResult execute(const ExecuteOptions& options);
     void execute(const PreparedStatement& statement, const std::vector<Value>& values, QueryCallback callback);
     void execute(const PreparedStatement& statement, const std::vector<Value>& values, const QueryAttributes& attributes, QueryCallback callback);
+    void execute(const ExecuteOptions& options, QueryCallback callback);
     Promise<QueryResult> execute_promise(const PreparedStatement& statement, const std::vector<Value>& values = {});
     Promise<QueryResult> execute_promise(const PreparedStatement& statement, const std::vector<Value>& values, const QueryAttributes& attributes);
+    Promise<QueryResult> execute_promise(ExecuteOptions options);
     std::vector<QueryResult> execute_all(const PreparedStatement& statement, const std::vector<Value>& values = {});
     std::vector<QueryResult> execute_all(const PreparedStatement& statement, const std::vector<Value>& values, const QueryAttributes& attributes);
+    std::vector<QueryResult> execute_all(const PreparedStatement& statement,
+                                         const std::vector<Value>& values,
+                                         const QueryAttributes& attributes,
+                                         CommandOptions options);
+    std::vector<QueryResult> execute_all(const ExecuteOptions& options);
     void execute_all(const PreparedStatement& statement, const std::vector<Value>& values, QueryAllCallback callback);
     void execute_all(const PreparedStatement& statement, const std::vector<Value>& values, const QueryAttributes& attributes, QueryAllCallback callback);
+    void execute_all(const ExecuteOptions& options, QueryAllCallback callback);
     Promise<std::vector<QueryResult>> execute_all_promise(const PreparedStatement& statement, const std::vector<Value>& values = {});
     Promise<std::vector<QueryResult>> execute_all_promise(const PreparedStatement& statement, const std::vector<Value>& values, const QueryAttributes& attributes);
+    Promise<std::vector<QueryResult>> execute_all_promise(ExecuteOptions options);
     QueryResult execute(const std::string& sql, const std::vector<Value>& values = {});
     QueryResult execute(const std::string& sql, const std::vector<Value>& values, const QueryAttributes& attributes);
     void execute(const std::string& sql, const std::vector<Value>& values, QueryCallback callback);
@@ -330,6 +390,7 @@ public:
                                    const QueryAttributes& attributes = {},
                                    CursorType cursor_type = CursorType::ReadOnly);
     QueryResult fetch(StatementCursor& cursor, uint32_t row_count);
+    QueryResult fetch(StatementCursor& cursor, uint32_t row_count, CommandOptions options);
     OkPacket register_slave(const RegisterSlaveOptions& options);
     void register_slave(const RegisterSlaveOptions& options, OkCallback callback);
     Promise<OkPacket> register_slave_promise(RegisterSlaveOptions options);

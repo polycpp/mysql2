@@ -38,13 +38,14 @@
 | `mysql.raw(sql)` | `polycpp::mysql2::raw(sql)` | adapted | Explicit raw SQL variant bypasses escaping. |
 | `namedPlaceholders` option | `polycpp::mysql2::format_named(sql, map)` | adapted | Separate helper rather than connection option. |
 | `connectAttributes` | `ConnectionOptions::connect_attributes` | adapted | Merged with default client name/version attributes and sent during handshake and `COM_CHANGE_USER`. |
-| `connectTimeout` | `ConnectionOptions::connect_timeout_ms` | adapted | Enforced around the initial TCP connect using `polycpp::io::Timer`. Per-command inactivity timeout options are not modeled as query objects. |
+| `connectTimeout` | `ConnectionOptions::connect_timeout_ms` | adapted | Enforced around the initial TCP connect using `polycpp::io::Timer`. |
+| `QueryOptions.timeout` / command inactivity timeout | `QueryOptions::timeout_ms`, `ExecuteOptions::timeout_ms`, `CommandOptions::timeout_ms` | adapted | Enforced around synchronous command reads/writes using `polycpp::io::Timer`; timeout closes the transport and marks the connection disconnected, matching mysql2's fatal timeout behavior. |
 | `charset`, `charsetNumber` | `ConnectionOptions::charset`, `charset_number`, `get_charset_number`, `get_charset_encoding` | adapted | Uses upstream mysql2 charset/collation ids and `iconv-lite` companion encoding support for non-core string conversions. |
 | `ConnectionConfig` | `ConnectionOptions` | adapted | Typed subset of host, port, user, password, database, charset, auth key, SSL, connect attributes, and flags. |
 | `PoolConfig` | `PoolOptions` | adapted | Connection options plus connection limit and wait timeout. |
 | `FieldPacket` / `ColumnDefinition` | `Field` | adapted | Public immutable metadata struct. |
 | text/binary row object | `Row` | adapted | Variant vector plus name lookup; no JS object prototype behavior. |
-| `Query#stream()` object-mode rows | `Connection::query_stream_json(sql)` | adapted | `polycpp::stream::Readable` emits `Buffer` chunks containing newline-delimited JSON rows. Native object-mode row chunks are not meaningful until polycpp streams support arbitrary chunk payloads. |
+| `Query#stream()` object-mode rows | `Connection::query_stream(...)`, `Connection::query_stream_json(...)` | adapted | `query_stream(...)` exposes a typed C++ `RowStream`; `query_stream_json(...)` exposes a `polycpp::stream::Readable` of newline-delimited JSON `Buffer` chunks. Exact Node `Readable` object chunks are not meaningful until polycpp streams support arbitrary chunk payloads. |
 | `ResultSetHeader` / OK packet | `OkPacket` | adapted | Affected rows, insert id, status, warnings, info. |
 | `Types`, `FieldFlags` constants | `polycpp::mysql2::constants::*` | direct | Protocol constants exposed for result interpretation. |
 | `createBinlogStream`, `_registerSlave`, `_binlogDump` | `Connection::register_slave(...)`, `Connection::binlog_dump(...)`, `parse_binlog_event_packet(...)` | adapted | Provides bounded synchronous replication command support. Query, Rotate, FormatDescription, and Xid events are typed; unknown events retain raw bytes. GTID dump and continuous stream abstraction remain deferred. |
@@ -67,8 +68,8 @@ No polycpp HTTP request, response, or header type should be introduced for this 
 - Callback APIs: supported as `std::function` overloads for public connection, pool, and cluster operations; callbacks receive `std::exception_ptr` plus typed result values.
 - Promise APIs: supported through `polycpp::Promise` wrappers for connect, query, execute, prepare, transaction helpers, ping, reset, change-user, end, register-slave/binlog-dump, pool queries, and cluster queries.
 - EventEmitter APIs: supported through typed `polycpp::events::EventEmitter` forwarding on `Connection`, `Pool`, and `PoolCluster`; event names are exposed as constants.
-- Stream APIs: `Query#stream()` is adapted to `Connection::query_stream_json(sql)`, a `polycpp::stream::Readable` of newline-delimited JSON `Buffer` chunks.
+- Stream APIs: `Query#stream()` is adapted to `Connection::query_stream(...)` for typed rows and `Connection::query_stream_json(...)`, a `polycpp::stream::Readable` of newline-delimited JSON `Buffer` chunks.
 - Buffer and binary APIs: mapped to `polycpp::Buffer` for wire packets, binary SQL values, binary result columns, and LOCAL INFILE chunk uploads.
-- URL, timer, process, and filesystem APIs: URI parsing maps to `polycpp::url`; connect deadlines use `polycpp::io::Timer`; pool wait settings use C++ chrono; process APIs are not public; filesystem access is limited to explicit TLS file options and caller-provided LOCAL INFILE data.
+- URL, timer, process, and filesystem APIs: URI parsing maps to `polycpp::url`; connect and command inactivity deadlines use `polycpp::io::Timer`; pool wait settings use C++ chrono; process APIs are not public; filesystem access is limited to explicit TLS file options and caller-provided LOCAL INFILE data.
 - Crypto, compression, TLS, network, and HTTP APIs: auth crypto maps to `polycpp::crypto`; compression maps to `polycpp::zlib`; TCP/TLS maps to `polycpp::io`/`polycpp::ssl`; HTTP is not part of this driver boundary.
-- Unsupported or non-meaningful Node-specific APIs and audit reason: native object-mode row chunks, server mode, GTID replication, continuous binlog object streams, and full row-event decoding remain deferred as documented in `docs/divergences.md`.
+- Unsupported or non-meaningful Node-specific APIs and audit reason: exact Node `Readable` object-mode row chunks, server mode, GTID replication, continuous binlog object streams, and full row-event decoding remain deferred as documented in `docs/divergences.md`.
