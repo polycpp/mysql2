@@ -2,8 +2,8 @@ Configuring TLS
 ===============
 
 Enable TLS with ``ConnectionOptions::ssl.enabled``. The client sends MySQL
-SSLRequest after the initial handshake, upgrades the existing TCP transport to
-TLS, then sends credentials through the encrypted channel.
+SSLRequest after the initial handshake, upgrades the existing TCP or Unix
+socket transport to TLS, then sends credentials through the encrypted channel.
 
 Verified TLS
 ------------
@@ -44,8 +44,9 @@ Client certificate
 Cleartext auth plugin
 ---------------------
 
-``mysql_clear_password`` is accepted only when TLS is active and
-``enable_cleartext_plugin`` is set:
+``mysql_clear_password`` is accepted only when TLS is active or
+``ConnectionOptions::socket_path`` is used, and ``enable_cleartext_plugin`` is
+set:
 
 .. code-block:: cpp
 

@@ -85,13 +85,15 @@ python3 /data/work/libgen/scripts/analyze-upstream-js.py /data/work/lib/mysql2 /
 - Node parity hints consumed: yes; callback, Promise, EventEmitter, stream, Buffer, URL, timer/process, crypto, compression, filesystem, network, and TLS surfaces were reviewed against polycpp APIs
 - security hints consumed: yes; package is security-sensitive because it handles credentials, crypto, network packets, and SQL escaping
 - security-sensitive package: yes
+- polycpp capability snapshot consumed: yes; `/data/repo/polycpp` HEAD `103496f2f50aad410dc63415a7f176182fb1ddd3` was rechecked on April 28, 2026 before closing the Unix/IPC and server TLS gaps.
+- transport/listener capability hints consumed: yes; TCP, Unix/IPC path, cross-transport stream wrappers, and MySQL in-protocol TLS upgrade are mapped to current polycpp IO/TLS primitives.
 
 ### Node.js API usage
 
 - `Buffer`: heavy packet encoding/decoding; mapped to `polycpp::Buffer`.
 - `crypto`: SHA1/SHA256/RSA public encrypt; mapped to `polycpp::crypto`.
-- `net`: TCP client; mapped to `polycpp::io::TcpSocket`.
-- `tls`: mapped to `polycpp::io::TlsContext`, `polycpp::io::TlsStream`, and `polycpp::ssl::X509Cert`.
+- `net`: TCP and Unix socket client/server surfaces; mapped to `polycpp::io::TcpSocket`, `PipeSocket`, `StreamSocket`, `TcpAcceptor`, `PipeAcceptor`, and `StreamAcceptor`.
+- `tls`: mapped to `polycpp::io::TlsContext`, `polycpp::io::TlsStream`, and `polycpp::ssl::X509Cert` for MySQL SSLRequest upgrades.
 - `zlib`: mapped to `polycpp::zlib` for the MySQL compressed packet protocol.
 - `events`: mapped to typed `polycpp::events::EventEmitter` integration on connections, pools, and pool clusters.
 - `stream`: Node object-mode row streams are adapted to typed `RowStream` rows and `polycpp::stream::Readable` byte chunks containing newline-delimited JSON rows.
@@ -106,7 +108,7 @@ python3 /data/work/libgen/scripts/analyze-upstream-js.py /data/work/lib/mysql2 /
 - streams: adapted to typed `RowStream` rows and `polycpp::stream::Readable` newline-delimited JSON `Buffer` chunks.
 - Buffer and binary data: mapped to `polycpp::Buffer` for packets, binary SQL values, result columns, and LOCAL INFILE chunks.
 - URL/timer/process/filesystem APIs: URI parsing uses `polycpp::url`; connect and command inactivity timeouts use `polycpp::io::Timer`; pool wait timeouts use C++ chrono; process APIs are not public; filesystem access is limited to explicit TLS file options and caller-provided LOCAL INFILE buffers.
-- crypto/compression/TLS/network/HTTP APIs: crypto uses `polycpp::crypto`; compression uses `polycpp::zlib`; TCP/TLS uses `polycpp::io` and `polycpp::ssl`; HTTP APIs are not relevant to this protocol driver.
+- crypto/compression/TLS/network/HTTP APIs: crypto uses `polycpp::crypto`; compression uses `polycpp::zlib`; TCP/Unix/TLS uses `polycpp::io` and `polycpp::ssl`; HTTP APIs are not relevant to this protocol driver.
 
 ### JavaScript API usage
 
@@ -125,7 +127,7 @@ python3 /data/work/libgen/scripts/analyze-upstream-js.py /data/work/lib/mysql2 /
 
 - Implement pure MySQL protocol over polycpp TCP sockets.
 - Keep the public C++ API synchronous to make integration tests deterministic.
-- Fail closed on unsupported auth plugins, LOCAL INFILE without an explicit handler, TLS-only cleartext auth, malformed packets, unexpected multi-results in single-result APIs, and server ERR packets.
+- Fail closed on unsupported auth plugins, LOCAL INFILE without an explicit handler, cleartext auth without TLS or `socket_path`, malformed packets, unexpected multi-results in single-result APIs, and server ERR packets.
 - Record deferred features explicitly rather than implying upstream parity.
 - Reuse `iconv-lite` companion for charset decoding and keep upstream mysql2 charset/collation id mappings in this repo.
 - Vendor dependency data only when the upstream package is data-oriented and a runtime dependency would otherwise be required. `aws-ssl-profiles` is handled this way; its generated CA bundle has a third-party MIT notice and must be regenerated when the upstream basis changes.

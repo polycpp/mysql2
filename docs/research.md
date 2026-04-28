@@ -21,7 +21,7 @@ The C++ companion provides a polycpp-native client that preserves the pure proto
 - browser: upstream is Node.js-only; this companion is C++ server/runtime code.
 - node.js: upstream depends on Node Buffer, net, tls, crypto, stream, zlib, timers, process, and EventEmitter. The C++ port replaces those with polycpp or C++ constructs.
 - filesystem: upstream uses filesystem-adjacent behavior for SSL profiles, TLS certificates, and LOCAL INFILE. The C++ port reads TLS certificate/key files only when explicitly configured; LOCAL INFILE is allowed only through an explicit caller-provided buffer handler.
-- network: required. The supported client connects over TCP and can upgrade the connection to TLS; adapted server mode listens over TCP using polycpp IO primitives.
+- network: required. The supported client connects over TCP or Unix socket paths and can upgrade the connection to TLS; adapted server mode listens over TCP or Unix socket paths using polycpp IO primitives and can perform MySQL in-protocol TLS upgrade when `ServerOptions::tls` is configured.
 - crypto: required for password authentication tokens and RSA password encryption.
 - terminal: not required.
 
@@ -104,7 +104,7 @@ The C++ supported slice maps core connection, query, query attributes, prepared 
 - Charset support is broad. The port maps upstream mysql2 charset/collation ids and delegates non-core conversions to the `iconv-lite` companion; handshake charset values still must fit MySQL's one-byte handshake field.
 - Upstream uses dynamic JavaScript values and parser generation; the C++ API must define explicit variant behavior.
 - LOCAL INFILE is a file exfiltration boundary. The port supports it only through an explicit callback policy that returns caller-approved `polycpp::Buffer` chunks.
-- Server mode is a separate protocol adapter surface rather than a client feature. It must use `polycpp::io::TcpAcceptor`, expose auth and command events, and document which response writers are available.
+- Server mode is a separate protocol adapter surface rather than a client feature. It must use `polycpp::io::TcpAcceptor`, `PipeAcceptor`, and `StreamAcceptor` where appropriate, expose auth and command events, and document which response writers are available.
 
 ## Companion repo alignment
 
@@ -119,14 +119,16 @@ The C++ supported slice maps core connection, query, query attributes, prepared 
 
 ## Polycpp ecosystem reuse analysis
 
-- polycpp core paths inspected: `/data/repo/polycpp/include/polycpp/buffer`, `/data/repo/polycpp/include/polycpp/crypto`, `/data/repo/polycpp/include/polycpp/io`, `/data/repo/polycpp/include/polycpp/zlib`, `/data/repo/polycpp/include/polycpp/tls`
-- polycpp core types/functions selected: `polycpp::Buffer`, `polycpp::crypto::createHash`, `polycpp::crypto::publicEncrypt`, `polycpp::io::EventContext`, `polycpp::io::TcpSocket`, `polycpp::io::TcpAcceptor`, `polycpp::io::TlsContext`, `polycpp::io::TlsStream`, and `polycpp::ssl::X509Cert`
+- polycpp core paths inspected: `/data/repo/polycpp/include/polycpp/buffer`, `/data/repo/polycpp/include/polycpp/crypto`, `/data/repo/polycpp/include/polycpp/io`, `/data/repo/polycpp/include/polycpp/net`, `/data/repo/polycpp/include/polycpp/zlib`, `/data/repo/polycpp/include/polycpp/tls`
+- polycpp capability snapshot: `/data/repo/polycpp` HEAD `103496f2f50aad410dc63415a7f176182fb1ddd3` checked on April 28, 2026 with `git -C /data/repo/polycpp rev-parse HEAD` and targeted `rg` searches for `PipeAcceptor`, `PipeSocket`, `StreamSocket`, `StreamAcceptor`, `tls::Server`, `createServer`, `listen(const std::string`, and `NativeListenHandle`.
+- transport/listener capability review: current polycpp provides TCP sockets/listeners, Unix/IPC path sockets/listeners through `PipeSocket`/`PipeAcceptor`, cross-transport `StreamSocket`/`StreamAcceptor`, native-handle adoption, `polycpp::io::TlsStream`, and direct TLS server/listener APIs through `polycpp::tls::Server` / `tls::createServer`. This port uses `StreamSocket`/`StreamAcceptor` for TCP and socket-path parity and uses protocol-internal `TlsStream` upgrade after MySQL SSLRequest rather than a direct `tls::Server`, because MySQL begins in plaintext and upgrades in-band.
+- polycpp core types/functions selected: `polycpp::Buffer`, `polycpp::crypto::createHash`, `polycpp::crypto::publicEncrypt`, `polycpp::io::EventContext`, `polycpp::io::TcpSocket`, `polycpp::io::PipeSocket`, `polycpp::io::StreamSocket`, `polycpp::io::TcpAcceptor`, `polycpp::io::PipeAcceptor`, `polycpp::io::StreamAcceptor`, `polycpp::io::TlsContext`, `polycpp::io::TlsStream`, and `polycpp::ssl::X509Cert`
 - polycpp core types/functions rejected: native HTTP request/response/header types are not relevant to MySQL protocol; native MySQL SDKs are not used.
 - companion libs inspected for reusable APIs: `iconv-lite`, `sequelize`, `jsonwebtoken`, and smaller HTTP utilities.
 - companion libs selected for reuse: `polycpp::iconv_lite` for non-core charset decoding.
 - companion libs rejected or deferred: no separate `long`, `denque`, `named-placeholders`, `sql-escaper`, or `lru.min` companion is required for the supported scope.
 - new local abstractions introduced: `Connection`, `ConnectionOptions`, `SslOptions`, `PreparedStatement`, `StatementCursor`, `QueryAttributes`, `PoolOptions`, `Pool`, `PoolConnection`, `Server`, `ServerConnection`, `ServerOptions`, `ServerHandshakeOptions`, `ServerAuthInfo`, `Field`, `Row`, `QueryResult`, `OkPacket`, and private packet cursor helpers.
-- reuse risks or integration gaps: `polycpp::io` is async-first, so this port wraps it with a synchronous API; connect and per-command inactivity timeout enforcement use `polycpp::io::Timer`. Exact Node `Readable` object-mode row chunks require a future polycpp stream payload model beyond byte/text buffers, so this port exposes a typed `RowStream` and an NDJSON byte stream adapter.
+- reuse risks or integration gaps: `polycpp::io` is async-first, so this port wraps it with a synchronous API; connect and per-command inactivity timeout enforcement use `polycpp::io::Timer`. `PipeSocket` keeps the event loop alive after connect when referenced, so the synchronous `socket_path` client path explicitly unreferences it after a successful connect. Exact Node `Readable` object-mode row chunks require a future polycpp stream payload model beyond byte/text buffers, so this port exposes a typed `RowStream` and an NDJSON byte stream adapter.
 
 ## Node parity surface audit
 
@@ -136,8 +138,8 @@ The C++ supported slice maps core connection, query, query attributes, prepared 
 - stream APIs: upstream object-mode row streams are adapted to typed `RowStream` rows and `polycpp::stream::Readable` byte chunks containing newline-delimited JSON rows because current polycpp streams are byte/text oriented, not arbitrary row object chunks.
 - Buffer and binary APIs: packet buffers, binary parameters, binary result columns, and LOCAL INFILE chunks use `polycpp::Buffer` so byte payloads are not downgraded to `std::string`.
 - URL, timer, process, and filesystem APIs: connection URI parsing uses `polycpp::url`; connect deadlines use `polycpp::io::Timer`; pool wait behavior uses C++ chrono; process globals are not a public C++ surface; filesystem access is limited to explicitly configured TLS certificate/key paths and LOCAL INFILE caller-provided buffers.
-- crypto, compression, TLS, network, and HTTP APIs: auth tokens and RSA encryption use `polycpp::crypto`; compression uses `polycpp::zlib`; client TCP/TLS transport uses `polycpp::io` and `polycpp::ssl`; server TCP listening uses `polycpp::io::TcpAcceptor`; HTTP APIs are not relevant to the MySQL protocol.
-- unsupported Node-specific APIs and audit reason: exact Node `Readable` object-mode row chunks, Unix socket server listen overloads, TLS server mode, and exact Node `createBinlogStream` object/EventEmitter shape are deferred or adapted because they require additional protocol families or polycpp stream/object primitives.
+- crypto, compression, TLS, network, and HTTP APIs: auth tokens and RSA encryption use `polycpp::crypto`; compression uses `polycpp::zlib`; client TCP/Unix/TLS transport uses `polycpp::io` and `polycpp::ssl`; server TCP/Unix listening uses `polycpp::io::TcpAcceptor`, `PipeAcceptor`, and `StreamAcceptor`; MySQL in-protocol server TLS uses server-side `polycpp::io::TlsStream`; HTTP APIs are not relevant to the MySQL protocol.
+- unsupported Node-specific APIs and audit reason: exact Node `Readable` object-mode row chunks and exact Node `createBinlogStream` object/EventEmitter shape are deferred or adapted because they require object-mode stream/event shapes that are not meaningful as direct C++ API copies.
 
 ## External SDK and native driver strategy
 
@@ -159,12 +161,12 @@ The C++ supported slice maps core connection, query, query attributes, prepared 
 
 - security-sensitive behavior: password authentication, RSA password encryption, SQL escaping, LOCAL INFILE, TLS, and server-controlled auth plugin names.
 - trust boundary: server packets, SQL/value input from callers, credentials, RSA public keys, and future file streams are untrusted boundaries.
-- supported protocol or algorithm matrix: MySQL protocol v10 client handshake; adapted server handshake; optional client TLS upgrade; compressed packet protocol; `mysql_native_password`; `caching_sha2_password` fast auth plus TLS/RSA full auth; `sha256_password` TLS/RSA auth; TLS-gated `mysql_clear_password`; text protocol query results; prepared statement binary protocol; server text/binary result packet writing; explicit LOCAL INFILE handler; classic and GTID binlog dump commands; table-map-aware binlog row parsing; multi-result draining.
-- unsupported behavior and fail-closed policy: `mysql_clear_password` without TLS, LOCAL INFILE without an explicit handler, unsupported auth plugins, malformed packets, and unexpected multiple result sets in single-result APIs throw `polycpp::mysql2::Error`.
+- supported protocol or algorithm matrix: MySQL protocol v10 client handshake over TCP or Unix socket paths; adapted server handshake over TCP or Unix socket paths; optional client TLS upgrade; optional MySQL in-protocol server TLS upgrade; compressed packet protocol; `mysql_native_password`; `caching_sha2_password` fast auth plus TLS/socket-path/RSA full auth; `sha256_password` TLS/socket-path/RSA auth; TLS-or-socket-path-gated `mysql_clear_password`; text protocol query results; prepared statement binary protocol; server text/binary result packet writing; explicit LOCAL INFILE handler; classic and GTID binlog dump commands; table-map-aware binlog row parsing; multi-result draining.
+- unsupported behavior and fail-closed policy: `mysql_clear_password` without TLS or `socket_path`, LOCAL INFILE without an explicit handler, unsupported auth plugins, malformed packets, and unexpected multiple result sets in single-result APIs throw `polycpp::mysql2::Error`.
 - result-set/framing drain policy, if protocol client: single-result APIs drain additional result sets before throwing; `query_all`/`execute_all` expose all result sets; bounded `binlog_dump` closes the connection when `max_events` stops a live replication command stream; `binlog_dump_each` is callback-controlled and closes when the callback returns false.
 - binary payload type-mapping policy, if protocol client: wire packets, binary parameters, binary result columns, LOCAL INFILE chunks, and binlog raw event/row slices use `polycpp::Buffer`; scalar row values use `Value`; TIME2/DATETIME2/TIMESTAMP2 binlog values remain raw `Buffer` because `Value` has no temporal binary type.
 - stateful parser/session-state policy, if protocol client/server: connection state owns handshake capabilities, sequence ids, compression/TLS flags, prepared statement cache, cursor status, and binlog table-map state; `BinlogParser` exposes explicit table-map state for callers that parse replication packets outside a connection.
-- server/listener response writer matrix, if protocol server surface exists: adapted server mode supports OK, ERR, EOF, column definitions, text rows/results, binary rows/results, prepared-statement OK metadata, raw packet observation, auth acceptance, and auth rejection ERR packets; it does not implement a SQL engine, Unix socket listening, or TLS server mode.
+- server/listener response writer matrix, if protocol server surface exists: adapted server mode supports TCP and Unix socket listening, optional MySQL TLS upgrade, OK, ERR, EOF, column definitions, text rows/results, binary rows/results, prepared-statement OK metadata, raw packet observation, auth acceptance, and auth rejection ERR packets; it does not implement a SQL engine.
 - key, secret, credential, or user-controlled input handling: password tokens are computed using polycpp crypto; SQL helpers escape string and buffer values; raw SQL requires explicit `raw()` use.
 - misuse cases that must be tested: auth plugin downgrade attempts, malformed length-coded packets, missing named placeholder values, SQL escaping edge bytes, server ERR packets, and LOCAL INFILE requests without an explicit handler.
 
@@ -186,7 +188,7 @@ The C++ supported slice maps core connection, query, query attributes, prepared 
 - Handshake and auth plugins needed by MariaDB and MySQL 8.
 - `COM_QUERY` text protocol.
 - Prepared statement binary protocol.
-- TLS transport upgrade after SSLRequest.
+- TLS transport upgrade after SSLRequest on client connections and configured server connections.
 - OK/ERR/resultset/column/text-row parsing.
 - Binary row parsing.
 - SQL escaping and placeholder formatting.
@@ -196,14 +198,14 @@ The C++ supported slice maps core connection, query, query attributes, prepared 
 
 - Exact Node `Readable` object-mode row chunks; current C++ adapters expose typed `RowStream` rows and newline-delimited JSON `Buffer` chunks.
 - Exact Node `createBinlogStream` object/EventEmitter shape; current C++ adapters expose bounded vector reads, callback-controlled reads, GTID dump options, and explicit `BinlogParser` state.
-- Unix socket server listen overloads and TLS server mode.
+- No additional transport/server primitives are deferred after the current polycpp IPC and TLS-server update; only API shapes listed below remain adapted or deferred.
 
 ## v0 scope
 
 - port version: 0.1.0
-- supported APIs: `ConnectionOptions`, `SslOptions`, `TraceEvent`, `CommandOptions`, `QueryOptions`, `ExecuteOptions`, `Connection`, `PreparedStatement`, `StatementCursor`, `QueryAttributes`, `RowStream`, `RegisterSlaveOptions`, `BinlogDumpOptions`, `BinlogEvent`, `BinlogParser`, `BinlogGtidSource`, `PoolOptions`, `Pool`, `PoolConnection`, `PoolCluster`, `PoolNamespace`, `ServerOptions`, `ServerHandshakeOptions`, `ServerAuthInfo`, `ServerStatementExecuteInfo`, `Server`, `ServerConnection`, `create_connection`, `create_pool`, `create_pool_cluster`, `create_server`, `query`, `query_all`, `execute`, `execute_all`, `execute_cursor`, `fetch`, `register_slave`, `binlog_dump`, `binlog_dump_each`, `parse_binlog_event_packet`, `parse_gtid_set`, `prepare`, `close_statement`, `begin_transaction`, `commit`, `rollback`, `change_user`, `reset`, `ping`, `end`, `destroy`, `pause`, `resume`, callback overloads, `polycpp::Promise` wrappers, typed `EventEmitter` events, server protocol events, trace events, `query_stream`, `query_stream_json`, connection URI parsing, command timeouts, compressed protocol, LOCAL INFILE handler, charset helpers, SSL profile helpers, parser-cache compatibility hooks, `escape`, `escape_id`, `format`, `format_named`, `raw`
-- unsupported APIs: Unix socket server listen overloads, TLS server mode, exact Node `createBinlogStream` object/EventEmitter shape, exact Node `Readable` object-mode row chunks
+- supported APIs: `ConnectionOptions`, `ConnectionOptions::socket_path`, `SslOptions`, `TraceEvent`, `CommandOptions`, `QueryOptions`, `ExecuteOptions`, `Connection`, `PreparedStatement`, `StatementCursor`, `QueryAttributes`, `RowStream`, `RegisterSlaveOptions`, `BinlogDumpOptions`, `BinlogEvent`, `BinlogParser`, `BinlogGtidSource`, `PoolOptions`, `Pool`, `PoolConnection`, `PoolCluster`, `PoolNamespace`, `ServerOptions`, `ServerOptions::socket_path`, `ServerTlsOptions`, `ServerHandshakeOptions`, `ServerAuthInfo`, `ServerStatementExecuteInfo`, `Server`, `Server::listen(path)`, `ServerConnection`, `create_connection`, `create_pool`, `create_pool_cluster`, `create_server`, `query`, `query_all`, `execute`, `execute_all`, `execute_cursor`, `fetch`, `register_slave`, `binlog_dump`, `binlog_dump_each`, `parse_binlog_event_packet`, `parse_gtid_set`, `prepare`, `close_statement`, `begin_transaction`, `commit`, `rollback`, `change_user`, `reset`, `ping`, `end`, `destroy`, `pause`, `resume`, callback overloads, `polycpp::Promise` wrappers, typed `EventEmitter` events, server protocol events, trace events, `query_stream`, `query_stream_json`, connection URI parsing, command timeouts, compressed protocol, LOCAL INFILE handler, charset helpers, SSL profile helpers, parser-cache compatibility hooks, `escape`, `escape_id`, `format`, `format_named`, `raw`
+- unsupported APIs: exact Node `createBinlogStream` object/EventEmitter shape, exact Node `Readable` object-mode row chunks
 - dependency plan: reuse `iconv-lite`; replace `long` with C++ integer types; replace `denque` with standard containers and a synchronous pool; implement SQL escaping and named placeholders locally; implement statement cache in-repo; generate AWS RDS CA PEM data from `aws-ssl-profiles`; expose generated JS parser controls as no-op audit hooks
-- polycpp modules to use: `Buffer`, `Promise`, `events`, `stream`, `url`, `zlib`, `crypto`, `io`, `TcpAcceptor`, `ssl`, TLS, and the `iconv-lite` companion
+- polycpp modules to use: `Buffer`, `Promise`, `events`, `stream`, `url`, `zlib`, `crypto`, `io`, `TcpSocket`, `PipeSocket`, `StreamSocket`, `TcpAcceptor`, `PipeAcceptor`, `StreamAcceptor`, `ssl`, TLS, and the `iconv-lite` companion
 - missing polycpp primitives: native typed object-mode stream chunks
 - versioning note: port versioning is independent from upstream npm versioning; upstream basis is recorded separately and does not imply parity

@@ -17,9 +17,10 @@ Compatibility note:
 Implemented:
 
 - TCP connection using `polycpp::io::TcpSocket`.
+- Unix socket path connection using `ConnectionOptions::socket_path` and `polycpp::io::PipeSocket`.
 - Optional TLS transport upgrade using `polycpp::io::TlsStream` after MySQL SSLRequest.
 - MySQL protocol v10 handshake.
-- `mysql_native_password`, `caching_sha2_password`, `sha256_password`, and TLS-gated `mysql_clear_password` auth behavior.
+- `mysql_native_password`, `caching_sha2_password`, `sha256_password`, and TLS-or-socket-path-gated `mysql_clear_password` auth behavior.
 - `COM_QUERY` text protocol for result sets and OK packets.
 - Prepared statements using `COM_STMT_PREPARE`, `COM_STMT_EXECUTE`, binary rows, and `COM_STMT_CLOSE`.
 - Prepared-statement execution cache with explicit `close_statement(sql)` / `close_statement(statement)` invalidation.
@@ -40,13 +41,13 @@ Implemented:
 - Parser-cache compatibility controls as no-op/static-parser audit hooks.
 - Bounded `COM_REGISTER_SLAVE`, `COM_BINLOG_DUMP`, and `COM_BINLOG_DUMP_GTID` support with typed parsing for Query, Rotate, FormatDescription, Xid, GTID, PreviousGTIDs, TableMap, and common row events, plus raw payload retention for audit and unsupported event types.
 - `BinlogParser` for stateful table-map-aware row decoding and `Connection::binlog_dump_each(...)` for callback-controlled replication reads without accumulating an unbounded vector.
-- Adapted server protocol mode with `create_server`, `Server`, `ServerConnection`, server-side protocol handshake/auth callback, typed query/ping/quit/init-db/field-list/statement command events, statement-prepare OK writers, and OK/ERR/text/binary result response writers.
+- Adapted server protocol mode with `create_server`, `Server`, `ServerConnection`, TCP or Unix socket listening, optional MySQL in-protocol TLS upgrade, server-side protocol handshake/auth callback, typed query/ping/quit/init-db/field-list/statement command events, statement-prepare OK writers, and OK/ERR/text/binary result response writers.
 - Optional real MariaDB/MySQL e2e tests controlled by `MYSQL2_TEST_*` environment variables.
 
 Deferred:
 
 - Exact Node `Readable` object-mode row chunks. `query_stream(...)` provides a typed C++ row iterator and `query_stream_json()` exposes newline-delimited JSON `Buffer` chunks because polycpp streams currently emit byte/text chunks, not arbitrary row objects.
-- Unix socket server listen overloads and TLS server mode. `polycpp::net`/`polycpp::io` currently provide TCP server primitives, while the mysql2 server TLS upgrade path requires a separate server-side TLS design.
+- Exact Node `createBinlogStream` EventEmitter/object-stream shape. The C++ port exposes bounded vector reads, callback-controlled reads, and explicit parser state instead.
 
 Known divergences:
 
@@ -54,7 +55,7 @@ Known divergences:
 - Native MySQL/MariaDB client SDKs are intentionally not linked.
 - Node diagnostic channels are adapted to typed `event::Trace` events.
 - Node object-mode row streaming is adapted to typed `RowStream` rows plus JSON line byte streams for auditability and `polycpp::stream` compatibility.
-- Server mode is adapted to a TCP-only C++ server object. It supports handshake/auth inspection, command dispatch, packet observation, statement prepare OK packets, and OK/ERR/text/binary result writers; Unix socket listen overloads, TLS server mode, and a full SQL engine are intentionally not implied.
+- Server mode is adapted to a C++ server object. It supports TCP and Unix socket listening, MySQL in-protocol TLS upgrade when configured, handshake/auth inspection, command dispatch, packet observation, statement prepare OK packets, and OK/ERR/text/binary result writers; a full SQL engine is intentionally not implied.
 - Parser cache controls are compatibility no-ops because C++ uses static parsers.
 - Query attributes use `std::unordered_map`, so attribute wire order is not a public contract.
 - Bounded binlog dump closes the connection if `max_events` is reached before EOF, because the connection is otherwise left in the replication command stream. Use `binlog_dump_each(...)` when the caller wants callback-controlled continuous consumption.

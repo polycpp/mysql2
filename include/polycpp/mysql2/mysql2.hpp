@@ -54,6 +54,7 @@ struct SslOptions {
 struct ConnectionOptions {
     std::string host = "127.0.0.1";
     uint16_t port = 3306;
+    std::string socket_path;
     std::string user;
     std::string password;
     std::string database;
@@ -359,12 +360,23 @@ struct ServerHandshakeOptions {
     ServerAuthCallback auth_callback;
 };
 
+struct ServerTlsOptions {
+    bool enabled = false;
+    std::string cert_pem;
+    std::string cert_file;
+    std::string key_pem;
+    std::string key_file;
+    std::string key_passphrase;
+};
+
 struct ServerOptions {
     std::string host = "127.0.0.1";
     uint16_t port = 0;
+    std::string socket_path;
     int backlog = 128;
     bool auto_handshake = true;
     ServerHandshakeOptions handshake;
+    ServerTlsOptions tls;
 };
 
 using VoidCallback = std::function<void(std::exception_ptr)>;
@@ -594,6 +606,7 @@ public:
     void listen();
     void listen(uint16_t port);
     void listen(uint16_t port, const std::string& host);
+    void listen(const std::string& path);
     void close();
 
     bool listening() const noexcept;

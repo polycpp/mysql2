@@ -5,6 +5,10 @@
 #include <polycpp/crypto.hpp>
 #include <polycpp/iconv_lite/iconv_lite.hpp>
 #include <polycpp/io/event_context.hpp>
+#include <polycpp/io/pipe_acceptor.hpp>
+#include <polycpp/io/pipe_socket.hpp>
+#include <polycpp/io/stream_acceptor.hpp>
+#include <polycpp/io/stream_socket.hpp>
 #include <polycpp/io/tcp_acceptor.hpp>
 #include <polycpp/io/tcp_socket.hpp>
 #include <polycpp/io/timer.hpp>
@@ -425,7 +429,7 @@ public:
         if (Buffer::isEncoding(encoding)) {
             return buffer.toString(encoding);
         }
-        if (iconv_lite::encoding_exists(encoding)) {
+        if (iconv_lite::encodingExists(encoding)) {
             return iconv_lite::decode(buffer, encoding);
         }
         return buffer.toString("utf8");
@@ -535,7 +539,7 @@ Buffer encode_string_for_mysql(std::string_view value, const std::string& encodi
     if (Buffer::isEncoding(encoding)) {
         return Buffer::from(text, encoding);
     }
-    if (iconv_lite::encoding_exists(encoding)) {
+    if (iconv_lite::encodingExists(encoding)) {
         return iconv_lite::encode(text, encoding);
     }
     return Buffer::from(text);
@@ -1555,6 +1559,45 @@ ServerAuthInfo parse_server_handshake_response(const Buffer& payload,
         }
     }
     return info;
+}
+
+uint32_t read_u32_le_at(const Buffer& payload, std::size_t offset) {
+    if (payload.length() < offset + 4) {
+        throw Error("packet is too short for uint32");
+    }
+    return static_cast<uint32_t>(payload[offset]) |
+           (static_cast<uint32_t>(payload[offset + 1]) << 8) |
+           (static_cast<uint32_t>(payload[offset + 2]) << 16) |
+           (static_cast<uint32_t>(payload[offset + 3]) << 24);
+}
+
+bool is_ssl_request_shape(const Buffer& payload) {
+    if (payload.length() != 32) {
+        return false;
+    }
+    const auto client_flags = read_u32_le_at(payload, 0);
+    return (client_flags & client_flag::SSL) != 0;
+}
+
+bool is_server_ssl_request_packet(const Buffer& payload, uint32_t server_flags) {
+    return is_ssl_request_shape(payload) && (server_flags & client_flag::SSL) != 0;
+}
+
+bool has_server_tls_material(const ServerTlsOptions& options) {
+    return (!options.cert_pem.empty() || !options.cert_file.empty()) &&
+           (!options.key_pem.empty() || !options.key_file.empty());
+}
+
+void drain_ready_handlers(EventContext& ctx) noexcept {
+    try {
+        ctx.restart();
+        for (std::size_t i = 0; i < 1024; ++i) {
+            if (ctx.poll() == 0) {
+                break;
+            }
+        }
+    } catch (...) {
+    }
 }
 
 void append_packet_bytes(std::vector<uint8_t>& out, const Buffer& payload, uint8_t& sequence_id) {
@@ -3415,14 +3458,16 @@ public:
         }
         connect_socket();
         std::error_code ec;
-        socket_.setNoDelay(true, ec);
-        if (ec) {
-            throw Error("failed to set TCP_NODELAY: " + ec.message());
-        }
-        if (options_.enable_keep_alive) {
-            socket_.setKeepAlive(true, ec);
+        if (socket_.isTcp()) {
+            socket_.setNoDelay(true, ec);
             if (ec) {
-                throw Error("failed to set TCP keepalive: " + ec.message());
+                throw Error("failed to set TCP_NODELAY: " + ec.message());
+            }
+            if (options_.enable_keep_alive) {
+                socket_.setKeepAlive(true, ec);
+                if (ec) {
+                    throw Error("failed to set TCP keepalive: " + ec.message());
+                }
             }
         }
 
@@ -3447,7 +3492,7 @@ public:
         }
 
         const auto scramble = handshake_.scramble();
-        const auto plugin = choose_auth_plugin(handshake_.auth_plugin_name, tls_active_, options_.enable_cleartext_plugin);
+        const auto plugin = choose_auth_plugin(handshake_.auth_plugin_name, secure_transport(), options_.enable_cleartext_plugin);
         auto token = calculate_auth_token(plugin, options_.password, scramble);
         write_packet(build_handshake_response(options_, handshake_, client_flags, plugin, token), tls_active_ ? 2 : 1);
         handle_auth_result(plugin, scramble, tls_active_ ? 3 : 2);
@@ -3855,6 +3900,7 @@ public:
         ensure_connected();
         options.host = options_.host;
         options.port = options_.port;
+        options.socket_path = options_.socket_path;
         options.ssl = options_.ssl;
         options.compress = options_.compress;
         if (options.charset.empty()) {
@@ -3876,7 +3922,7 @@ public:
             options.connect_attributes = options_.connect_attributes;
         }
         const auto scramble = handshake_.scramble();
-        const auto plugin = choose_auth_plugin(handshake_.auth_plugin_name, tls_active_, options.enable_cleartext_plugin || options_.enable_cleartext_plugin);
+        const auto plugin = choose_auth_plugin(handshake_.auth_plugin_name, secure_transport(), options.enable_cleartext_plugin || options_.enable_cleartext_plugin);
         const auto token = calculate_auth_token(plugin, options.password, scramble);
         write_packet(build_change_user_payload(options, client_flags_, plugin, token), 0);
         handle_auth_result(plugin, scramble, 1);
@@ -3991,8 +4037,8 @@ public:
         event.sql = sql;
         event.database = options_.database;
         event.user = options_.user;
-        event.server_address = options_.host;
-        event.server_port = options_.port;
+        event.server_address = options_.socket_path.empty() ? options_.host : options_.socket_path;
+        event.server_port = options_.socket_path.empty() ? options_.port : 0;
         event.duration = std::chrono::duration_cast<std::chrono::microseconds>(
             std::chrono::steady_clock::now() - start);
         event.error = error;
@@ -4026,8 +4072,12 @@ private:
         std::error_code ignored;
         if (tls_stream_) {
             tls_stream_->close(ignored);
+            tls_stream_.reset();
+            tls_context_.reset();
+            socket_ = io::StreamSocket(ctx_);
+        } else {
+            socket_.close(ignored);
         }
-        socket_.close(ignored);
         connected_ = false;
         tls_active_ = false;
         compression_active_ = false;
@@ -4043,6 +4093,7 @@ private:
             if (!error && !completed) {
                 timed_out = true;
                 abort_transport_for_timeout();
+                ctx_.stop();
             }
         });
         return timer;
@@ -4061,13 +4112,29 @@ private:
         bool timed_out = false;
         io::Timer timer(ctx_);
 
-        socket_.asyncConnect(options_.host, options_.port, [&](std::error_code error) {
+        if (!options_.socket_path.empty()) {
+            socket_ = io::StreamSocket(io::PipeSocket(ctx_));
+        } else {
+            socket_ = io::StreamSocket(ctx_);
+        }
+
+        auto on_connect = [&](std::error_code error) {
             completed = true;
             ec = error;
+            if (!error && !options_.socket_path.empty()) {
+                socket_.unref();
+            }
             if (options_.connect_timeout_ms != 0) {
                 timer.cancel();
             }
-        });
+            ctx_.stop();
+        };
+
+        if (!options_.socket_path.empty()) {
+            socket_.pipe()->asyncConnect(options_.socket_path, on_connect);
+        } else {
+            socket_.tcp()->asyncConnect(options_.host, options_.port, on_connect);
+        }
 
         if (options_.connect_timeout_ms != 0) {
             timer.expiresAfter(std::chrono::milliseconds(options_.connect_timeout_ms));
@@ -4076,6 +4143,7 @@ private:
                     timed_out = true;
                     std::error_code ignored;
                     socket_.close(ignored);
+                    ctx_.stop();
                 }
             });
         }
@@ -4133,13 +4201,16 @@ private:
         tls_context_ = std::make_unique<io::TlsContext>(io::TlsContext::Method::kTLSClient);
         configure_tls_context(*tls_context_);
         tls_stream_ = std::make_unique<io::TlsStream>(std::move(socket_), *tls_context_);
-        if (!looks_like_ip_address(options_.host)) {
+        if (options_.socket_path.empty() && !looks_like_ip_address(options_.host)) {
             tls_stream_->sslConnection().setHostname(options_.host);
         }
 
         ctx_.restart();
         std::error_code ec;
-        tls_stream_->asyncHandshake(false, [&](std::error_code error) { ec = error; });
+        tls_stream_->asyncHandshake(false, [&](std::error_code error) {
+            ec = error;
+            ctx_.stop();
+        });
         ctx_.run();
         if (ec) {
             throw Error("TLS handshake failed: " + ec.message());
@@ -4151,7 +4222,7 @@ private:
                 throw Error("TLS certificate verification failed: " +
                             ssl::SslConnection::verifyErrorString(verify_result));
             }
-            if (options_.ssl.verify_identity && !looks_like_ip_address(options_.host)) {
+            if (options_.socket_path.empty() && options_.ssl.verify_identity && !looks_like_ip_address(options_.host)) {
                 auto* peer = tls_stream_->sslConnection().peerCertificateHandle();
                 if (peer == nullptr) {
                     throw Error("TLS peer did not provide a certificate");
@@ -4160,7 +4231,7 @@ private:
                 if (!cert.checkHost(options_.host)) {
                     throw Error("TLS certificate host mismatch for " + options_.host);
                 }
-            } else if (options_.ssl.verify_identity && looks_like_ip_address(options_.host)) {
+            } else if (options_.socket_path.empty() && options_.ssl.verify_identity && looks_like_ip_address(options_.host)) {
                 auto* peer = tls_stream_->sslConnection().peerCertificateHandle();
                 if (peer == nullptr) {
                     throw Error("TLS peer did not provide a certificate");
@@ -4174,6 +4245,10 @@ private:
         tls_active_ = true;
     }
 
+    bool secure_transport() const noexcept {
+        return tls_active_ || !options_.socket_path.empty();
+    }
+
     bool transport_is_open() const noexcept {
         return tls_stream_ ? tls_stream_->isOpen() : socket_.isOpen();
     }
@@ -4183,17 +4258,23 @@ private:
         if (tls_stream_) {
             try {
                 ctx_.restart();
-                tls_stream_->asyncShutdown([&](std::error_code error) { ec = error; });
+                tls_stream_->asyncShutdown([&](std::error_code error) {
+                    ec = error;
+                    ctx_.stop();
+                });
                 ctx_.run();
             } catch (...) {
             }
             tls_stream_->close(ec);
             tls_stream_.reset();
             tls_context_.reset();
+            socket_ = io::StreamSocket(ctx_);
+            drain_ready_handlers(ctx_);
             return;
         }
         socket_.shutdown(2, ec);
         socket_.close(ec);
+        drain_ready_handlers(ctx_);
     }
 
     std::vector<uint8_t> read_exact(std::size_t length) {
@@ -4216,6 +4297,7 @@ private:
                         std::error_code ignored;
                         timer->cancel(ignored);
                     }
+                    ctx_.stop();
                 });
             } else {
                 socket_.asyncRead(data.data() + offset, remaining, [&](std::error_code error, std::size_t n) {
@@ -4226,6 +4308,7 @@ private:
                         std::error_code ignored;
                         timer->cancel(ignored);
                     }
+                    ctx_.stop();
                 });
             }
             ctx_.run();
@@ -4261,6 +4344,7 @@ private:
                         std::error_code ignored;
                         timer->cancel(ignored);
                     }
+                    ctx_.stop();
                 });
             } else {
                 socket_.asyncWrite(data + offset, length - offset, [&](std::error_code error, std::size_t n) {
@@ -4271,6 +4355,7 @@ private:
                         std::error_code ignored;
                         timer->cancel(ignored);
                     }
+                    ctx_.stop();
                 });
             }
             ctx_.run();
@@ -4467,7 +4552,7 @@ private:
                     if (data.length() == 1 && data[0] == 4) {
                         if (options_.password.empty()) {
                             write_packet(Buffer{}, next_client_sequence);
-                        } else if (tls_active_) {
+                        } else if (secure_transport()) {
                             std::string clear = options_.password;
                             clear.push_back('\0');
                             write_packet(buffer_from_string(clear), next_client_sequence);
@@ -4512,7 +4597,7 @@ private:
             if (options_.password.empty()) {
                 return Buffer{};
             }
-            if (tls_active_) {
+            if (secure_transport()) {
                 std::string clear = options_.password;
                 clear.push_back('\0');
                 return buffer_from_string(clear);
@@ -4523,8 +4608,8 @@ private:
             return Buffer::from({0x01});
         }
         if (plugin == "mysql_clear_password") {
-            if (!tls_active_ || !options_.enable_cleartext_plugin) {
-                throw Error("mysql_clear_password requires TLS and enable_cleartext_plugin");
+            if (!secure_transport() || !options_.enable_cleartext_plugin) {
+                throw Error("mysql_clear_password requires TLS or socket_path and enable_cleartext_plugin");
             }
             std::string clear = options_.password;
             clear.push_back('\0');
@@ -4640,7 +4725,7 @@ private:
     ConnectionOptions options_;
     events::EventEmitter emitter_;
     EventContext ctx_;
-    io::TcpSocket socket_;
+    io::StreamSocket socket_;
     std::unique_ptr<io::TlsContext> tls_context_;
     std::unique_ptr<io::TlsStream> tls_stream_;
     bool connected_ = false;
@@ -4984,6 +5069,7 @@ ConnectionOptions parse_connection_uri(const std::string& uri) {
         else if (key == "enableKeepAlive" || key == "enable_keep_alive") options.enable_keep_alive = parse_bool_option(value);
         else if (key == "enableCleartextPlugin" || key == "enable_cleartext_plugin") options.enable_cleartext_plugin = parse_bool_option(value);
         else if (key == "compress") options.compress = parse_bool_option(value);
+        else if (key == "socketPath" || key == "socket_path") options.socket_path = value;
         else if (key == "ssl") options.ssl.enabled = parse_bool_option(value);
         else if (key == "sslProfile" || key == "ssl.profile") {
             options.ssl.enabled = true;
@@ -5870,8 +5956,10 @@ uint32_t Connection::server_capability_flags() const noexcept { return impl_->se
 
 class ServerConnection::Impl : public std::enable_shared_from_this<ServerConnection::Impl> {
 public:
-    Impl(io::TcpSocket socket, EventContext& ctx)
-        : ctx_(ctx), socket_(std::move(socket)) {}
+    Impl(io::StreamSocket socket, EventContext& ctx, ServerTlsOptions tls_options)
+        : ctx_(ctx), socket_(std::move(socket)), tls_options_(std::move(tls_options)) {
+        capture_remote_endpoint();
+    }
 
     ~Impl() {
         close();
@@ -5889,6 +5977,11 @@ public:
         handshake_options_ = std::move(options);
         if (handshake_options_.capability_flags == 0) {
             handshake_options_.capability_flags = default_server_capability_flags();
+        }
+        if (tls_options_.enabled) {
+            handshake_options_.capability_flags |= client_flag::SSL;
+        } else {
+            handshake_options_.capability_flags &= ~client_flag::SSL;
         }
         if (handshake_options_.auth_plugin_name.empty()) {
             handshake_options_.auth_plugin_name = "mysql_native_password";
@@ -5965,17 +6058,31 @@ public:
     void close() noexcept {
         connected_ = false;
         std::error_code ec;
+        if (tls_stream_) {
+            tls_stream_->close(ec);
+            tls_stream_.reset();
+            tls_context_.reset();
+            tls_active_ = false;
+            socket_ = io::StreamSocket(ctx_);
+            return;
+        }
         socket_.shutdown(2, ec);
         socket_.close(ec);
     }
 
-    bool connected() const noexcept { return connected_ && socket_.isOpen(); }
+    bool connected() const noexcept {
+        return connected_ && (tls_stream_ ? tls_stream_->isOpen() : socket_.isOpen());
+    }
 
     const ServerAuthInfo& auth_info() const noexcept { return auth_info_; }
 
-    std::string remote_address() const { return socket_.remoteAddress(); }
+    std::string remote_address() const {
+        return remote_address_;
+    }
 
-    uint16_t remote_port() const { return socket_.remotePort(); }
+    uint16_t remote_port() const {
+        return remote_port_;
+    }
 
 private:
     struct Frame {
@@ -5995,6 +6102,18 @@ private:
         }
     }
 
+    void capture_remote_endpoint() {
+        if (const auto* tcp = socket_.tcp()) {
+            remote_address_ = tcp->remoteAddress();
+            remote_port_ = tcp->remotePort();
+            return;
+        }
+        if (const auto* pipe = socket_.pipe()) {
+            remote_address_ = pipe->remotePath();
+            remote_port_ = 0;
+        }
+    }
+
     void fail(const Error& error) {
         emit_error(error);
         close();
@@ -6010,7 +6129,7 @@ private:
     void read_packet_part(std::shared_ptr<ReadState> state) {
         auto self = shared_from_this();
         auto header = std::make_shared<std::array<uint8_t, 4>>();
-        socket_.asyncRead(header->data(), header->size(), [self, state, header](std::error_code ec, std::size_t n) {
+        async_read_exact(header->data(), header->size(), [self, state, header](std::error_code ec, std::size_t n) {
             if (ec) {
                 self->close();
                 return;
@@ -6031,7 +6150,7 @@ private:
                 self->handle_packet(Frame{state->first_sequence, Buffer::concat(state->parts)});
                 return;
             }
-            self->socket_.asyncRead(body->data(), body->size(), [self, state, body, length](std::error_code body_ec, std::size_t body_n) {
+            self->async_read_exact(body->data(), body->size(), [self, state, body, length](std::error_code body_ec, std::size_t body_n) {
                 if (body_ec) {
                     self->close();
                     return;
@@ -6066,6 +6185,14 @@ private:
 
     void handle_handshake_response(const Frame& frame) {
         next_response_sequence_ = static_cast<uint8_t>(frame.sequence_id + 1);
+        if (!tls_active_ && is_server_ssl_request_packet(frame.payload, handshake_options_.capability_flags)) {
+            upgrade_to_tls_server();
+            return;
+        }
+        if (!tls_active_ && is_ssl_request_shape(frame.payload)) {
+            fail(Error("client requested TLS but mysql2 server did not advertise TLS support"));
+            return;
+        }
         auth_info_ = parse_server_handshake_response(frame.payload,
                                                      handshake_options_.capability_flags,
                                                      remote_address(),
@@ -6207,13 +6334,110 @@ private:
         write_raw(std::move(packet));
     }
 
+    void async_read_exact(void* data,
+                          std::size_t length,
+                          std::function<void(std::error_code, std::size_t)> handler) {
+        if (!tls_stream_) {
+            socket_.asyncRead(data, length, std::move(handler));
+            return;
+        }
+
+        auto self = shared_from_this();
+        auto offset = std::make_shared<std::size_t>(0);
+        auto done = std::make_shared<std::function<void(std::error_code, std::size_t)>>(std::move(handler));
+        auto pump = std::make_shared<std::function<void()>>();
+        *pump = [self, data, length, offset, done, pump]() {
+            auto* bytes = static_cast<uint8_t*>(data);
+            self->tls_stream_->asyncReadSome(bytes + *offset, length - *offset,
+                [self, length, offset, done, pump](std::error_code ec, std::size_t n) {
+                    if (ec) {
+                        (*done)(ec, *offset);
+                        return;
+                    }
+                    if (n == 0) {
+                        (*done)(std::make_error_code(std::errc::connection_reset), *offset);
+                        return;
+                    }
+                    *offset += n;
+                    if (*offset >= length) {
+                        (*done)({}, *offset);
+                        return;
+                    }
+                    (*pump)();
+                });
+        };
+        (*pump)();
+    }
+
+    void configure_server_tls_context(io::TlsContext& tls_context) {
+        if (!has_server_tls_material(tls_options_)) {
+            throw Error("mysql2 server TLS requires certificate and private key material");
+        }
+        tls_context.setDefaultOptions();
+        tls_context.setVerifyMode(0);
+        if (!tls_options_.key_passphrase.empty()) {
+            const auto passphrase = tls_options_.key_passphrase;
+            tls_context.setPasswordCallback([passphrase]() { return passphrase; });
+        }
+        if (!tls_options_.cert_pem.empty()) {
+            tls_context.useCertificateChainPem(tls_options_.cert_pem);
+        }
+        if (!tls_options_.cert_file.empty()) {
+            tls_context.useCertificateChainFile(tls_options_.cert_file);
+        }
+        if (!tls_options_.key_pem.empty()) {
+            tls_context.usePrivateKeyPem(tls_options_.key_pem);
+        }
+        if (!tls_options_.key_file.empty()) {
+            tls_context.usePrivateKeyFile(tls_options_.key_file);
+        }
+    }
+
+    void upgrade_to_tls_server() {
+        if (!tls_options_.enabled) {
+            fail(Error("client requested TLS but mysql2 server TLS is not enabled"));
+            return;
+        }
+        try {
+            tls_context_ = std::make_unique<io::TlsContext>(io::TlsContext::Method::kTLSServer);
+            configure_server_tls_context(*tls_context_);
+            tls_stream_ = std::make_unique<io::TlsStream>(std::move(socket_), *tls_context_);
+        } catch (const Error& error) {
+            fail(error);
+            return;
+        } catch (const std::exception& error) {
+            fail(Error(error.what()));
+            return;
+        }
+
+        auto self = shared_from_this();
+        tls_stream_->asyncHandshake(true, [self](std::error_code ec) {
+            if (ec) {
+                self->fail(Error("mysql2 server TLS handshake failed: " + ec.message()));
+                return;
+            }
+            self->tls_active_ = true;
+            self->read_packet();
+        });
+    }
+
+    void async_write_transport(const void* data,
+                               std::size_t length,
+                               std::function<void(std::error_code, std::size_t)> handler) {
+        if (tls_stream_) {
+            tls_stream_->asyncWrite(data, length, std::move(handler));
+            return;
+        }
+        socket_.asyncWrite(data, length, std::move(handler));
+    }
+
     void write_raw(std::vector<uint8_t> bytes, bool close_after_write = false) {
-        if (!socket_.isOpen()) {
+        if (tls_stream_ ? !tls_stream_->isOpen() : !socket_.isOpen()) {
             return;
         }
         auto self = shared_from_this();
         auto data = std::make_shared<std::vector<uint8_t>>(std::move(bytes));
-        socket_.asyncWrite(data->data(), data->size(), [self, data, close_after_write](std::error_code ec, std::size_t) {
+        async_write_transport(data->data(), data->size(), [self, data, close_after_write](std::error_code ec, std::size_t) {
             if (ec) {
                 self->emit_error(Error("mysql2 server socket write failed: " + ec.message()));
                 self->close();
@@ -6231,16 +6455,22 @@ private:
     };
 
     EventContext& ctx_;
-    io::TcpSocket socket_;
+    io::StreamSocket socket_;
+    std::unique_ptr<io::TlsContext> tls_context_;
+    std::unique_ptr<io::TlsStream> tls_stream_;
     events::EventEmitter emitter_;
     ServerConnection* owner_ = nullptr;
     ServerHandshakeOptions handshake_options_;
+    ServerTlsOptions tls_options_;
     ServerAuthInfo auth_info_;
     Buffer scramble_;
+    std::string remote_address_;
+    uint16_t remote_port_ = 0;
     Phase phase_ = Phase::HandshakeResponse;
     uint8_t next_response_sequence_ = 0;
     bool handshake_started_ = false;
     bool connected_ = true;
+    bool tls_active_ = false;
 };
 
 ServerConnection::ServerConnection(std::shared_ptr<Impl> impl) : impl_(std::move(impl)) {
@@ -6352,7 +6582,7 @@ uint16_t ServerConnection::remote_port() const { return impl_ ? impl_->remote_po
 class ServerImpl : public std::enable_shared_from_this<ServerImpl> {
 public:
     explicit ServerImpl(ServerOptions options)
-        : options_(std::move(options)), acceptor_(ctx_) {}
+        : options_(std::move(options)) {}
 
     ~ServerImpl() {
         close();
@@ -6364,20 +6594,57 @@ public:
         if (listening_) {
             throw Error("mysql2 server is already listening");
         }
+        if (options_.tls.enabled && !has_server_tls_material(options_.tls)) {
+            throw Error("mysql2 server TLS requires certificate and private key material");
+        }
         if (port) {
             options_.port = *port;
+            options_.socket_path.clear();
         }
         if (host) {
             options_.host = *host;
         }
+        if (!options_.socket_path.empty()) {
+            listen_path(options_.socket_path);
+            return;
+        }
         ctx_.restart();
         const int family = options_.host.find(':') == std::string::npos ? AF_INET : AF_INET6;
-        acceptor_.open(family);
-        acceptor_.setReuseAddress(true);
-        acceptor_.bind(options_.host, options_.port);
-        acceptor_.listen(options_.backlog);
-        local_address_ = acceptor_.localAddress();
-        local_port_ = acceptor_.localPort();
+        io::TcpAcceptor tcp_acceptor(ctx_);
+        tcp_acceptor.open(family);
+        tcp_acceptor.setReuseAddress(true);
+        tcp_acceptor.bind(options_.host, options_.port);
+        tcp_acceptor.listen(options_.backlog);
+        local_address_ = tcp_acceptor.localAddress();
+        local_port_ = tcp_acceptor.localPort();
+        acceptor_ = std::make_unique<io::StreamAcceptor>(std::move(tcp_acceptor));
+        listening_ = true;
+        next_connection_id_ = options_.handshake.connection_id == 0 ? 1 : options_.handshake.connection_id;
+        start_accept();
+        thread_ = std::thread([self = shared_from_this()] {
+            self->ctx_.run();
+        });
+    }
+
+    void listen_path(std::string path) {
+        if (listening_) {
+            throw Error("mysql2 server is already listening");
+        }
+        if (path.empty()) {
+            throw Error("mysql2 server socket path must not be empty");
+        }
+        if (options_.tls.enabled && !has_server_tls_material(options_.tls)) {
+            throw Error("mysql2 server TLS requires certificate and private key material");
+        }
+        options_.socket_path = std::move(path);
+        ctx_.restart();
+        io::PipeAcceptor pipe_acceptor(ctx_);
+        pipe_acceptor.open();
+        pipe_acceptor.bind(options_.socket_path);
+        pipe_acceptor.listen(options_.backlog);
+        local_address_ = pipe_acceptor.localPath();
+        local_port_ = 0;
+        acceptor_ = std::make_unique<io::StreamAcceptor>(std::move(pipe_acceptor));
         listening_ = true;
         next_connection_id_ = options_.handshake.connection_id == 0 ? 1 : options_.handshake.connection_id;
         start_accept();
@@ -6392,23 +6659,33 @@ public:
         }
         listening_ = false;
         std::error_code ec;
-        acceptor_.close(ec);
+        if (acceptor_) {
+            acceptor_->close(ec);
+            acceptor_.reset();
+        }
+        std::vector<std::shared_ptr<ServerConnection>> connections;
         {
             std::lock_guard<std::mutex> lock(mutex_);
-            for (auto& connection : connections_) {
-                if (connection) {
-                    connection->close();
-                }
-            }
-            connections_.clear();
+            connections.swap(connections_);
         }
+        for (auto& connection : connections) {
+            if (connection) {
+                connection->close();
+            }
+        }
+        const bool called_from_event_thread = thread_.joinable() && thread_.get_id() == std::this_thread::get_id();
         ctx_.stop();
         if (thread_.joinable()) {
-            if (thread_.get_id() != std::this_thread::get_id()) {
+            if (!called_from_event_thread) {
                 thread_.join();
+                drain_ready_handlers(ctx_);
             } else {
                 thread_.detach();
             }
+        }
+        connections.clear();
+        if (!called_from_event_thread) {
+            drain_ready_handlers(ctx_);
         }
     }
 
@@ -6426,7 +6703,7 @@ public:
 private:
     void start_accept() {
         auto self = shared_from_this();
-        acceptor_.asyncAccept([self](std::error_code ec, io::TcpSocket socket) {
+        acceptor_->asyncAccept([self](std::error_code ec, io::StreamSocket socket) {
             if (!self->listening_) {
                 return;
             }
@@ -6437,7 +6714,7 @@ private:
                 self->start_accept();
                 return;
             }
-            auto impl = std::make_shared<ServerConnection::Impl>(std::move(socket), self->ctx_);
+            auto impl = std::make_shared<ServerConnection::Impl>(std::move(socket), self->ctx_, self->options_.tls);
             auto connection = std::shared_ptr<ServerConnection>(new ServerConnection(std::move(impl)));
             {
                 std::lock_guard<std::mutex> lock(self->mutex_);
@@ -6455,7 +6732,7 @@ private:
 
     ServerOptions options_;
     EventContext ctx_;
-    io::TcpAcceptor acceptor_;
+    std::unique_ptr<io::StreamAcceptor> acceptor_;
     events::EventEmitter emitter_;
     std::thread thread_;
     mutable std::mutex mutex_;
@@ -6504,6 +6781,8 @@ void Server::listen() { impl_->listen(); }
 void Server::listen(uint16_t port) { impl_->listen(port, std::nullopt); }
 
 void Server::listen(uint16_t port, const std::string& host) { impl_->listen(port, host); }
+
+void Server::listen(const std::string& path) { impl_->listen_path(path); }
 
 void Server::close() { impl_->close(); }
 

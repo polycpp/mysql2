@@ -41,6 +41,6 @@ The integration test covers connection, ping, text rows, binary values, query
 attributes when the server supports them, prepared statements, server-side
 cursor fetch, transactions, reset, multi-result queries, compression, LOCAL
 INFILE policy, pooling, pool clusters, and optional TLS. The local loopback
-test covers the adapted server protocol mode by connecting the port's client
-to ``create_server`` and validating handshake, query, ping, text-result, and
-quit behavior.
+tests cover the adapted server protocol mode over TCP and Unix socket paths by
+connecting the port's client to ``create_server`` and validating handshake,
+query, ping, text-result, and quit behavior.

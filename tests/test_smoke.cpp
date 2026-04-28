@@ -3,7 +3,9 @@
 #include <atomic>
 #include <chrono>
 #include <cstdlib>
+#include <filesystem>
 #include <iostream>
+#include <sstream>
 #include <string>
 #include <thread>
 #include <vector>
@@ -27,6 +29,14 @@ void trace_result(const char* step, const mysql2::QueryResult& result) {
                   << " rows=" << result.rows.size()
                   << " status=0x" << std::hex << result.ok.server_status << std::dec << '\n';
     }
+}
+
+std::string unique_socket_path() {
+    static std::atomic<unsigned> counter{0};
+    std::ostringstream name;
+    name << "polycpp-mysql2-" << std::chrono::steady_clock::now().time_since_epoch().count()
+         << "-" << counter++ << ".sock";
+    return (std::filesystem::temp_directory_path() / name.str()).string();
 }
 
 }  // namespace
@@ -70,6 +80,10 @@ TEST(connection_options, parse_connection_uri) {
     EXPECT_TRUE(options.multiple_statements);
     EXPECT_EQ(options.charset_number, 8);
     EXPECT_EQ(options.max_prepared_statements, 7u);
+
+    const auto socket_options = mysql2::parse_connection_uri(
+        "mysql://root@localhost/test?socketPath=/tmp/polycpp-mysql.sock");
+    EXPECT_EQ(socket_options.socket_path, "/tmp/polycpp-mysql.sock");
 }
 
 TEST(connection_options, ssl_profiles_and_parser_cache_controls) {
@@ -400,6 +414,128 @@ TEST(server_mode, loopback_query_uses_adapted_server_api) {
     EXPECT_TRUE(protocol_stmt_prepare_seen);
     EXPECT_TRUE(protocol_stmt_execute_seen);
     EXPECT_EQ(server.connection_count(), 0u);
+}
+
+TEST(server_mode, loopback_query_supports_unix_socket_path) {
+#if defined(_WIN32)
+    GTEST_SKIP() << "Unix socket path tests are not available on Windows";
+#else
+    const auto path = unique_socket_path();
+    std::filesystem::remove(path);
+
+    mysql2::ServerOptions server_options;
+    server_options.socket_path = path;
+    server_options.handshake.server_version = "polycpp-mysql2-ipc-test";
+
+    std::atomic<bool> query_seen{false};
+    std::atomic<bool> quit_seen{false};
+    auto server = mysql2::create_server(server_options);
+    server.on(mysql2::event::ServerConnectionAccepted, [&](mysql2::ServerConnection& connection) {
+        connection.on(mysql2::event::ServerQuery, [&](mysql2::ServerConnection& conn, const std::string& sql) {
+            query_seen = sql == "SELECT 'ipc' AS transport";
+
+            mysql2::Field transport;
+            transport.name = "transport";
+            transport.column_type = mysql2::constants::column_type::VAR_STRING;
+            transport.character_set = 224;
+            transport.encoding = "utf8";
+
+            mysql2::Row row;
+            row.values = {std::string("ipc")};
+            conn.write_text_result(std::vector<mysql2::Row>{row}, std::vector<mysql2::Field>{transport});
+        });
+        connection.on(mysql2::event::ServerQuit, [&](mysql2::ServerConnection&) {
+            quit_seen = true;
+        });
+    });
+
+    server.listen();
+    EXPECT_EQ(server.address(), path);
+    EXPECT_EQ(server.port(), 0);
+
+    mysql2::ConnectionOptions client_options;
+    client_options.socket_path = path;
+    client_options.user = "polycpp";
+    client_options.connect_timeout_ms = 5000;
+
+    auto client = mysql2::create_connection(client_options);
+    const auto result = client.query("SELECT 'ipc' AS transport");
+    ASSERT_EQ(result.rows.size(), 1u);
+    EXPECT_EQ(std::get<std::string>(result.rows[0].at("transport")), "ipc");
+    client.end();
+
+    for (int i = 0; i < 50 && !quit_seen.load(); ++i) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(10));
+    }
+    server.close();
+    std::filesystem::remove(path);
+
+    EXPECT_TRUE(query_seen);
+    EXPECT_TRUE(quit_seen);
+    EXPECT_EQ(server.connection_count(), 0u);
+#endif
+}
+
+TEST(server_mode, loopback_query_supports_tls_upgrade_when_configured) {
+    const char* cert_file = std::getenv("MYSQL2_TEST_SERVER_TLS_CERT_FILE");
+    const char* key_file = std::getenv("MYSQL2_TEST_SERVER_TLS_KEY_FILE");
+    if (cert_file == nullptr || key_file == nullptr) {
+        GTEST_SKIP() << "set MYSQL2_TEST_SERVER_TLS_CERT_FILE and MYSQL2_TEST_SERVER_TLS_KEY_FILE";
+    }
+
+    mysql2::ServerOptions server_options;
+    server_options.handshake.server_version = "polycpp-mysql2-tls-test";
+    server_options.tls.enabled = true;
+    server_options.tls.cert_file = cert_file;
+    server_options.tls.key_file = key_file;
+
+    std::atomic<bool> query_seen{false};
+    std::atomic<bool> quit_seen{false};
+    auto server = mysql2::create_server(server_options);
+    server.on(mysql2::event::ServerConnectionAccepted, [&](mysql2::ServerConnection& connection) {
+        connection.on(mysql2::event::ServerQuery, [&](mysql2::ServerConnection& conn, const std::string& sql) {
+            query_seen = sql == "SELECT 'tls' AS transport";
+
+            mysql2::Field transport;
+            transport.name = "transport";
+            transport.column_type = mysql2::constants::column_type::VAR_STRING;
+            transport.character_set = 224;
+            transport.encoding = "utf8";
+
+            mysql2::Row row;
+            row.values = {std::string("tls")};
+            conn.write_text_result(std::vector<mysql2::Row>{row}, std::vector<mysql2::Field>{transport});
+        });
+        connection.on(mysql2::event::ServerQuit, [&](mysql2::ServerConnection&) {
+            quit_seen = true;
+        });
+    });
+
+    server.listen();
+
+    mysql2::ConnectionOptions client_options;
+    client_options.host = server.address();
+    client_options.port = server.port();
+    client_options.user = "polycpp";
+    client_options.connect_timeout_ms = 5000;
+    client_options.ssl.enabled = true;
+    client_options.ssl.reject_unauthorized = false;
+    client_options.ssl.verify_identity = false;
+
+    auto client = mysql2::create_connection(client_options);
+    EXPECT_TRUE(client.encrypted());
+    const auto result = client.query("SELECT 'tls' AS transport");
+    ASSERT_EQ(result.rows.size(), 1u);
+    EXPECT_EQ(std::get<std::string>(result.rows[0].at("transport")), "tls");
+    client.end();
+
+    for (int i = 0; i < 50 && !quit_seen.load(); ++i) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(10));
+    }
+    server.close();
+
+    EXPECT_TRUE(query_seen);
+    EXPECT_TRUE(quit_seen);
 }
 
 TEST(server_mode, auth_callback_rejects_client_with_error_packet) {

@@ -7,7 +7,7 @@
 - Prepared statements are explicit C++ objects. `execute(sql, values)` also uses a bounded connection-local statement cache for upstream compatibility.
 - Pools are synchronous RAII pools rather than async command queues.
 - Pool clusters are synchronous typed objects rather than JavaScript EventEmitter command queues, but they keep named pools, wildcard matching, RR/RANDOM/ORDER selection, retry/offline/remove policy, and typed events.
-- TLS is implemented through polycpp TLS primitives. The upstream `"Amazon RDS"` SSL profile is bundled as CA PEM data generated from `aws-ssl-profiles@1.1.2`.
+- TLS is implemented through polycpp TLS primitives. The upstream `"Amazon RDS"` SSL profile is bundled as CA PEM data generated from `aws-ssl-profiles@1.1.2`. Server mode uses MySQL in-protocol TLS upgrade after SSLRequest when `ServerOptions::tls` is configured; it is not modeled as a direct `tls.createServer` public surface.
 - Single-result `query` and `execute` calls drain unexpected additional result sets and throw; callers that expect multiple result sets must use `query_all` or `execute_all`.
 - Native MySQL/MariaDB client SDKs are not linked, even if installed on the system.
 - JavaScript parser code generation is replaced with static C++ parsing.
@@ -21,18 +21,17 @@
 - Server-side prepared-statement cursors are explicit `StatementCursor` objects. Callers fetch batches with `Connection::fetch(...)` and close the underlying prepared statement when they are done.
 - Charset and collation ids are mapped from upstream mysql2 constants and string conversion reuses the `iconv-lite` companion where polycpp Buffer does not already support the encoding. Handshake charset still must fit MySQL's one-byte handshake field.
 - Connection attributes are sent during both the initial handshake and `COM_CHANGE_USER` when the server advertises connect-attribute capability.
-- Server mode is adapted to explicit `Server` and `ServerConnection` objects rather than reusing the client `Connection`. It supports TCP listening, server handshake/auth inspection, typed command events including statement prepare/execute, raw packet observation, statement-prepare OK packets, and OK/ERR/text/binary-result writers. It does not imply a SQL execution engine, Unix socket listening, or TLS server mode.
+- Server mode is adapted to explicit `Server` and `ServerConnection` objects rather than reusing the client `Connection`. It supports TCP and Unix socket listening, optional MySQL in-protocol TLS upgrade, server handshake/auth inspection, typed command events including statement prepare/execute, raw packet observation, statement-prepare OK packets, and OK/ERR/text/binary-result writers. It does not imply a SQL execution engine.
 
 ## Deferred Features
 
 - Exact Node `createBinlogStream` EventEmitter/object-stream shape is adapted to synchronous `binlog_dump(...)`, callback-controlled `binlog_dump_each(...)`, and explicit `BinlogParser` state rather than a JavaScript stream object.
 - Exact Node `Readable` object-mode row chunks are deferred until polycpp stream supports arbitrary typed payload chunks.
-- Unix socket server listen overloads and TLS server mode are deferred until matching polycpp server primitives and TLS upgrade design are available.
 - Binlog TIME2/DATETIME2/TIMESTAMP2 row values are exposed as raw `Buffer` values in row changes. The current public `Value` variant has no temporal binary value type, and converting those packed values to strings would lose audit fidelity.
 
 ## Security-Driven Behavior Changes
 
-- `mysql_clear_password` requires both TLS and `ConnectionOptions::enable_cleartext_plugin`.
+- `mysql_clear_password` requires `ConnectionOptions::enable_cleartext_plugin` and either TLS or `ConnectionOptions::socket_path`.
 - TLS certificate verification is enabled by `SslOptions::reject_unauthorized`; host/IP identity verification is controlled by `SslOptions::verify_identity`.
 - LOCAL INFILE requests throw unless the caller configured an explicit handler.
 - Unsupported auth plugins throw instead of silently falling back after authentication starts.

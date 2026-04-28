@@ -41,6 +41,8 @@ Legend:
 ## Polycpp Ecosystem Reuse
 
 - [x] polycpp core modules searched for reusable primitives
+- [x] current polycpp capability snapshot recorded
+- [x] transport/listener capabilities revalidated against current polycpp
 - [x] polycpp core reuse decisions recorded
 - [x] companion libraries searched for reusable APIs
 - [x] companion reuse decisions recorded

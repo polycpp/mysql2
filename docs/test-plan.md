@@ -16,7 +16,7 @@
 - Parser-cache compatibility hooks are covered as no-op static-parser controls.
 - Typed `RowStream` coverage verifies row iteration and NDJSON buffer conversion.
 - Binlog packet parser coverage includes QueryEvent fixtures, GTID set parsing, and stateful TableMap plus WriteRows decoding. Rotate, FormatDescription, Xid, GTID packet, PreviousGTIDs packet, update/delete rows, and unknown-event fixtures should be expanded.
-- Adapted server mode loopback coverage creates a `Server`, accepts a `Connection` client, validates handshake auth/connect attributes, dispatches query, ping, statement prepare, and statement execute events, writes text/OK responses, writes a prepared-statement OK packet and binary result rows for a real client `prepare`/`execute`, observes quit, and verifies auth callback rejection returns a MySQL ERR packet.
+- Adapted server mode loopback coverage creates a `Server`, accepts a `Connection` client over TCP and Unix socket paths, validates handshake auth/connect attributes, dispatches query, ping, statement prepare, and statement execute events, writes text/OK responses, writes a prepared-statement OK packet and binary result rows for a real client `prepare`/`execute`, observes quit, and verifies auth callback rejection returns a MySQL ERR packet.
 
 ## Integration Tests
 
@@ -42,7 +42,7 @@
 ## Security and Fail-Closed Tests
 
 - Unsupported auth plugin returns an error.
-- `mysql_clear_password` without TLS returns an error.
+- `mysql_clear_password` without TLS or `socket_path` returns an error.
 - TLS certificate chain failure returns an error when `reject_unauthorized` is true.
 - TLS host/IP mismatch returns an error when `verify_identity` is true.
 - LOCAL INFILE request without an explicit handler returns an error and with a handler sends only caller-provided buffers.
@@ -61,7 +61,7 @@
 - Real MariaDB e2e passes without TLS.
 - Real MariaDB e2e passes with verified TLS.
 - Real MySQL 8 e2e passes before claiming MySQL 8 auth parity.
-- Stream adaptation, command timeout behavior, compression, LOCAL INFILE policy, callback/Promise wrappers, EventEmitter/trace behavior, adapted server mode, bounded/callback binlog behavior, parser-cache compatibility hooks, and SSL profile data remain documented with exact C++ semantics.
+- Stream adaptation, command timeout behavior, compression, LOCAL INFILE policy, callback/Promise wrappers, EventEmitter/trace behavior, adapted TCP/Unix server mode, bounded/callback binlog behavior, parser-cache compatibility hooks, and SSL profile data remain documented with exact C++ semantics.
 - Third-party license notices are complete.
 - Documentation builds with `python3 docs/build.py`.
 - GitHub repo remains private until production-grade quality and public docs are ready.
@@ -81,6 +81,15 @@ docker run -d --name polycpp-mysql2-mariadb-e2e -e MARIADB_ROOT_PASSWORD=polycpp
 docker run --rm --network container:polycpp-mysql2-mariadb-e2e -v /data/work/lib/mysql2:/work -w /work ubuntu:22.04 bash -lc 'apt-get update >/dev/null && apt-get install -y libicu70 libssl3 >/dev/null && MYSQL2_TEST_HOST=127.0.0.1 MYSQL2_TEST_PORT=3306 MYSQL2_TEST_USER=root MYSQL2_TEST_PASSWORD=polycpp MYSQL2_TEST_DATABASE=polycpp_test MYSQL2_TEST_TRACE=1 build/test_smoke --gtest_filter=mysql2_integration.query_against_real_database_when_configured'
 docker run -d --name polycpp-mysql2-mariadb-tls-e2e -e MARIADB_ROOT_PASSWORD=polycpp -e MARIADB_DATABASE=polycpp_test -v /data/work/lib/mysql2/build/mariadb-tls:/certs:ro mariadb:10.6 --local-infile=1 --ssl-ca=/certs/ca.pem --ssl-cert=/certs/server-cert.pem --ssl-key=/certs/server-key.pem --require-secure-transport=ON
 docker run --rm --network container:polycpp-mysql2-mariadb-tls-e2e -v /data/work/lib/mysql2:/work -w /work ubuntu:22.04 bash -lc 'apt-get update >/dev/null && apt-get install -y libicu70 libssl3 >/dev/null && MYSQL2_TEST_HOST=127.0.0.1 MYSQL2_TEST_PORT=3306 MYSQL2_TEST_USER=root MYSQL2_TEST_PASSWORD=polycpp MYSQL2_TEST_DATABASE=polycpp_test MYSQL2_TEST_SSL=1 MYSQL2_TEST_SSL_REJECT_UNAUTHORIZED=1 MYSQL2_TEST_SSL_VERIFY_IDENTITY=1 MYSQL2_TEST_SSL_CA_FILE=/work/build/mariadb-tls/ca.pem build/test_smoke --gtest_filter=mysql2_integration.query_against_real_database_when_configured'
+```
+
+Additional validation on April 28, 2026 after updating against current polycpp IPC/TLS primitives:
+
+```bash
+cmake --build build -j2
+timeout 20s build/test_smoke --gtest_filter=server_mode.loopback_query_supports_unix_socket_path --gtest_also_run_disabled_tests
+MYSQL2_TEST_SERVER_TLS_CERT_FILE=$PWD/build/mariadb-tls/server-cert.pem MYSQL2_TEST_SERVER_TLS_KEY_FILE=$PWD/build/mariadb-tls/server-key.pem timeout 20s build/test_smoke --gtest_filter=server_mode.loopback_query_supports_tls_upgrade_when_configured --gtest_also_run_disabled_tests
+ctest --test-dir build --output-on-failure
 ```
 
 Service versions used for e2e validation:
