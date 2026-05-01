@@ -2,6 +2,23 @@
 
 ## Implemented With C++ Adaptation
 
+- polycpp TypedEvent migration applied 2026-05-01: the typed event constants
+  switched from the string-literal NTTP form
+  (`events::TypedEvent<"name", Args...>`) to the current polycpp tag-struct
+  form (`events::TypedEvent<Args...>{"name"}`), and the wrapper classes moved
+  from the legacy `events::EventEmitterForwarder` to the current
+  `events::IEventEmitterForwarder<Derived>` CRTP shape with explicit
+  `eventTarget_()` overrides. Wire-level event names are preserved.
+  `event::ConnectionCreated` / `Acquire` / `Release` / `ServerConnection*`
+  events now pass `Connection*` / `ServerConnection*` (raw pointer) instead of
+  `&` because polycpp's `IEventEmitter::emit()` requires copy-constructible
+  arguments and `Connection` / `ServerConnection` are move-only.
+- mysql2 currently ships without the `polycpp/iconv-lite` runtime dependency.
+  The non-UTF-8 server-charset decode/encode fallback is stubbed to UTF-8
+  while the iconv-lite companion is being migrated against polycpp HEAD's
+  stream API. UTF-8 / latin1 / encodings supported by `polycpp::Buffer`
+  continue to work end-to-end. Set `-DPOLYCPP_MYSQL2_USE_ICONV_LITE=ON` once
+  iconv-lite is back in sync to re-enable the iconv-lite path.
 - The API is synchronous and typed first. Callback and `polycpp::Promise` wrappers are available, but they execute the same typed operations rather than introducing a separate JavaScript command queue.
 - Rows use `std::variant` values and explicit field lookup rather than mutable JavaScript objects.
 - Prepared statements are explicit C++ objects. `execute(sql, values)` also uses a bounded connection-local statement cache for upstream compatibility.

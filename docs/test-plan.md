@@ -97,3 +97,21 @@ Service versions used for e2e validation:
 - MariaDB 10.6 in Docker, with a generated test CA/server certificate for the verified TLS run.
 - MySQL Community Server 8.4.6 in Docker.
 - Database e2e commands run from an Ubuntu 22.04 helper container sharing the database container network namespace.
+
+Additional validation on May 1, 2026 after migrating to the current polycpp
+TypedEvent / IEventEmitterForwarder shape (`events::TypedEvent<Args...>{"name"}`)
+against polycpp HEAD `7a8df099`:
+
+```bash
+rm -rf build
+cmake -B build -G Ninja -DCMAKE_BUILD_TYPE=Debug \
+  -DPOLYCPP_SOURCE_DIR=/data/work/gitlab-workspace/polycpp
+cmake --build build -j$(nproc)
+(cd build && ctest --output-on-failure)
+```
+
+Result: `100% tests passed, 0 tests failed out of 14` in 0.23 s
+(12 ran, 2 skipped — `server_mode.loopback_query_supports_tls_upgrade_when_configured`
+needs `MYSQL2_TEST_SERVER_TLS_CERT_FILE`/`MYSQL2_TEST_SERVER_TLS_KEY_FILE`,
+`mysql2_integration.query_against_real_database_when_configured` needs
+`MYSQL2_TEST_HOST`/`MYSQL2_TEST_USER`).
