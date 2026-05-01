@@ -11,9 +11,6 @@ set(POLYCPP_BUILD_TESTS OFF CACHE BOOL "" FORCE)
 set(POLYCPP_SOURCE_DIR "" CACHE PATH "Path to a local polycpp checkout")
 set(POLYCPP_ICONV_LITE_BUILD_TESTS OFF CACHE BOOL "" FORCE)
 set(POLYCPP_ICONV_LITE_SOURCE_DIR "" CACHE PATH "Path to a local polycpp iconv-lite checkout")
-option(POLYCPP_MYSQL2_USE_ICONV_LITE
-       "Link polycpp/iconv-lite for non-UTF-8 charset encode/decode (currently disabled by default while iconv-lite is being migrated against polycpp HEAD)"
-       OFF)
 
 if(NOT POLYCPP_ICONV_LITE_SOURCE_DIR AND EXISTS "/data/work/lib/iconv-lite/CMakeLists.txt")
     set(POLYCPP_ICONV_LITE_SOURCE_DIR "/data/work/lib/iconv-lite" CACHE PATH "Path to a local polycpp iconv-lite checkout" FORCE)
@@ -35,35 +32,23 @@ else()
 endif()
 FetchContent_MakeAvailable(polycpp)
 
-# polycpp/iconv-lite previously provided non-UTF-8 charset encode/decode for
-# the server character_set field. The iconv-lite companion has not yet been
-# migrated against current polycpp HEAD's stream API (StreamOptions::context →
-# ctx, removal of stream::event::DataString), so mysql2 currently runs with
-# the iconv-lite fallback path stubbed out (see decode_buffer/encode_string_for_mysql
-# in src/mysql2.cpp). UTF-8 / latin1 / encodings supported by polycpp::Buffer
-# work as before. Re-enable the dependency once iconv-lite is back in sync.
-if(POLYCPP_MYSQL2_USE_ICONV_LITE)
-    if(POLYCPP_ICONV_LITE_SOURCE_DIR AND EXISTS "${POLYCPP_ICONV_LITE_SOURCE_DIR}/CMakeLists.txt")
-        FetchContent_Declare(polycpp_iconv_lite SOURCE_DIR "${POLYCPP_ICONV_LITE_SOURCE_DIR}")
-    else()
-        FetchContent_Declare(
-            polycpp_iconv_lite
-            GIT_REPOSITORY git@github.com:polycpp/iconv-lite.git
-            GIT_TAG        main
-            GIT_SHALLOW    TRUE
-        )
-    endif()
-    FetchContent_MakeAvailable(polycpp_iconv_lite)
+if(POLYCPP_ICONV_LITE_SOURCE_DIR AND EXISTS "${POLYCPP_ICONV_LITE_SOURCE_DIR}/CMakeLists.txt")
+    FetchContent_Declare(polycpp_iconv_lite SOURCE_DIR "${POLYCPP_ICONV_LITE_SOURCE_DIR}")
+else()
+    FetchContent_Declare(
+        polycpp_iconv_lite
+        GIT_REPOSITORY git@github.com:polycpp/iconv-lite.git
+        GIT_TAG        main
+        GIT_SHALLOW    TRUE
+    )
 endif()
+FetchContent_MakeAvailable(polycpp_iconv_lite)
 
 add_library(polycpp_mysql2
     src/aws_rds_ca.cpp
     src/mysql2.cpp
 )
-target_link_libraries(polycpp_mysql2 PUBLIC polycpp)
-if(POLYCPP_MYSQL2_USE_ICONV_LITE)
-    target_link_libraries(polycpp_mysql2 PUBLIC polycpp_iconv_lite)
-endif()
+target_link_libraries(polycpp_mysql2 PUBLIC polycpp polycpp_iconv_lite)
 target_compile_features(polycpp_mysql2 PUBLIC cxx_std_20)
 target_include_directories(polycpp_mysql2 PUBLIC
     $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>

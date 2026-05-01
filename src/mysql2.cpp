@@ -3,13 +3,17 @@
 #include "aws_rds_ca.hpp"
 
 #include <polycpp/crypto.hpp>
+#include <polycpp/iconv_lite/iconv_lite.hpp>
 #include <polycpp/io/event_context.hpp>
+#include <polycpp/io/pipe_acceptor.hpp>
+#include <polycpp/io/pipe_socket.hpp>
+#include <polycpp/io/stream_acceptor.hpp>
+#include <polycpp/io/stream_socket.hpp>
 #include <polycpp/io/tcp_acceptor.hpp>
 #include <polycpp/io/tcp_socket.hpp>
 #include <polycpp/io/timer.hpp>
 #include <polycpp/io/tls_context.hpp>
 #include <polycpp/io/tls_stream.hpp>
-#include <polycpp/mysql2/detail/socket_adapter.hpp>
 #include <polycpp/ssl/x509_cert.hpp>
 #include <polycpp/url.hpp>
 #include <polycpp/zlib.hpp>
@@ -41,25 +45,6 @@
 #include <sys/socket.h>
 
 namespace polycpp::mysql2 {
-
-// Internal aliases for the in-tree transport adapter (replaces the
-// removed polycpp/io/{stream,pipe}_{socket,acceptor}.hpp helpers).
-using StreamSocket   = detail::transport::StreamSocket;
-using StreamAcceptor = detail::transport::StreamAcceptor;
-using PipeSocket     = detail::transport::PipeSocket;
-using PipeAcceptor   = detail::transport::PipeAcceptor;
-
-// Default-constructed EventEmitter used by `eventTarget_()` returns when the
-// owning wrapper has been moved-from. Calling `on/emit/listenerCount` on a
-// moved-from object is a logic error in user code; routing through this dummy
-// keeps it observable rather than UB.
-namespace {
-events::EventEmitter& moved_from_emitter() {
-    static events::EventEmitter instance;
-    return instance;
-}
-}  // namespace
-
 namespace {
 
 namespace client_flag {
@@ -444,11 +429,9 @@ public:
         if (Buffer::isEncoding(encoding)) {
             return buffer.toString(encoding);
         }
-        // Non-trivial server-side encodings (gb18030, cp932, etc.) used to be
-        // routed through polycpp/iconv-lite. iconv-lite has not yet been
-        // migrated against the current polycpp stream API surface, so we
-        // fall back to UTF-8 here. Once the iconv-lite companion port is
-        // back in sync, the iconv_lite::decode() call can be reinstated.
+        if (iconv_lite::encodingExists(encoding)) {
+            return iconv_lite::decode(buffer, encoding);
+        }
         return buffer.toString("utf8");
     }
 
@@ -556,8 +539,9 @@ Buffer encode_string_for_mysql(std::string_view value, const std::string& encodi
     if (Buffer::isEncoding(encoding)) {
         return Buffer::from(text, encoding);
     }
-    // See decode_buffer above: iconv-lite encode path temporarily disabled
-    // while polycpp/iconv-lite catches up to the current polycpp stream API.
+    if (iconv_lite::encodingExists(encoding)) {
+        return iconv_lite::encode(text, encoding);
+    }
     return Buffer::from(text);
 }
 
@@ -3514,7 +3498,7 @@ public:
         handle_auth_result(plugin, scramble, tls_active_ ? 3 : 2);
         compression_active_ = options_.compress && ((client_flags & client_flag::COMPRESS) != 0);
         connected_ = true;
-        detail::emitTyped(emitter_, event::Connect, connection_info());
+        emitter_.emit(event::Connect, connection_info());
     }
 
     QueryResult query(const std::string& sql) {
@@ -3973,9 +3957,9 @@ public:
         compression_active_ = false;
         try {
             if (was_connected) {
-                detail::emitTyped(emitter_, event::End);
+                emitter_.emit(event::End);
             }
-            detail::emitTyped(emitter_, event::Close);
+            emitter_.emit(event::Close);
         } catch (...) {
         }
     }
@@ -3993,7 +3977,7 @@ public:
     template <typename Fn>
     std::invoke_result_t<Fn> traced(const std::string& operation, const std::string& sql, Fn&& fn) {
         using Result = std::invoke_result_t<Fn>;
-        const bool has_trace_listener = detail::listenerCountTyped(emitter_, event::Trace) > 0;
+        const bool has_trace_listener = emitter_.listenerCount(event::Trace) > 0;
         const auto start = std::chrono::steady_clock::now();
         if (has_trace_listener) {
             emit_trace(operation, "start", sql, start, {});
@@ -4034,8 +4018,8 @@ public:
     }
 
     void emit_error(const Error& error) {
-        if (detail::listenerCountTyped(emitter_, event::Error_) > 0) {
-            detail::emitTyped(emitter_, event::Error_, error);
+        if (emitter_.listenerCount(event::Error_) > 0) {
+            emitter_.emit(event::Error_, error);
         }
     }
 
@@ -4044,7 +4028,7 @@ public:
                     const std::string& sql,
                     std::chrono::steady_clock::time_point start,
                     const std::string& error) {
-        if (detail::listenerCountTyped(emitter_, event::Trace) == 0) {
+        if (emitter_.listenerCount(event::Trace) == 0) {
             return;
         }
         TraceEvent event;
@@ -4058,7 +4042,7 @@ public:
         event.duration = std::chrono::duration_cast<std::chrono::microseconds>(
             std::chrono::steady_clock::now() - start);
         event.error = error;
-        detail::emitTyped(emitter_, event::Trace, event);
+        emitter_.emit(event::Trace, event);
     }
 
     void pause() noexcept { paused_ = true; }
@@ -4090,7 +4074,7 @@ private:
             tls_stream_->close(ignored);
             tls_stream_.reset();
             tls_context_.reset();
-            socket_ = StreamSocket(ctx_);
+            socket_ = io::StreamSocket(ctx_);
         } else {
             socket_.close(ignored);
         }
@@ -4129,9 +4113,9 @@ private:
         io::Timer timer(ctx_);
 
         if (!options_.socket_path.empty()) {
-            socket_ = StreamSocket(PipeSocket(ctx_));
+            socket_ = io::StreamSocket(io::PipeSocket(ctx_));
         } else {
-            socket_ = StreamSocket(ctx_);
+            socket_ = io::StreamSocket(ctx_);
         }
 
         auto on_connect = [&](std::error_code error) {
@@ -4216,7 +4200,7 @@ private:
     void upgrade_to_tls() {
         tls_context_ = std::make_unique<io::TlsContext>(io::TlsContext::Method::kTLSClient);
         configure_tls_context(*tls_context_);
-        tls_stream_ = std::make_unique<io::TlsStream>(socket_.releaseTcp(), *tls_context_);
+        tls_stream_ = std::make_unique<io::TlsStream>(std::move(socket_), *tls_context_);
         if (options_.socket_path.empty() && !looks_like_ip_address(options_.host)) {
             tls_stream_->sslConnection().setHostname(options_.host);
         }
@@ -4284,7 +4268,7 @@ private:
             tls_stream_->close(ec);
             tls_stream_.reset();
             tls_context_.reset();
-            socket_ = StreamSocket(ctx_);
+            socket_ = io::StreamSocket(ctx_);
             drain_ready_handlers(ctx_);
             return;
         }
@@ -4741,7 +4725,7 @@ private:
     ConnectionOptions options_;
     events::EventEmitter emitter_;
     EventContext ctx_;
-    StreamSocket socket_;
+    io::StreamSocket socket_;
     std::unique_ptr<io::TlsContext> tls_context_;
     std::unique_ptr<io::TlsStream> tls_stream_;
     bool connected_ = false;
@@ -5188,17 +5172,12 @@ Promise<void> promise_void_from(F&& work) {
     });
 }
 
-events::EventEmitter& Connection::eventTarget_() {
-    return impl_ ? impl_->emitter() : moved_from_emitter();
-}
-const events::EventEmitter& Connection::eventTarget_() const {
-    return impl_ ? impl_->emitter() : moved_from_emitter();
-}
-
 Connection::Connection() : impl_(new Impl(ConnectionOptions{})) {
+    setEmitter_(impl_->emitter());
 }
 
 Connection::Connection(ConnectionOptions options) : impl_(new Impl(std::move(options))) {
+    setEmitter_(impl_->emitter());
 }
 
 Connection::~Connection() {
@@ -5208,7 +5187,12 @@ Connection::~Connection() {
     }
 }
 
-Connection::Connection(Connection&& other) noexcept : impl_(std::exchange(other.impl_, nullptr)) {}
+Connection::Connection(Connection&& other) noexcept : impl_(std::exchange(other.impl_, nullptr)) {
+    if (impl_) {
+        setEmitter_(impl_->emitter());
+    }
+    other.resetEmitter_();
+}
 
 Connection& Connection::operator=(Connection&& other) noexcept {
     if (this != &other) {
@@ -5217,6 +5201,12 @@ Connection& Connection::operator=(Connection&& other) noexcept {
             delete impl_;
         }
         impl_ = std::exchange(other.impl_, nullptr);
+        if (impl_) {
+            setEmitter_(impl_->emitter());
+        } else {
+            resetEmitter_();
+        }
+        other.resetEmitter_();
     }
     return *this;
 }
@@ -5966,7 +5956,7 @@ uint32_t Connection::server_capability_flags() const noexcept { return impl_->se
 
 class ServerConnection::Impl : public std::enable_shared_from_this<ServerConnection::Impl> {
 public:
-    Impl(StreamSocket socket, EventContext& ctx, ServerTlsOptions tls_options)
+    Impl(io::StreamSocket socket, EventContext& ctx, ServerTlsOptions tls_options)
         : ctx_(ctx), socket_(std::move(socket)), tls_options_(std::move(tls_options)) {
         capture_remote_endpoint();
     }
@@ -6073,7 +6063,7 @@ public:
             tls_stream_.reset();
             tls_context_.reset();
             tls_active_ = false;
-            socket_ = StreamSocket(ctx_);
+            socket_ = io::StreamSocket(ctx_);
             return;
         }
         socket_.shutdown(2, ec);
@@ -6107,8 +6097,8 @@ private:
     };
 
     void emit_error(const Error& error) {
-        if (detail::listenerCountTyped(emitter_, event::Error_) > 0) {
-            detail::emitTyped(emitter_, event::Error_, error);
+        if (emitter_.listenerCount(event::Error_) > 0) {
+            emitter_.emit(event::Error_, error);
         }
     }
 
@@ -6232,23 +6222,23 @@ private:
         const auto command = cursor.read_u8();
         bool known = true;
         const auto emit_packet = [&]() {
-            if (owner_ && detail::listenerCountTyped(emitter_, event::ServerPacket) > 0) {
-                detail::emitTyped(emitter_, event::ServerPacket, owner_, frame.payload, known, command);
+            if (owner_ && emitter_.listenerCount(event::ServerPacket) > 0) {
+                emitter_.emit(event::ServerPacket, *owner_, frame.payload, known, command);
             }
         };
 
         switch (command) {
             case command_code::QUIT:
                 emit_packet();
-                if (owner_ && detail::listenerCountTyped(emitter_, event::ServerQuit) > 0) {
-                    detail::emitTyped(emitter_, event::ServerQuit, owner_);
+                if (owner_ && emitter_.listenerCount(event::ServerQuit) > 0) {
+                    emitter_.emit(event::ServerQuit, *owner_);
                 }
                 close();
                 return;
             case command_code::PING:
                 emit_packet();
-                if (owner_ && detail::listenerCountTyped(emitter_, event::ServerPing) > 0) {
-                    detail::emitTyped(emitter_, event::ServerPing, owner_);
+                if (owner_ && emitter_.listenerCount(event::ServerPing) > 0) {
+                    emitter_.emit(event::ServerPing, *owner_);
                 } else {
                     write_ok(OkPacket{});
                 }
@@ -6256,8 +6246,8 @@ private:
             case command_code::INIT_DB: {
                 const auto schema = PacketCursor::decode_buffer(cursor.read_rest_buffer(), client_encoding());
                 emit_packet();
-                if (owner_ && detail::listenerCountTyped(emitter_, event::ServerInitDb) > 0) {
-                    detail::emitTyped(emitter_, event::ServerInitDb, owner_, schema);
+                if (owner_ && emitter_.listenerCount(event::ServerInitDb) > 0) {
+                    emitter_.emit(event::ServerInitDb, *owner_, schema);
                 } else {
                     write_ok(OkPacket{});
                 }
@@ -6267,8 +6257,8 @@ private:
                 const auto table = cursor.read_null_terminated_ascii();
                 const auto fields = PacketCursor::decode_buffer(cursor.read_rest_buffer(), client_encoding());
                 emit_packet();
-                if (owner_ && detail::listenerCountTyped(emitter_, event::ServerFieldList) > 0) {
-                    detail::emitTyped(emitter_, event::ServerFieldList, owner_, table, fields);
+                if (owner_ && emitter_.listenerCount(event::ServerFieldList) > 0) {
+                    emitter_.emit(event::ServerFieldList, *owner_, table, fields);
                 } else {
                     write_error(1287, "HY000", "COM_FIELD_LIST is deprecated and no field_list handler is configured");
                 }
@@ -6279,16 +6269,16 @@ private:
                 emit_packet();
                 if (owner_ &&
                     (is_server_statement_text(sql, "PREPARE") || is_server_statement_text(sql, "SET")) &&
-                    detail::listenerCountTyped(emitter_, event::ServerStatementPrepare) > 0) {
-                    detail::emitTyped(emitter_, event::ServerStatementPrepare, owner_, sql);
+                    emitter_.listenerCount(event::ServerStatementPrepare) > 0) {
+                    emitter_.emit(event::ServerStatementPrepare, *owner_, sql);
                 } else if (owner_ &&
                            is_server_statement_text(sql, "EXECUTE") &&
-                           detail::listenerCountTyped(emitter_, event::ServerStatementExecute) > 0) {
+                           emitter_.listenerCount(event::ServerStatementExecute) > 0) {
                     ServerStatementExecuteInfo info;
                     info.query = sql;
-                    detail::emitTyped(emitter_, event::ServerStatementExecute, owner_, info);
-                } else if (owner_ && detail::listenerCountTyped(emitter_, event::ServerQuery) > 0) {
-                    detail::emitTyped(emitter_, event::ServerQuery, owner_, sql);
+                    emitter_.emit(event::ServerStatementExecute, *owner_, info);
+                } else if (owner_ && emitter_.listenerCount(event::ServerQuery) > 0) {
+                    emitter_.emit(event::ServerQuery, *owner_, sql);
                 } else {
                     write_error(1105, "HY000", "No query handler");
                 }
@@ -6297,8 +6287,8 @@ private:
             case command_code::STMT_PREPARE: {
                 const auto sql = PacketCursor::decode_buffer(cursor.read_rest_buffer(), client_encoding());
                 emit_packet();
-                if (owner_ && detail::listenerCountTyped(emitter_, event::ServerStatementPrepare) > 0) {
-                    detail::emitTyped(emitter_, event::ServerStatementPrepare, owner_, sql);
+                if (owner_ && emitter_.listenerCount(event::ServerStatementPrepare) > 0) {
+                    emitter_.emit(event::ServerStatementPrepare, *owner_, sql);
                 } else {
                     write_error(1105, "HY000", "No query handler for prepared statements");
                 }
@@ -6308,8 +6298,8 @@ private:
                 const auto execute_payload = cursor.read_rest_buffer();
                 auto info = parse_server_statement_execute_payload(execute_payload, client_encoding());
                 emit_packet();
-                if (owner_ && detail::listenerCountTyped(emitter_, event::ServerStatementExecute) > 0) {
-                    detail::emitTyped(emitter_, event::ServerStatementExecute, owner_, info);
+                if (owner_ && emitter_.listenerCount(event::ServerStatementExecute) > 0) {
+                    emitter_.emit(event::ServerStatementExecute, *owner_, info);
                 } else {
                     write_error(1105, "HY000", "No query handler for execute statements");
                 }
@@ -6411,7 +6401,7 @@ private:
         try {
             tls_context_ = std::make_unique<io::TlsContext>(io::TlsContext::Method::kTLSServer);
             configure_server_tls_context(*tls_context_);
-            tls_stream_ = std::make_unique<io::TlsStream>(socket_.releaseTcp(), *tls_context_);
+            tls_stream_ = std::make_unique<io::TlsStream>(std::move(socket_), *tls_context_);
         } catch (const Error& error) {
             fail(error);
             return;
@@ -6465,7 +6455,7 @@ private:
     };
 
     EventContext& ctx_;
-    StreamSocket socket_;
+    io::StreamSocket socket_;
     std::unique_ptr<io::TlsContext> tls_context_;
     std::unique_ptr<io::TlsStream> tls_stream_;
     events::EventEmitter emitter_;
@@ -6483,16 +6473,10 @@ private:
     bool tls_active_ = false;
 };
 
-events::EventEmitter& ServerConnection::eventTarget_() {
-    return impl_ ? impl_->emitter() : moved_from_emitter();
-}
-const events::EventEmitter& ServerConnection::eventTarget_() const {
-    return impl_ ? impl_->emitter() : moved_from_emitter();
-}
-
 ServerConnection::ServerConnection(std::shared_ptr<Impl> impl) : impl_(std::move(impl)) {
     if (impl_) {
         impl_->set_owner(this);
+        setEmitter_(impl_->emitter());
     }
 }
 
@@ -6506,7 +6490,9 @@ ServerConnection::ServerConnection(ServerConnection&& other) noexcept
     : impl_(std::move(other.impl_)) {
     if (impl_) {
         impl_->set_owner(this);
+        setEmitter_(impl_->emitter());
     }
+    other.resetEmitter_();
 }
 
 ServerConnection& ServerConnection::operator=(ServerConnection&& other) noexcept {
@@ -6517,7 +6503,11 @@ ServerConnection& ServerConnection::operator=(ServerConnection&& other) noexcept
         impl_ = std::move(other.impl_);
         if (impl_) {
             impl_->set_owner(this);
+            setEmitter_(impl_->emitter());
+        } else {
+            resetEmitter_();
         }
+        other.resetEmitter_();
     }
     return *this;
 }
@@ -6627,7 +6617,7 @@ public:
         tcp_acceptor.listen(options_.backlog);
         local_address_ = tcp_acceptor.localAddress();
         local_port_ = tcp_acceptor.localPort();
-        acceptor_ = std::make_unique<StreamAcceptor>(std::move(tcp_acceptor));
+        acceptor_ = std::make_unique<io::StreamAcceptor>(std::move(tcp_acceptor));
         listening_ = true;
         next_connection_id_ = options_.handshake.connection_id == 0 ? 1 : options_.handshake.connection_id;
         start_accept();
@@ -6648,13 +6638,13 @@ public:
         }
         options_.socket_path = std::move(path);
         ctx_.restart();
-        PipeAcceptor pipe_acceptor(ctx_);
+        io::PipeAcceptor pipe_acceptor(ctx_);
         pipe_acceptor.open();
         pipe_acceptor.bind(options_.socket_path);
         pipe_acceptor.listen(options_.backlog);
         local_address_ = pipe_acceptor.localPath();
         local_port_ = 0;
-        acceptor_ = std::make_unique<StreamAcceptor>(std::move(pipe_acceptor));
+        acceptor_ = std::make_unique<io::StreamAcceptor>(std::move(pipe_acceptor));
         listening_ = true;
         next_connection_id_ = options_.handshake.connection_id == 0 ? 1 : options_.handshake.connection_id;
         start_accept();
@@ -6713,13 +6703,13 @@ public:
 private:
     void start_accept() {
         auto self = shared_from_this();
-        acceptor_->asyncAccept([self](std::error_code ec, StreamSocket socket) {
+        acceptor_->asyncAccept([self](std::error_code ec, io::StreamSocket socket) {
             if (!self->listening_) {
                 return;
             }
             if (ec) {
-                if (detail::listenerCountTyped(self->emitter_, event::Error_) > 0) {
-                    detail::emitTyped(self->emitter_, event::Error_, Error("mysql2 server accept failed: " + ec.message()));
+                if (self->emitter_.listenerCount(event::Error_) > 0) {
+                    self->emitter_.emit(event::Error_, Error("mysql2 server accept failed: " + ec.message()));
                 }
                 self->start_accept();
                 return;
@@ -6730,7 +6720,7 @@ private:
                 std::lock_guard<std::mutex> lock(self->mutex_);
                 self->connections_.push_back(connection);
             }
-            detail::emitTyped(self->emitter_, event::ServerConnectionAccepted, connection.get());
+            self->emitter_.emit(event::ServerConnectionAccepted, *connection);
             if (self->options_.auto_handshake) {
                 auto handshake = self->options_.handshake;
                 handshake.connection_id = self->next_connection_id_++;
@@ -6742,7 +6732,7 @@ private:
 
     ServerOptions options_;
     EventContext ctx_;
-    std::unique_ptr<StreamAcceptor> acceptor_;
+    std::unique_ptr<io::StreamAcceptor> acceptor_;
     events::EventEmitter emitter_;
     std::thread thread_;
     mutable std::mutex mutex_;
@@ -6753,14 +6743,8 @@ private:
     std::atomic<bool> listening_{false};
 };
 
-events::EventEmitter& Server::eventTarget_() {
-    return impl_ ? impl_->emitter() : moved_from_emitter();
-}
-const events::EventEmitter& Server::eventTarget_() const {
-    return impl_ ? impl_->emitter() : moved_from_emitter();
-}
-
 Server::Server(ServerOptions options) : impl_(std::make_shared<ServerImpl>(std::move(options))) {
+    setEmitter_(impl_->emitter());
 }
 
 Server::~Server() {
@@ -6769,7 +6753,12 @@ Server::~Server() {
     }
 }
 
-Server::Server(Server&& other) noexcept : impl_(std::move(other.impl_)) {}
+Server::Server(Server&& other) noexcept : impl_(std::move(other.impl_)) {
+    if (impl_) {
+        setEmitter_(impl_->emitter());
+    }
+    other.resetEmitter_();
+}
 
 Server& Server::operator=(Server&& other) noexcept {
     if (this != &other) {
@@ -6777,6 +6766,12 @@ Server& Server::operator=(Server&& other) noexcept {
             impl_->close();
         }
         impl_ = std::move(other.impl_);
+        if (impl_) {
+            setEmitter_(impl_->emitter());
+        } else {
+            resetEmitter_();
+        }
+        other.resetEmitter_();
     }
     return *this;
 }
@@ -6823,7 +6818,7 @@ public:
         if (!idle_.empty()) {
             auto connection = idle_.back();
             idle_.pop_back();
-            detail::emitTyped(emitter_, event::Acquire, connection.get());
+            emitter_.emit(event::Acquire, *connection);
             return PoolConnection(shared_from_this(), connection);
         }
 
@@ -6831,8 +6826,8 @@ public:
             auto connection = std::make_shared<Connection>(options_.connection);
             connection->connect();
             connections_.push_back(std::move(connection));
-            detail::emitTyped(emitter_, event::ConnectionCreated, connections_.back().get());
-            detail::emitTyped(emitter_, event::Acquire, connections_.back().get());
+            emitter_.emit(event::ConnectionCreated, *connections_.back());
+            emitter_.emit(event::Acquire, *connections_.back());
             return PoolConnection(shared_from_this(), connections_.back());
         }
 
@@ -6847,7 +6842,7 @@ public:
             std::size_t& value;
             ~WaitingGuard() { --value; }
         } waiting_guard{waiting_count_};
-        detail::emitTyped(emitter_, event::Enqueue);
+        emitter_.emit(event::Enqueue);
 
         const auto deadline = std::chrono::steady_clock::now() +
             std::chrono::milliseconds(options_.wait_timeout_ms);
@@ -6863,7 +6858,7 @@ public:
         }
         auto connection = idle_.back();
         idle_.pop_back();
-        detail::emitTyped(emitter_, event::Acquire, connection.get());
+        emitter_.emit(event::Acquire, *connection);
         return PoolConnection(shared_from_this(), connection);
     }
 
@@ -6895,7 +6890,7 @@ public:
         }
         idle_.push_back(connection);
         try {
-            detail::emitTyped(emitter_, event::Release, connection.get());
+            emitter_.emit(event::Release, *connection);
         } catch (...) {
         }
         available_.notify_one();
@@ -7016,23 +7011,28 @@ void PoolConnection::release() {
     }
 }
 
-events::EventEmitter& Pool::eventTarget_() {
-    return impl_ ? impl_->emitter() : moved_from_emitter();
-}
-const events::EventEmitter& Pool::eventTarget_() const {
-    return impl_ ? impl_->emitter() : moved_from_emitter();
-}
-
 Pool::Pool(PoolOptions options) : impl_(std::make_shared<PoolImpl>(std::move(options))) {
+    setEmitter_(impl_->emitter());
 }
 
 Pool::~Pool() = default;
 
-Pool::Pool(Pool&& other) noexcept : impl_(std::move(other.impl_)) {}
+Pool::Pool(Pool&& other) noexcept : impl_(std::move(other.impl_)) {
+    if (impl_) {
+        setEmitter_(impl_->emitter());
+    }
+    other.resetEmitter_();
+}
 
 Pool& Pool::operator=(Pool&& other) noexcept {
     if (this != &other) {
         impl_ = std::move(other.impl_);
+        if (impl_) {
+            setEmitter_(impl_->emitter());
+        } else {
+            resetEmitter_();
+        }
+        other.resetEmitter_();
     }
     return *this;
 }
@@ -7206,8 +7206,8 @@ public:
             } catch (const Error& error) {
                 increase_error_count(id);
                 if (options_.can_retry && !matching_node_ids(pattern, false).empty()) {
-                    if (detail::listenerCountTyped(emitter_, event::Warn) > 0) {
-                        detail::emitTyped(emitter_, event::Warn, error);
+                    if (emitter_.listenerCount(event::Warn) > 0) {
+                        emitter_.emit(event::Warn, error);
                     }
                     continue;
                 }
@@ -7329,13 +7329,13 @@ private:
             }
         }
         if (emit_offline) {
-            detail::emitTyped(emitter_, event::Offline, id);
+            emitter_.emit(event::Offline, id);
         }
         if (emit_remove) {
             if (removed_pool) {
                 removed_pool->end();
             }
-            detail::emitTyped(emitter_, event::Remove, id);
+            emitter_.emit(event::Remove, id);
         }
     }
 
@@ -7358,7 +7358,7 @@ private:
             }
         }
         if (emit_online) {
-            detail::emitTyped(emitter_, event::Online, id);
+            emitter_.emit(event::Online, id);
         }
     }
 
@@ -7377,7 +7377,7 @@ private:
             pool->end();
         }
         if (emit_event) {
-            detail::emitTyped(emitter_, event::Remove, id);
+            emitter_.emit(event::Remove, id);
         }
     }
 
@@ -7423,24 +7423,29 @@ std::vector<QueryResult> PoolNamespace::execute_all(const std::string& sql, cons
     return connection->execute_all(sql, values);
 }
 
-events::EventEmitter& PoolCluster::eventTarget_() {
-    return impl_ ? impl_->emitter() : moved_from_emitter();
-}
-const events::EventEmitter& PoolCluster::eventTarget_() const {
-    return impl_ ? impl_->emitter() : moved_from_emitter();
-}
-
 PoolCluster::PoolCluster(PoolClusterOptions options)
     : impl_(std::make_shared<PoolClusterImpl>(options)) {
+    setEmitter_(impl_->emitter());
 }
 
 PoolCluster::~PoolCluster() = default;
 
-PoolCluster::PoolCluster(PoolCluster&& other) noexcept : impl_(std::move(other.impl_)) {}
+PoolCluster::PoolCluster(PoolCluster&& other) noexcept : impl_(std::move(other.impl_)) {
+    if (impl_) {
+        setEmitter_(impl_->emitter());
+    }
+    other.resetEmitter_();
+}
 
 PoolCluster& PoolCluster::operator=(PoolCluster&& other) noexcept {
     if (this != &other) {
         impl_ = std::move(other.impl_);
+        if (impl_) {
+            setEmitter_(impl_->emitter());
+        } else {
+            resetEmitter_();
+        }
+        other.resetEmitter_();
     }
     return *this;
 }

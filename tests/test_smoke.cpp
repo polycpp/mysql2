@@ -315,9 +315,9 @@ TEST(server_mode, loopback_query_uses_adapted_server_api) {
     };
 
     auto server = mysql2::create_server(server_options);
-    server.on(mysql2::event::ServerConnectionAccepted, [&](mysql2::ServerConnection* connection) {
+    server.on(mysql2::event::ServerConnectionAccepted, [&](mysql2::ServerConnection& connection) {
         connection_seen = true;
-        connection->on(mysql2::event::ServerQuery, [&](mysql2::ServerConnection* conn, const std::string& sql) {
+        connection.on(mysql2::event::ServerQuery, [&](mysql2::ServerConnection& conn, const std::string& sql) {
             query_seen = sql == "SELECT 42 AS answer";
 
             mysql2::Field answer;
@@ -328,13 +328,13 @@ TEST(server_mode, loopback_query_uses_adapted_server_api) {
 
             mysql2::Row row;
             row.values = {int64_t{42}};
-            conn->write_text_result(std::vector<mysql2::Row>{row}, std::vector<mysql2::Field>{answer});
+            conn.write_text_result(std::vector<mysql2::Row>{row}, std::vector<mysql2::Field>{answer});
         });
-        connection->on(mysql2::event::ServerPing, [&](mysql2::ServerConnection* conn) {
+        connection.on(mysql2::event::ServerPing, [&](mysql2::ServerConnection& conn) {
             ping_seen = true;
-            conn->write_ok();
+            conn.write_ok();
         });
-        connection->on(mysql2::event::ServerStatementPrepare, [&](mysql2::ServerConnection* conn, const std::string& sql) {
+        connection.on(mysql2::event::ServerStatementPrepare, [&](mysql2::ServerConnection& conn, const std::string& sql) {
             if (sql == "SELECT ? AS answer") {
                 protocol_stmt_prepare_seen = true;
                 mysql2::Field parameter;
@@ -348,14 +348,14 @@ TEST(server_mode, loopback_query_uses_adapted_server_api) {
                 answer.column_type = mysql2::constants::column_type::LONGLONG;
                 answer.character_set = 63;
                 answer.encoding = "binary";
-                conn->write_statement_prepare_ok(7, {parameter}, {answer});
+                conn.write_statement_prepare_ok(7, {parameter}, {answer});
             } else {
                 stmt_prepare_seen = sql.rfind("PREPARE ", 0) == 0;
-                conn->write_ok();
+                conn.write_ok();
             }
         });
-        connection->on(mysql2::event::ServerStatementExecute,
-                      [&](mysql2::ServerConnection* conn, const mysql2::ServerStatementExecuteInfo& info) {
+        connection.on(mysql2::event::ServerStatementExecute,
+                      [&](mysql2::ServerConnection& conn, const mysql2::ServerStatementExecuteInfo& info) {
             if (info.statement_id == 7) {
                 protocol_stmt_execute_seen = !info.values.empty() && std::get<int64_t>(info.values[0]) == 41;
                 mysql2::Field answer;
@@ -366,13 +366,13 @@ TEST(server_mode, loopback_query_uses_adapted_server_api) {
 
                 mysql2::Row row;
                 row.values = {int64_t{42}};
-                conn->write_binary_result(std::vector<mysql2::Row>{row}, std::vector<mysql2::Field>{answer});
+                conn.write_binary_result(std::vector<mysql2::Row>{row}, std::vector<mysql2::Field>{answer});
             } else {
                 stmt_execute_seen = info.query == "EXECUTE polycpp_stmt";
-                conn->write_ok();
+                conn.write_ok();
             }
         });
-        connection->on(mysql2::event::ServerQuit, [&](mysql2::ServerConnection*) {
+        connection.on(mysql2::event::ServerQuit, [&](mysql2::ServerConnection&) {
             quit_seen = true;
         });
     });
@@ -430,8 +430,8 @@ TEST(server_mode, loopback_query_supports_unix_socket_path) {
     std::atomic<bool> query_seen{false};
     std::atomic<bool> quit_seen{false};
     auto server = mysql2::create_server(server_options);
-    server.on(mysql2::event::ServerConnectionAccepted, [&](mysql2::ServerConnection* connection) {
-        connection->on(mysql2::event::ServerQuery, [&](mysql2::ServerConnection* conn, const std::string& sql) {
+    server.on(mysql2::event::ServerConnectionAccepted, [&](mysql2::ServerConnection& connection) {
+        connection.on(mysql2::event::ServerQuery, [&](mysql2::ServerConnection& conn, const std::string& sql) {
             query_seen = sql == "SELECT 'ipc' AS transport";
 
             mysql2::Field transport;
@@ -442,9 +442,9 @@ TEST(server_mode, loopback_query_supports_unix_socket_path) {
 
             mysql2::Row row;
             row.values = {std::string("ipc")};
-            conn->write_text_result(std::vector<mysql2::Row>{row}, std::vector<mysql2::Field>{transport});
+            conn.write_text_result(std::vector<mysql2::Row>{row}, std::vector<mysql2::Field>{transport});
         });
-        connection->on(mysql2::event::ServerQuit, [&](mysql2::ServerConnection*) {
+        connection.on(mysql2::event::ServerQuit, [&](mysql2::ServerConnection&) {
             quit_seen = true;
         });
     });
@@ -492,8 +492,8 @@ TEST(server_mode, loopback_query_supports_tls_upgrade_when_configured) {
     std::atomic<bool> query_seen{false};
     std::atomic<bool> quit_seen{false};
     auto server = mysql2::create_server(server_options);
-    server.on(mysql2::event::ServerConnectionAccepted, [&](mysql2::ServerConnection* connection) {
-        connection->on(mysql2::event::ServerQuery, [&](mysql2::ServerConnection* conn, const std::string& sql) {
+    server.on(mysql2::event::ServerConnectionAccepted, [&](mysql2::ServerConnection& connection) {
+        connection.on(mysql2::event::ServerQuery, [&](mysql2::ServerConnection& conn, const std::string& sql) {
             query_seen = sql == "SELECT 'tls' AS transport";
 
             mysql2::Field transport;
@@ -504,9 +504,9 @@ TEST(server_mode, loopback_query_supports_tls_upgrade_when_configured) {
 
             mysql2::Row row;
             row.values = {std::string("tls")};
-            conn->write_text_result(std::vector<mysql2::Row>{row}, std::vector<mysql2::Field>{transport});
+            conn.write_text_result(std::vector<mysql2::Row>{row}, std::vector<mysql2::Field>{transport});
         });
-        connection->on(mysql2::event::ServerQuit, [&](mysql2::ServerConnection*) {
+        connection.on(mysql2::event::ServerQuit, [&](mysql2::ServerConnection&) {
             quit_seen = true;
         });
     });
@@ -857,14 +857,14 @@ TEST(mysql2_integration, query_against_real_database_when_configured) {
     bool pool_connection_event = false;
     bool pool_acquire_event = false;
     bool pool_release_event = false;
-    pool.on(mysql2::event::ConnectionCreated, [&](mysql2::Connection* pooled_connection) {
-        pool_connection_event = pooled_connection->connected();
+    pool.on(mysql2::event::ConnectionCreated, [&](mysql2::Connection& pooled_connection) {
+        pool_connection_event = pooled_connection.connected();
     });
-    pool.on(mysql2::event::Acquire, [&](mysql2::Connection* pooled_connection) {
-        pool_acquire_event = pooled_connection->connected();
+    pool.on(mysql2::event::Acquire, [&](mysql2::Connection& pooled_connection) {
+        pool_acquire_event = pooled_connection.connected();
     });
-    pool.on(mysql2::event::Release, [&](mysql2::Connection* pooled_connection) {
-        pool_release_event = pooled_connection->connected();
+    pool.on(mysql2::event::Release, [&](mysql2::Connection& pooled_connection) {
+        pool_release_event = pooled_connection.connected();
     });
     const auto pooled = pool.query("SELECT 5 AS five");
     ASSERT_EQ(pooled.rows.size(), 1u);

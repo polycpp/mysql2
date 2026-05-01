@@ -17,49 +17,9 @@
 #include <polycpp/core/json.hpp>
 #include <polycpp/core/promise.hpp>
 #include <polycpp/events.hpp>
-#include <polycpp/events/typed_event.hpp>
-#include <polycpp/interfaces/event_emitter.hpp>
 #include <polycpp/stream.hpp>
 
 namespace polycpp::mysql2 {
-
-namespace detail {
-
-// ─────────────────────────────────────────────────────────────────────────────
-// TypedEvent <-> EventEmitter call-site helpers.
-//
-// polycpp HEAD's `IEventEmitter::on(TypedEvent, F)` returns `IEventEmitter&`,
-// not a `ListenerId`, and `emit` / `listenerCount` only accept `const
-// std::string&`. mysql2's wrapper classes still want the convenience of
-// passing the typed-event constants to `emit()` / `listenerCount()`. These
-// thin helpers absorb the difference so the wrapper classes (Connection,
-// Server, ServerConnection, Pool, PoolCluster) and their internal Impl
-// objects can keep their `emitter_.emit(...)` / `emitter_.listenerCount(...)`
-// call sites readable.
-// ─────────────────────────────────────────────────────────────────────────────
-
-template <typename Emitter, typename... CallbackArgs, typename F>
-auto onTyped(Emitter& emitter,
-             const events::TypedEvent<CallbackArgs...>& evt,
-             F&& cb) -> decltype(static_cast<::polycpp::IEventEmitter&>(emitter).on(evt, std::forward<F>(cb))) {
-    return static_cast<::polycpp::IEventEmitter&>(emitter).on(evt, std::forward<F>(cb));
-}
-
-template <typename Emitter, typename... CallbackArgs, typename... Args>
-bool emitTyped(Emitter& emitter,
-               const events::TypedEvent<CallbackArgs...>& evt, Args&&... args) {
-    return static_cast<::polycpp::IEventEmitter&>(emitter).emit(
-        std::string(evt.name), std::forward<Args>(args)...);
-}
-
-template <typename Emitter, typename... CallbackArgs>
-size_t listenerCountTyped(const Emitter& emitter,
-                          const events::TypedEvent<CallbackArgs...>& evt) {
-    return static_cast<const ::polycpp::IEventEmitter&>(emitter)
-        .listenerCount(std::string(evt.name));
-}
-
-}  // namespace detail
 
 using Buffer = polycpp::buffer::Buffer;
 
@@ -452,13 +412,8 @@ void clear_parser_cache() noexcept;
 BinlogEvent parse_binlog_event_packet(const Buffer& payload);
 std::vector<BinlogGtidSource> parse_gtid_set(const std::string& gtid_set);
 
-class Connection : public events::IEventEmitterForwarder<Connection> {
-    friend class events::IEventEmitterForwarder<Connection>;
-
+class Connection : public events::EventEmitterForwarder {
 public:
-    using events::IEventEmitterForwarder<Connection>::on;
-    using events::IEventEmitterForwarder<Connection>::once;
-
     Connection();
     explicit Connection(ConnectionOptions options);
     ~Connection();
@@ -468,19 +423,6 @@ public:
 
     Connection(const Connection&) = delete;
     Connection& operator=(const Connection&) = delete;
-
-    /// Typed-event emit. Adapts current polycpp `IEventEmitter::emit(string, ...)`
-    /// to the typed-event sites that mysql2 users still want to call.
-    template <typename... CallbackArgs, typename... Args>
-    bool emit(const events::TypedEvent<CallbackArgs...>& event, Args&&... args) {
-        return detail::emitTyped(*this, event, std::forward<Args>(args)...);
-    }
-    using events::IEventEmitterForwarder<Connection>::emit;
-    template <typename... CallbackArgs>
-    size_t listenerCount(const events::TypedEvent<CallbackArgs...>& event) const {
-        return detail::listenerCountTyped(*this, event);
-    }
-    using events::IEventEmitterForwarder<Connection>::listenerCount;
 
     void connect();
     void connect(VoidCallback callback);
@@ -605,18 +547,10 @@ public:
 private:
     class Impl;
     Impl* impl_ = nullptr;
-
-    events::EventEmitter& eventTarget_();
-    const events::EventEmitter& eventTarget_() const;
 };
 
-class ServerConnection : public events::IEventEmitterForwarder<ServerConnection> {
-    friend class events::IEventEmitterForwarder<ServerConnection>;
-
+class ServerConnection : public events::EventEmitterForwarder {
 public:
-    using events::IEventEmitterForwarder<ServerConnection>::on;
-    using events::IEventEmitterForwarder<ServerConnection>::once;
-
     ~ServerConnection();
 
     ServerConnection(ServerConnection&&) noexcept;
@@ -624,17 +558,6 @@ public:
 
     ServerConnection(const ServerConnection&) = delete;
     ServerConnection& operator=(const ServerConnection&) = delete;
-
-    template <typename... CallbackArgs, typename... Args>
-    bool emit(const events::TypedEvent<CallbackArgs...>& event, Args&&... args) {
-        return detail::emitTyped(*this, event, std::forward<Args>(args)...);
-    }
-    using events::IEventEmitterForwarder<ServerConnection>::emit;
-    template <typename... CallbackArgs>
-    size_t listenerCount(const events::TypedEvent<CallbackArgs...>& event) const {
-        return detail::listenerCountTyped(*this, event);
-    }
-    using events::IEventEmitterForwarder<ServerConnection>::listenerCount;
 
     void server_handshake(ServerHandshakeOptions options = {});
     void write_ok(OkPacket ok = {});
@@ -665,20 +588,12 @@ private:
     explicit ServerConnection(std::shared_ptr<Impl> impl);
 
     std::shared_ptr<Impl> impl_;
-
-    events::EventEmitter& eventTarget_();
-    const events::EventEmitter& eventTarget_() const;
 };
 
 class ServerImpl;
 
-class Server : public events::IEventEmitterForwarder<Server> {
-    friend class events::IEventEmitterForwarder<Server>;
-
+class Server : public events::EventEmitterForwarder {
 public:
-    using events::IEventEmitterForwarder<Server>::on;
-    using events::IEventEmitterForwarder<Server>::once;
-
     explicit Server(ServerOptions options = {});
     ~Server();
 
@@ -687,17 +602,6 @@ public:
 
     Server(const Server&) = delete;
     Server& operator=(const Server&) = delete;
-
-    template <typename... CallbackArgs, typename... Args>
-    bool emit(const events::TypedEvent<CallbackArgs...>& event, Args&&... args) {
-        return detail::emitTyped(*this, event, std::forward<Args>(args)...);
-    }
-    using events::IEventEmitterForwarder<Server>::emit;
-    template <typename... CallbackArgs>
-    size_t listenerCount(const events::TypedEvent<CallbackArgs...>& event) const {
-        return detail::listenerCountTyped(*this, event);
-    }
-    using events::IEventEmitterForwarder<Server>::listenerCount;
 
     void listen();
     void listen(uint16_t port);
@@ -712,9 +616,6 @@ public:
 
 private:
     std::shared_ptr<ServerImpl> impl_;
-
-    events::EventEmitter& eventTarget_();
-    const events::EventEmitter& eventTarget_() const;
 };
 
 class PoolImpl;
@@ -746,13 +647,8 @@ private:
     std::shared_ptr<Connection> connection_;
 };
 
-class Pool : public events::IEventEmitterForwarder<Pool> {
-    friend class events::IEventEmitterForwarder<Pool>;
-
+class Pool : public events::EventEmitterForwarder {
 public:
-    using events::IEventEmitterForwarder<Pool>::on;
-    using events::IEventEmitterForwarder<Pool>::once;
-
     explicit Pool(PoolOptions options);
     ~Pool();
 
@@ -761,17 +657,6 @@ public:
 
     Pool(const Pool&) = delete;
     Pool& operator=(const Pool&) = delete;
-
-    template <typename... CallbackArgs, typename... Args>
-    bool emit(const events::TypedEvent<CallbackArgs...>& event, Args&&... args) {
-        return detail::emitTyped(*this, event, std::forward<Args>(args)...);
-    }
-    using events::IEventEmitterForwarder<Pool>::emit;
-    template <typename... CallbackArgs>
-    size_t listenerCount(const events::TypedEvent<CallbackArgs...>& event) const {
-        return detail::listenerCountTyped(*this, event);
-    }
-    using events::IEventEmitterForwarder<Pool>::listenerCount;
 
     PoolConnection get_connection();
     void get_connection(std::function<void(std::exception_ptr, std::shared_ptr<PoolConnection>)> callback);
@@ -796,9 +681,6 @@ public:
 
 private:
     std::shared_ptr<PoolImpl> impl_;
-
-    events::EventEmitter& eventTarget_();
-    const events::EventEmitter& eventTarget_() const;
 };
 
 class PoolClusterImpl;
@@ -821,13 +703,8 @@ private:
     PoolSelector selector_ = PoolSelector::RoundRobin;
 };
 
-class PoolCluster : public events::IEventEmitterForwarder<PoolCluster> {
-    friend class events::IEventEmitterForwarder<PoolCluster>;
-
+class PoolCluster : public events::EventEmitterForwarder {
 public:
-    using events::IEventEmitterForwarder<PoolCluster>::on;
-    using events::IEventEmitterForwarder<PoolCluster>::once;
-
     explicit PoolCluster(PoolClusterOptions options = {});
     ~PoolCluster();
 
@@ -836,17 +713,6 @@ public:
 
     PoolCluster(const PoolCluster&) = delete;
     PoolCluster& operator=(const PoolCluster&) = delete;
-
-    template <typename... CallbackArgs, typename... Args>
-    bool emit(const events::TypedEvent<CallbackArgs...>& event, Args&&... args) {
-        return detail::emitTyped(*this, event, std::forward<Args>(args)...);
-    }
-    using events::IEventEmitterForwarder<PoolCluster>::emit;
-    template <typename... CallbackArgs>
-    size_t listenerCount(const events::TypedEvent<CallbackArgs...>& event) const {
-        return detail::listenerCountTyped(*this, event);
-    }
-    using events::IEventEmitterForwarder<PoolCluster>::listenerCount;
 
     void add(PoolOptions options);
     void add(std::string id, PoolOptions options);
@@ -863,9 +729,6 @@ public:
 
 private:
     std::shared_ptr<PoolClusterImpl> impl_;
-
-    events::EventEmitter& eventTarget_();
-    const events::EventEmitter& eventTarget_() const;
 };
 
 Connection create_connection(ConnectionOptions options);
@@ -879,28 +742,28 @@ QueryResult query(ConnectionOptions options, const std::string& sql);
 Promise<QueryResult> query_promise(ConnectionOptions options, const std::string& sql);
 
 namespace event {
-inline constexpr events::TypedEvent<const ConnectionInfo&> Connect{"connect"};
-inline constexpr events::TypedEvent<const Error&> Error_{"error"};
-inline constexpr events::TypedEvent<const TraceEvent&> Trace{"trace"};
-inline constexpr events::TypedEvent<> End{"end"};
-inline constexpr events::TypedEvent<> Close{"close"};
-inline constexpr events::TypedEvent<> Enqueue{"enqueue"};
-inline constexpr events::TypedEvent<Connection*> ConnectionCreated{"connection"};
-inline constexpr events::TypedEvent<Connection*> Acquire{"acquire"};
-inline constexpr events::TypedEvent<Connection*> Release{"release"};
-inline constexpr events::TypedEvent<const std::string&> Online{"online"};
-inline constexpr events::TypedEvent<const std::string&> Offline{"offline"};
-inline constexpr events::TypedEvent<const std::string&> Remove{"remove"};
-inline constexpr events::TypedEvent<const Error&> Warn{"warn"};
-inline constexpr events::TypedEvent<ServerConnection*> ServerConnectionAccepted{"connection"};
-inline constexpr events::TypedEvent<ServerConnection*, const std::string&> ServerQuery{"query"};
-inline constexpr events::TypedEvent<ServerConnection*> ServerPing{"ping"};
-inline constexpr events::TypedEvent<ServerConnection*> ServerQuit{"quit"};
-inline constexpr events::TypedEvent<ServerConnection*, const std::string&> ServerInitDb{"init_db"};
-inline constexpr events::TypedEvent<ServerConnection*, const std::string&, const std::string&> ServerFieldList{"field_list"};
-inline constexpr events::TypedEvent<ServerConnection*, const std::string&> ServerStatementPrepare{"stmt_prepare"};
-inline constexpr events::TypedEvent<ServerConnection*, const ServerStatementExecuteInfo&> ServerStatementExecute{"stmt_execute"};
-inline constexpr events::TypedEvent<ServerConnection*, const Buffer&, bool, uint8_t> ServerPacket{"packet"};
+inline constexpr events::TypedEvent<"connect", const ConnectionInfo&> Connect{};
+inline constexpr events::TypedEvent<"error", const Error&> Error_{};
+inline constexpr events::TypedEvent<"trace", const TraceEvent&> Trace{};
+inline constexpr events::TypedEvent<"end"> End{};
+inline constexpr events::TypedEvent<"close"> Close{};
+inline constexpr events::TypedEvent<"enqueue"> Enqueue{};
+inline constexpr events::TypedEvent<"connection", Connection&> ConnectionCreated{};
+inline constexpr events::TypedEvent<"acquire", Connection&> Acquire{};
+inline constexpr events::TypedEvent<"release", Connection&> Release{};
+inline constexpr events::TypedEvent<"online", const std::string&> Online{};
+inline constexpr events::TypedEvent<"offline", const std::string&> Offline{};
+inline constexpr events::TypedEvent<"remove", const std::string&> Remove{};
+inline constexpr events::TypedEvent<"warn", const Error&> Warn{};
+inline constexpr events::TypedEvent<"connection", ServerConnection&> ServerConnectionAccepted{};
+inline constexpr events::TypedEvent<"query", ServerConnection&, const std::string&> ServerQuery{};
+inline constexpr events::TypedEvent<"ping", ServerConnection&> ServerPing{};
+inline constexpr events::TypedEvent<"quit", ServerConnection&> ServerQuit{};
+inline constexpr events::TypedEvent<"init_db", ServerConnection&, const std::string&> ServerInitDb{};
+inline constexpr events::TypedEvent<"field_list", ServerConnection&, const std::string&, const std::string&> ServerFieldList{};
+inline constexpr events::TypedEvent<"stmt_prepare", ServerConnection&, const std::string&> ServerStatementPrepare{};
+inline constexpr events::TypedEvent<"stmt_execute", ServerConnection&, const ServerStatementExecuteInfo&> ServerStatementExecute{};
+inline constexpr events::TypedEvent<"packet", ServerConnection&, const Buffer&, bool, uint8_t> ServerPacket{};
 }  // namespace event
 
 namespace constants {
@@ -977,3 +840,30 @@ inline constexpr uint8_t PREVIOUS_GTIDS = 35;
 }  // namespace constants
 
 }  // namespace polycpp::mysql2
+
+namespace polycpp::events {
+template <>
+struct ErrorEventOf<mysql2::Connection> {
+    static constexpr auto value = mysql2::event::Error_;
+};
+
+template <>
+struct ErrorEventOf<mysql2::Pool> {
+    static constexpr auto value = mysql2::event::Error_;
+};
+
+template <>
+struct ErrorEventOf<mysql2::PoolCluster> {
+    static constexpr auto value = mysql2::event::Error_;
+};
+
+template <>
+struct ErrorEventOf<mysql2::Server> {
+    static constexpr auto value = mysql2::event::Error_;
+};
+
+template <>
+struct ErrorEventOf<mysql2::ServerConnection> {
+    static constexpr auto value = mysql2::event::Error_;
+};
+}  // namespace polycpp::events

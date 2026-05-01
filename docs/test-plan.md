@@ -98,19 +98,22 @@ Service versions used for e2e validation:
 - MySQL Community Server 8.4.6 in Docker.
 - Database e2e commands run from an Ubuntu 22.04 helper container sharing the database container network namespace.
 
-Additional validation on May 1, 2026 after migrating to the current polycpp
-TypedEvent / IEventEmitterForwarder shape (`events::TypedEvent<Args...>{"name"}`)
-against polycpp HEAD `7a8df099`:
+Additional validation on May 1, 2026 after rolling back the same-day
+TypedEvent migration in favor of the canonical
+`events::TypedEvent<"name", Args...>` (fixed_string NTTP) form, dropping
+the private `detail/socket_adapter.hpp` variant adapter, and switching to
+`polycpp::io::PipeSocket` / `PipeAcceptor` / `StreamSocket` /
+`StreamAcceptor` directly against polycpp HEAD `75bc07df`:
 
 ```bash
 rm -rf build
 cmake -B build -G Ninja -DCMAKE_BUILD_TYPE=Debug \
-  -DPOLYCPP_SOURCE_DIR=/data/work/gitlab-workspace/polycpp
+  -DFETCHCONTENT_SOURCE_DIR_POLYCPP=/data/work/gitlab-workspace/polycpp
 cmake --build build -j$(nproc)
 (cd build && ctest --output-on-failure)
 ```
 
-Result: `100% tests passed, 0 tests failed out of 14` in 0.23 s
+Result: `100% tests passed, 0 tests failed out of 14` in 0.09 s
 (12 ran, 2 skipped — `server_mode.loopback_query_supports_tls_upgrade_when_configured`
 needs `MYSQL2_TEST_SERVER_TLS_CERT_FILE`/`MYSQL2_TEST_SERVER_TLS_KEY_FILE`,
 `mysql2_integration.query_against_real_database_when_configured` needs
