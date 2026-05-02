@@ -1,5 +1,6 @@
 #include <gtest/gtest.h>
 
+#include <array>
 #include <atomic>
 #include <chrono>
 #include <cstdlib>
@@ -37,6 +38,89 @@ std::string unique_socket_path() {
     name << "polycpp-mysql2-" << std::chrono::steady_clock::now().time_since_epoch().count()
          << "-" << counter++ << ".sock";
     return (std::filesystem::temp_directory_path() / name.str()).string();
+}
+
+bool env_enabled(const char* name) {
+    const char* value = std::getenv(name);
+    return value && std::string(value) != "0" && std::string(value) != "false";
+}
+
+uint64_t value_as_u64(const mysql2::Value& value) {
+    if (const auto* u = std::get_if<uint64_t>(&value)) return *u;
+    if (const auto* i = std::get_if<int64_t>(&value)) return static_cast<uint64_t>(*i);
+    if (const auto* d = std::get_if<double>(&value)) return static_cast<uint64_t>(*d);
+    if (const auto* s = std::get_if<std::string>(&value)) return static_cast<uint64_t>(std::stoull(*s));
+    throw mysql2::Error("test expected numeric mysql2 value");
+}
+
+std::string value_as_string(const mysql2::Value& value) {
+    if (const auto* s = std::get_if<std::string>(&value)) return *s;
+    if (const auto* b = std::get_if<mysql2::Buffer>(&value)) return b->toString();
+    throw mysql2::Error("test expected string mysql2 value");
+}
+
+void append_u8(std::vector<uint8_t>& payload, uint8_t value) {
+    payload.push_back(value);
+}
+
+void append_u16_le(std::vector<uint8_t>& payload, uint16_t value) {
+    payload.push_back(static_cast<uint8_t>(value & 0xff));
+    payload.push_back(static_cast<uint8_t>((value >> 8) & 0xff));
+}
+
+void append_u24_be(std::vector<uint8_t>& payload, uint32_t value) {
+    payload.push_back(static_cast<uint8_t>((value >> 16) & 0xff));
+    payload.push_back(static_cast<uint8_t>((value >> 8) & 0xff));
+    payload.push_back(static_cast<uint8_t>(value & 0xff));
+}
+
+void append_u32_le(std::vector<uint8_t>& payload, uint32_t value) {
+    payload.push_back(static_cast<uint8_t>(value & 0xff));
+    payload.push_back(static_cast<uint8_t>((value >> 8) & 0xff));
+    payload.push_back(static_cast<uint8_t>((value >> 16) & 0xff));
+    payload.push_back(static_cast<uint8_t>((value >> 24) & 0xff));
+}
+
+void append_u32_be(std::vector<uint8_t>& payload, uint32_t value) {
+    payload.push_back(static_cast<uint8_t>((value >> 24) & 0xff));
+    payload.push_back(static_cast<uint8_t>((value >> 16) & 0xff));
+    payload.push_back(static_cast<uint8_t>((value >> 8) & 0xff));
+    payload.push_back(static_cast<uint8_t>(value & 0xff));
+}
+
+void append_u40_be(std::vector<uint8_t>& payload, uint64_t value) {
+    for (int i = 4; i >= 0; --i) {
+        payload.push_back(static_cast<uint8_t>((value >> (8 * i)) & 0xff));
+    }
+}
+
+void append_u48_le(std::vector<uint8_t>& payload, uint64_t value) {
+    for (int i = 0; i < 6; ++i) {
+        payload.push_back(static_cast<uint8_t>((value >> (8 * i)) & 0xff));
+    }
+}
+
+void append_u64_le(std::vector<uint8_t>& payload, uint64_t value) {
+    for (int i = 0; i < 8; ++i) {
+        payload.push_back(static_cast<uint8_t>((value >> (8 * i)) & 0xff));
+    }
+}
+
+void append_string(std::vector<uint8_t>& payload, const std::string& value) {
+    payload.insert(payload.end(), value.begin(), value.end());
+}
+
+mysql2::Buffer make_binlog_event(uint8_t type, const std::vector<uint8_t>& body) {
+    std::vector<uint8_t> payload;
+    append_u8(payload, 0x00);
+    append_u32_le(payload, 1);
+    append_u8(payload, type);
+    append_u32_le(payload, 99);
+    append_u32_le(payload, static_cast<uint32_t>(19 + body.size()));
+    append_u32_le(payload, 1234);
+    append_u16_le(payload, 0);
+    payload.insert(payload.end(), body.begin(), body.end());
+    return mysql2::Buffer::from(payload.data(), payload.size());
 }
 
 }  // namespace
@@ -223,6 +307,212 @@ TEST(binlog, stateful_parser_decodes_table_map_and_write_rows) {
     ASSERT_EQ(rows.row_changes[0].after.size(), 2u);
     EXPECT_EQ(std::get<int64_t>(rows.row_changes[0].after[0]), 42);
     EXPECT_EQ(std::get<std::string>(rows.row_changes[0].after[1]), "Ada");
+}
+
+TEST(binlog, stateful_parser_decodes_update_delete_and_temporal2_rows) {
+    std::vector<uint8_t> table_map_body;
+    append_u48_le(table_map_body, 9);
+    append_u16_le(table_map_body, 0);
+    append_u8(table_map_body, 4);
+    append_string(table_map_body, "test");
+    append_u8(table_map_body, 0);
+    append_u8(table_map_body, 8);
+    append_string(table_map_body, "temporal");
+    append_u8(table_map_body, 0);
+    append_u8(table_map_body, 5);
+    append_u8(table_map_body, mysql2::constants::column_type::LONG);
+    append_u8(table_map_body, mysql2::constants::column_type::VAR_STRING);
+    append_u8(table_map_body, mysql2::constants::column_type::TIMESTAMP2);
+    append_u8(table_map_body, mysql2::constants::column_type::DATETIME2);
+    append_u8(table_map_body, mysql2::constants::column_type::TIME2);
+    append_u8(table_map_body, 5);
+    append_u16_le(table_map_body, 255);
+    append_u8(table_map_body, 6);
+    append_u8(table_map_body, 6);
+    append_u8(table_map_body, 6);
+    append_u8(table_map_body, 0);
+
+    const auto append_temporal_values = [](std::vector<uint8_t>& payload,
+                                           int32_t id,
+                                           const std::string& name,
+                                           uint32_t timestamp_seconds,
+                                           uint64_t datetime2_int,
+                                           uint32_t time2_int) {
+        append_u8(payload, 0x00);
+        append_u32_le(payload, static_cast<uint32_t>(id));
+        append_u8(payload, static_cast<uint8_t>(name.size()));
+        append_string(payload, name);
+        append_u32_be(payload, timestamp_seconds);
+        append_u24_be(payload, 123456);
+        append_u40_be(payload, datetime2_int + 0x8000000000ULL);
+        append_u24_be(payload, 123456);
+        append_u24_be(payload, time2_int + 0x800000);
+        append_u24_be(payload, 123456);
+    };
+    const auto datetime2_int = (static_cast<uint64_t>(2024 * 13 + 5) << 22) |
+                               (static_cast<uint64_t>(6) << 17) |
+                               (static_cast<uint64_t>(7) << 12) |
+                               (static_cast<uint64_t>(8) << 6) |
+                               9;
+    const auto time2_int = (12u << 12) | (34u << 6) | 56u;
+
+    mysql2::BinlogParser parser;
+    const auto table_map = parser.parse(make_binlog_event(mysql2::constants::binlog_event_type::TABLE_MAP, table_map_body));
+    ASSERT_EQ(table_map.column_types.size(), 5u);
+    ASSERT_EQ(table_map.column_metadata.size(), 5u);
+    EXPECT_EQ(table_map.column_metadata[2], 6u);
+    EXPECT_EQ(table_map.column_metadata[3], 6u);
+    EXPECT_EQ(table_map.column_metadata[4], 6u);
+
+    std::vector<uint8_t> update_body;
+    append_u48_le(update_body, 9);
+    append_u16_le(update_body, 0);
+    append_u8(update_body, 5);
+    append_u8(update_body, 0x1f);
+    append_u8(update_body, 0x1f);
+    append_temporal_values(update_body, 42, "Ada", 1234567890u, datetime2_int, time2_int);
+    append_temporal_values(update_body, 43, "Bea", 1234567891u, datetime2_int, time2_int);
+
+    const auto update = parser.parse(make_binlog_event(mysql2::constants::binlog_event_type::UPDATE_ROWS_V1, update_body));
+    EXPECT_EQ(update.name, "UpdateRowsEventV1");
+    ASSERT_EQ(update.row_changes.size(), 1u);
+    ASSERT_EQ(update.row_changes[0].before.size(), 5u);
+    ASSERT_EQ(update.row_changes[0].after.size(), 5u);
+    EXPECT_EQ(std::get<int64_t>(update.row_changes[0].before[0]), 42);
+    EXPECT_EQ(std::get<int64_t>(update.row_changes[0].after[0]), 43);
+    const auto& timestamp = std::get<mysql2::BinlogTimestamp>(update.row_changes[0].after[2]);
+    EXPECT_EQ(timestamp.seconds_since_epoch, 1234567891u);
+    EXPECT_EQ(timestamp.microsecond, 123456u);
+    const auto& datetime = std::get<mysql2::BinlogDateTime>(update.row_changes[0].after[3]);
+    EXPECT_EQ(datetime.to_string(), "2024-05-06 07:08:09.123456");
+    const auto& time = std::get<mysql2::BinlogTime>(update.row_changes[0].after[4]);
+    EXPECT_FALSE(time.negative);
+    EXPECT_EQ(time.to_string(), "12:34:56.123456");
+
+    std::vector<uint8_t> delete_body;
+    append_u48_le(delete_body, 9);
+    append_u16_le(delete_body, 0);
+    append_u8(delete_body, 5);
+    append_u8(delete_body, 0x1f);
+    append_temporal_values(delete_body, 43, "Bea", 1234567891u, datetime2_int, time2_int);
+
+    const auto deleted = parser.parse(make_binlog_event(mysql2::constants::binlog_event_type::DELETE_ROWS_V1, delete_body));
+    EXPECT_EQ(deleted.name, "DeleteRowsEventV1");
+    ASSERT_EQ(deleted.row_changes.size(), 1u);
+    ASSERT_EQ(deleted.row_changes[0].before.size(), 5u);
+    EXPECT_TRUE(deleted.row_changes[0].after.empty());
+    EXPECT_EQ(std::get<int64_t>(deleted.row_changes[0].before[0]), 43);
+}
+
+TEST(binlog, stateful_parser_decodes_negative_time2_fractional_rows) {
+    std::vector<uint8_t> table_map_body;
+    append_u48_le(table_map_body, 10);
+    append_u16_le(table_map_body, 0);
+    append_u8(table_map_body, 4);
+    append_string(table_map_body, "test");
+    append_u8(table_map_body, 0);
+    append_u8(table_map_body, 8);
+    append_string(table_map_body, "time_neg");
+    append_u8(table_map_body, 0);
+    append_u8(table_map_body, 1);
+    append_u8(table_map_body, mysql2::constants::column_type::TIME2);
+    append_u8(table_map_body, 1);
+    append_u8(table_map_body, 2);
+    append_u8(table_map_body, 0);
+
+    mysql2::BinlogParser parser;
+    parser.parse(make_binlog_event(mysql2::constants::binlog_event_type::TABLE_MAP, table_map_body));
+
+    std::vector<uint8_t> row_body;
+    append_u48_le(row_body, 10);
+    append_u16_le(row_body, 0);
+    append_u8(row_body, 1);
+    append_u8(row_body, 0x01);
+    append_u8(row_body, 0x00);
+    append_u8(row_body, 0x7f);
+    append_u8(row_body, 0xff);
+    append_u8(row_body, 0xff);
+    append_u8(row_body, 0xff);
+
+    const auto rows = parser.parse(make_binlog_event(mysql2::constants::binlog_event_type::WRITE_ROWS_V1, row_body));
+    ASSERT_EQ(rows.row_changes.size(), 1u);
+    ASSERT_EQ(rows.row_changes[0].after.size(), 1u);
+    const auto& time = std::get<mysql2::BinlogTime>(rows.row_changes[0].after[0]);
+    EXPECT_TRUE(time.negative);
+    EXPECT_EQ(time.hours, 0u);
+    EXPECT_EQ(time.minutes, 0u);
+    EXPECT_EQ(time.seconds, 0u);
+    EXPECT_EQ(time.microsecond, 10000u);
+    EXPECT_EQ(time.to_string(), "-00:00:00.01");
+}
+
+TEST(binlog, parses_rotate_format_xid_gtid_previous_gtids_and_unknown_events) {
+    std::vector<uint8_t> rotate_body;
+    append_u64_le(rotate_body, 4567);
+    append_string(rotate_body, "mysql-bin.000002");
+    const auto rotate = mysql2::parse_binlog_event_packet(
+        make_binlog_event(mysql2::constants::binlog_event_type::ROTATE, rotate_body));
+    EXPECT_EQ(rotate.name, "RotateEvent");
+    EXPECT_EQ(rotate.next_position, 4567u);
+    EXPECT_EQ(rotate.next_binlog, "mysql-bin.000002");
+
+    std::vector<uint8_t> format_body;
+    append_u16_le(format_body, 4);
+    std::string server_version = "8.4.0-polycpp";
+    format_body.insert(format_body.end(), server_version.begin(), server_version.end());
+    format_body.resize(format_body.size() + (50 - server_version.size()), 0);
+    append_u32_le(format_body, 777);
+    append_u8(format_body, 19);
+    append_u8(format_body, 1);
+    append_u8(format_body, 2);
+    const auto format = mysql2::parse_binlog_event_packet(
+        make_binlog_event(mysql2::constants::binlog_event_type::FORMAT_DESCRIPTION, format_body));
+    EXPECT_EQ(format.name, "FormatDescriptionEvent");
+    EXPECT_EQ(format.binlog_version, 4u);
+    EXPECT_EQ(format.server_version, server_version);
+    EXPECT_EQ(format.create_timestamp, 777u);
+    EXPECT_EQ(format.event_header_length, 19u);
+    EXPECT_EQ(format.event_type_header_lengths.length(), 2u);
+
+    std::vector<uint8_t> xid_body;
+    append_u64_le(xid_body, 0x1122334455667788ULL);
+    const auto xid = mysql2::parse_binlog_event_packet(
+        make_binlog_event(mysql2::constants::binlog_event_type::XID, xid_body));
+    EXPECT_EQ(xid.name, "XidEvent");
+    EXPECT_EQ(xid.xid, 0x1122334455667788ULL);
+
+    const std::array<uint8_t, 16> sid = {
+        0x3e, 0x11, 0xfa, 0x47, 0x71, 0xca, 0x11, 0xe1,
+        0x9e, 0x33, 0xc8, 0x0a, 0xa9, 0x42, 0x95, 0x62};
+    std::vector<uint8_t> gtid_body;
+    append_u8(gtid_body, 1);
+    gtid_body.insert(gtid_body.end(), sid.begin(), sid.end());
+    append_u64_le(gtid_body, 99);
+    const auto gtid = mysql2::parse_binlog_event_packet(
+        make_binlog_event(mysql2::constants::binlog_event_type::GTID, gtid_body));
+    EXPECT_EQ(gtid.name, "GtidEvent");
+    EXPECT_EQ(gtid.gtid_flags, 1u);
+    EXPECT_EQ(gtid.gtid_sid, "3e11fa47-71ca-11e1-9e33-c80aa9429562");
+    EXPECT_EQ(gtid.gtid_sequence_number, 99u);
+
+    std::vector<uint8_t> previous_body;
+    append_u64_le(previous_body, 1);
+    previous_body.insert(previous_body.end(), sid.begin(), sid.end());
+    append_u64_le(previous_body, 1);
+    append_u64_le(previous_body, 10);
+    append_u64_le(previous_body, 21);
+    const auto previous = mysql2::parse_binlog_event_packet(
+        make_binlog_event(mysql2::constants::binlog_event_type::PREVIOUS_GTIDS, previous_body));
+    ASSERT_EQ(previous.previous_gtids.size(), 1u);
+    EXPECT_EQ(previous.previous_gtids[0].sid, "3e11fa47-71ca-11e1-9e33-c80aa9429562");
+    ASSERT_EQ(previous.previous_gtids[0].intervals.size(), 1u);
+    EXPECT_EQ(previous.previous_gtids[0].intervals[0].start, 10u);
+    EXPECT_EQ(previous.previous_gtids[0].intervals[0].end, 20u);
+
+    const auto unknown = mysql2::parse_binlog_event_packet(make_binlog_event(99, {0x01, 0x02, 0x03}));
+    EXPECT_EQ(unknown.name, "UnknownEvent");
+    EXPECT_EQ(unknown.header.event_type, 99u);
+    EXPECT_EQ(unknown.body.length(), 3u);
 }
 
 TEST(binlog, parses_gtid_set_text) {
@@ -589,6 +879,144 @@ TEST(server_mode, auth_callback_rejects_client_with_error_packet) {
     }
 
     server.close();
+}
+
+TEST(mysql2_replication, binlog_stream_against_real_database_when_configured) {
+    if (!env_enabled("MYSQL2_TEST_REPLICATION")) {
+        GTEST_SKIP() << "Set MYSQL2_TEST_REPLICATION=1 with a binary-log-enabled server to run replication e2e";
+    }
+    const char* host = std::getenv("MYSQL2_TEST_HOST");
+    if (!host) {
+        GTEST_SKIP() << "Set MYSQL2_TEST_HOST/MYSQL2_TEST_USER to run mysql2 replication e2e tests";
+    }
+
+    mysql2::ConnectionOptions options;
+    options.host = host;
+    options.port = std::getenv("MYSQL2_TEST_PORT") ? static_cast<uint16_t>(std::stoi(std::getenv("MYSQL2_TEST_PORT"))) : 3306;
+    options.user = std::getenv("MYSQL2_TEST_USER") ? std::getenv("MYSQL2_TEST_USER") : "root";
+    options.password = std::getenv("MYSQL2_TEST_PASSWORD") ? std::getenv("MYSQL2_TEST_PASSWORD") : "";
+    options.database = std::getenv("MYSQL2_TEST_DATABASE") ? std::getenv("MYSQL2_TEST_DATABASE") : "";
+    options.connect_timeout_ms = 5000;
+
+    mysql2::Connection writer(options);
+    writer.connect();
+    const auto log_bin = writer.query("SELECT @@log_bin AS log_bin");
+    ASSERT_EQ(log_bin.rows.size(), 1u);
+    if (value_as_u64(log_bin.rows[0].at("log_bin")) == 0) {
+        GTEST_SKIP() << "Server binary logging is disabled";
+    }
+    try {
+        writer.query("SET SESSION binlog_format = 'ROW'");
+    } catch (const mysql2::Error&) {
+    }
+    const auto binlog_format = writer.query("SELECT @@session.binlog_format AS binlog_format");
+    ASSERT_EQ(binlog_format.rows.size(), 1u);
+    if (value_as_string(binlog_format.rows[0].at("binlog_format")) != "ROW") {
+        GTEST_SKIP() << "Replication e2e requires ROW binlog_format";
+    }
+    writer.query("SET time_zone = '+00:00'");
+    writer.query("DROP TABLE IF EXISTS polycpp_mysql2_binlog_e2e");
+    writer.query("CREATE TABLE polycpp_mysql2_binlog_e2e ("
+                 "id INT PRIMARY KEY, "
+                 "name VARCHAR(32), "
+                 "ts TIMESTAMP(6) NULL, "
+                 "dt DATETIME(6) NULL, "
+                 "tm TIME(6) NULL)");
+
+    mysql2::QueryResult status;
+    try {
+        status = writer.query("SHOW BINARY LOG STATUS");
+    } catch (const mysql2::Error&) {
+        status = writer.query("SHOW MASTER STATUS");
+    }
+    ASSERT_EQ(status.rows.size(), 1u);
+    mysql2::BinlogDumpOptions dump;
+    dump.filename = value_as_string(status.rows[0].at("File"));
+    dump.binlog_position = value_as_u64(status.rows[0].at("Position"));
+    dump.flags = mysql2::constants::binlog_dump_flags::NON_BLOCK;
+    dump.server_id = 61002;
+    dump.max_events = 64;
+
+    writer.query("INSERT INTO polycpp_mysql2_binlog_e2e "
+                 "VALUES (1, 'Ada', '2009-02-13 23:31:30.123456', "
+                 "'2024-05-06 07:08:09.123456', '12:34:56.123456'), "
+                 "(2, 'Neo', '2009-02-13 23:31:31.654321', "
+                 "'2025-06-07 08:09:10.654321', '-00:00:00.010000')");
+
+    {
+        mysql2::Connection max_reader(options);
+        auto max_dump = dump;
+        max_dump.server_id = 61003;
+        max_dump.max_events = 1;
+        auto stream = max_reader.create_binlog_stream(max_dump);
+        ASSERT_TRUE(stream.read().has_value());
+        EXPECT_FALSE(stream.read().has_value());
+        EXPECT_FALSE(max_reader.connected());
+    }
+
+    mysql2::Connection reader(options);
+    auto stream = reader.create_binlog_stream(dump);
+    EXPECT_THROW(reader.query("SELECT 1"), mysql2::Error);
+
+    bool saw_table_map = false;
+    bool saw_write_rows = false;
+    while (auto event = stream.read()) {
+        if (event->name == "TableMapEvent" && event->table == "polycpp_mysql2_binlog_e2e") {
+            saw_table_map = true;
+        }
+        if ((event->name == "WriteRowsEventV1" || event->name == "WriteRowsEventV2") &&
+            event->table == "polycpp_mysql2_binlog_e2e") {
+            saw_write_rows = true;
+            ASSERT_EQ(event->row_changes.size(), 2u);
+            for (const auto& change : event->row_changes) {
+                ASSERT_GE(change.after.size(), 5u);
+                const auto id = std::get<int64_t>(change.after[0]);
+                if (id == 1) {
+                    EXPECT_EQ(std::get<std::string>(change.after[1]), "Ada");
+                    const auto& ts = std::get<mysql2::BinlogTimestamp>(change.after[2]);
+                    EXPECT_EQ(ts.seconds_since_epoch, 1234567890u);
+                    EXPECT_EQ(ts.microsecond, 123456u);
+                    EXPECT_EQ(std::get<mysql2::BinlogDateTime>(change.after[3]).to_string(),
+                              "2024-05-06 07:08:09.123456");
+                    EXPECT_EQ(std::get<mysql2::BinlogTime>(change.after[4]).to_string(),
+                              "12:34:56.123456");
+                } else if (id == 2) {
+                    EXPECT_EQ(std::get<std::string>(change.after[1]), "Neo");
+                    const auto& ts = std::get<mysql2::BinlogTimestamp>(change.after[2]);
+                    EXPECT_EQ(ts.seconds_since_epoch, 1234567891u);
+                    EXPECT_EQ(ts.microsecond, 654321u);
+                    EXPECT_EQ(std::get<mysql2::BinlogDateTime>(change.after[3]).to_string(),
+                              "2025-06-07 08:09:10.654321");
+                    const auto& time = std::get<mysql2::BinlogTime>(change.after[4]);
+                    EXPECT_TRUE(time.negative);
+                    EXPECT_EQ(time.to_string(), "-00:00:00.01");
+                } else {
+                    FAIL() << "unexpected replication e2e row id " << id;
+                }
+            }
+        }
+    }
+    EXPECT_TRUE(saw_table_map);
+    EXPECT_TRUE(saw_write_rows);
+    EXPECT_FALSE(reader.connected());
+    EXPECT_NO_THROW((void)reader.query("SELECT 1 AS reusable_after_eof"));
+
+    mysql2::QueryResult after_status;
+    try {
+        after_status = writer.query("SHOW BINARY LOG STATUS");
+    } catch (const mysql2::Error&) {
+        after_status = writer.query("SHOW MASTER STATUS");
+    }
+    mysql2::BinlogDumpOptions abandon_dump;
+    abandon_dump.filename = value_as_string(after_status.rows[0].at("File"));
+    abandon_dump.binlog_position = value_as_u64(after_status.rows[0].at("Position"));
+    abandon_dump.flags = mysql2::constants::binlog_dump_flags::NON_BLOCK;
+    abandon_dump.server_id = 61004;
+    abandon_dump.max_events = 0;
+    mysql2::Connection abandon_reader(options);
+    auto abandoned = abandon_reader.create_binlog_stream(abandon_dump);
+    abandoned.destroy();
+    EXPECT_FALSE(abandon_reader.connected());
 }
 
 TEST(mysql2_integration, query_against_real_database_when_configured) {

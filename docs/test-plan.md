@@ -15,8 +15,8 @@
 - SSL profile helper coverage verifies the generated AWS RDS CA bundle is loadable as PEM strings.
 - Parser-cache compatibility hooks are covered as no-op static-parser controls.
 - Typed `RowStream` coverage verifies row iteration, field metadata exposure, active-stream connection reservation, and cleanup after abandoned streams. NDJSON `Readable<Buffer>` coverage verifies lazy byte serialization over the row stream.
-- Typed `BinlogStream` coverage verifies `polycpp::stream::event::Data` delivery for `BinlogEvent` chunks. Replication e2e should validate active-stream connection reservation, EOF release, `max_events` transport close, and destroy-before-EOF transport close against a binary-log-enabled server.
-- Binlog packet parser coverage includes QueryEvent fixtures, GTID set parsing, and stateful TableMap plus WriteRows decoding. Rotate, FormatDescription, Xid, GTID packet, PreviousGTIDs packet, update/delete rows, and unknown-event fixtures should be expanded.
+- Typed `BinlogStream` coverage verifies `polycpp::stream::event::Data` delivery for `BinlogEvent` chunks. Replication e2e validates active-stream command rejection, CRC32 checksum negotiation, typed temporal row values, EOF transport close with reconnect-on-next-command behavior, `max_events` transport close, and destroy-before-EOF transport close against a binary-log-enabled server.
+- Binlog packet parser coverage includes QueryEvent fixtures, GTID set parsing, stateful TableMap plus WriteRows decoding, Rotate, FormatDescription, Xid, GTID packet, PreviousGTIDs packet, update/delete rows, unknown-event fixtures, TIME2/DATETIME2/TIMESTAMP2 row values, and negative TIME2 fractional encoding. Additional future fixtures should focus on malformed packets and less-common row column families.
 - Adapted server mode loopback coverage creates a `Server`, accepts a `Connection` client over TCP and Unix socket paths, validates handshake auth/connect attributes, dispatches query, ping, statement prepare, and statement execute events, writes text/OK responses, writes a prepared-statement OK packet and binary result rows for a real client `prepare`/`execute`, observes quit, and verifies auth callback rejection returns a MySQL ERR packet.
 
 ## Integration Tests
@@ -31,7 +31,7 @@
 - Add charset coverage for utf8mb4, latin1, binary, and representative non-UTF encodings through `iconv-lite`.
 - Add pool contention and wait-timeout coverage.
 - Add multi-result stored procedure coverage.
-- Add replication e2e coverage against a server configured with binary logging and a replication-capable user.
+- Environment-gated replication e2e coverage runs against a server configured with binary logging, row format, and a replication-capable user.
 
 ## Compatibility Tests Adapted From Upstream
 
@@ -53,7 +53,7 @@
 - RSA auth path uses OAEP SHA1 to match upstream caching_sha2_password behavior.
 - Single-result APIs drain additional result sets before throwing so the connection is reusable.
 - Per-command inactivity timeout closes the transport and marks the connection disconnected.
-- Bounded binlog dump and `create_binlog_stream(...)` close the connection if `max_events` is reached before EOF, so callers do not accidentally reuse a connection that is still inside a replication stream. Callback-controlled `binlog_dump_each` and `create_binlog_stream(...)` with `max_events = 0` are the documented continuous-consumption surfaces.
+- Bounded binlog dump, callback-controlled `binlog_dump_each(...)`, and `create_binlog_stream(...)` close the transport when EOF, `max_events`, callback stop, or destroy/drop cleanup ends the replication command stream, so callers do not accidentally reuse a socket that is still in or just left replication packet mode. `binlog_dump_each(...)` and `create_binlog_stream(...)` with `max_events = 0` are the documented continuous-consumption surfaces.
 - Server auth callbacks can reject a client by returning an `Error`; accepted clients expose parsed `ServerAuthInfo` without validating passwords implicitly. Rejection is covered by a loopback test that expects error code 1045 / SQL state 28000.
 
 ## Release-Blocking Behaviors
@@ -62,6 +62,7 @@
 - Real MariaDB e2e passes without TLS.
 - Real MariaDB e2e passes with verified TLS.
 - Real MySQL 8 e2e passes before claiming MySQL 8 auth parity.
+- Real MySQL/MariaDB replication e2e passes before claiming binlog stream lifecycle and temporal row parity.
 - Stream adaptation, command timeout behavior, compression, LOCAL INFILE policy, callback/Promise wrappers, EventEmitter/trace behavior, adapted TCP/Unix server mode, bounded/callback/typed-stream binlog behavior, parser-cache compatibility hooks, and SSL profile data remain documented with exact C++ semantics.
 - Third-party license notices are complete.
 - Documentation builds with `python3 docs/build.py`.
@@ -136,3 +137,40 @@ Result: `100% tests passed, 0 tests failed out of 14` in 0.39 s
 needs `MYSQL2_TEST_SERVER_TLS_CERT_FILE`/`MYSQL2_TEST_SERVER_TLS_KEY_FILE`,
 `mysql2_integration.query_against_real_database_when_configured` needs
 `MYSQL2_TEST_HOST`/`MYSQL2_TEST_USER`).
+
+Additional validation on May 2, 2026 after closing binlog checksum,
+temporal-row decoding including negative TIME2 fractional values,
+replication-stream lifecycle, and parser fixture gaps:
+
+```bash
+cmake --build build -j2
+ctest --test-dir build --output-on-failure
+python3 docs/build.py
+git diff --check
+docker run -d --name polycpp-mysql2-repl-e2e \
+  -e MYSQL_ROOT_PASSWORD=polycpp \
+  -e MYSQL_DATABASE=polycpp_test \
+  mysql:8.4 \
+  --server-id=1 \
+  --log-bin=mysql-bin \
+  --binlog-format=ROW \
+  --local-infile=1 \
+  --mysqlx=0
+docker run --rm --network container:polycpp-mysql2-repl-e2e \
+  -v /data/work/lib/mysql2:/work \
+  -w /work \
+  ubuntu:22.04 \
+  bash -lc 'apt-get update >/dev/null && apt-get install -y libicu70 libssl3 >/dev/null && MYSQL2_TEST_REPLICATION=1 MYSQL2_TEST_HOST=127.0.0.1 MYSQL2_TEST_PORT=3306 MYSQL2_TEST_USER=root MYSQL2_TEST_PASSWORD=polycpp MYSQL2_TEST_DATABASE=polycpp_test MYSQL2_TEST_TRACE=1 build/test_smoke --gtest_filter=mysql2_replication.binlog_stream_against_real_database_when_configured'
+docker run --rm --network container:polycpp-mysql2-repl-e2e \
+  -v /data/work/lib/mysql2:/work \
+  -w /work \
+  ubuntu:22.04 \
+  bash -lc 'apt-get update >/dev/null && apt-get install -y libicu70 libssl3 >/dev/null && MYSQL2_TEST_HOST=127.0.0.1 MYSQL2_TEST_PORT=3306 MYSQL2_TEST_USER=root MYSQL2_TEST_PASSWORD=polycpp MYSQL2_TEST_DATABASE=polycpp_test MYSQL2_TEST_TRACE=1 build/test_smoke --gtest_filter=mysql2_integration.query_against_real_database_when_configured'
+docker rm -f polycpp-mysql2-repl-e2e
+```
+
+Result: local `ctest` passed `18/18` with 3 expected environment-gated skips
+(TLS loopback, replication e2e, real DB e2e); docs built successfully with
+warnings as errors; `git diff --check` was clean; the live MySQL 8.4
+replication e2e passed in 203 ms; the live MySQL 8.4 database e2e passed in
+47 ms.

@@ -1700,6 +1700,10 @@ std::string server_value_to_string(const Value& value) {
             return item.toString("latin1");
         } else if constexpr (std::is_same_v<T, RawSql>) {
             return item.sql;
+        } else if constexpr (std::is_same_v<T, BinlogDateTime> ||
+                             std::is_same_v<T, BinlogTime> ||
+                             std::is_same_v<T, BinlogTimestamp>) {
+            return item.to_string();
         }
     }, value);
 }
@@ -1761,6 +1765,12 @@ int64_t value_to_i64(const Value& value) {
             return text.empty() ? 0 : std::stoll(text);
         } else if constexpr (std::is_same_v<T, RawSql>) {
             return item.sql.empty() ? 0 : std::stoll(item.sql);
+        } else if constexpr (std::is_same_v<T, BinlogTimestamp>) {
+            return static_cast<int64_t>(item.seconds_since_epoch);
+        } else if constexpr (std::is_same_v<T, BinlogDateTime> ||
+                             std::is_same_v<T, BinlogTime>) {
+            const auto text = item.to_string();
+            return text.empty() ? 0 : std::stoll(text);
         }
     }, value);
 }
@@ -1785,6 +1795,12 @@ uint64_t value_to_u64(const Value& value) {
             return text.empty() ? 0 : static_cast<uint64_t>(std::stoull(text));
         } else if constexpr (std::is_same_v<T, RawSql>) {
             return item.sql.empty() ? 0 : static_cast<uint64_t>(std::stoull(item.sql));
+        } else if constexpr (std::is_same_v<T, BinlogTimestamp>) {
+            return item.seconds_since_epoch;
+        } else if constexpr (std::is_same_v<T, BinlogDateTime> ||
+                             std::is_same_v<T, BinlogTime>) {
+            const auto text = item.to_string();
+            return text.empty() ? 0 : static_cast<uint64_t>(std::stoull(text));
         }
     }, value);
 }
@@ -1807,6 +1823,13 @@ double value_to_double(const Value& value) {
             return text.empty() ? 0 : std::stod(text);
         } else if constexpr (std::is_same_v<T, RawSql>) {
             return item.sql.empty() ? 0 : std::stod(item.sql);
+        } else if constexpr (std::is_same_v<T, BinlogTimestamp>) {
+            return static_cast<double>(item.seconds_since_epoch) +
+                   static_cast<double>(item.microsecond) / 1000000.0;
+        } else if constexpr (std::is_same_v<T, BinlogDateTime> ||
+                             std::is_same_v<T, BinlogTime>) {
+            const auto text = item.to_string();
+            return text.empty() ? 0 : std::stod(text);
         }
     }, value);
 }
@@ -2352,6 +2375,13 @@ std::string two_digits(uint32_t value) {
     return out;
 }
 
+std::string mysql_time_hours(uint32_t value) {
+    if (value < 100) {
+        return two_digits(value);
+    }
+    return std::to_string(value);
+}
+
 std::string four_digits(uint32_t value) {
     std::string out;
     out.push_back(static_cast<char>('0' + ((value / 1000) % 10)));
@@ -2359,6 +2389,15 @@ std::string four_digits(uint32_t value) {
     out.push_back(static_cast<char>('0' + ((value / 10) % 10)));
     out.push_back(static_cast<char>('0' + (value % 10)));
     return out;
+}
+
+std::string fractional_suffix(uint32_t micros) {
+    if (micros == 0) {
+        return {};
+    }
+    std::string frac = std::to_string(1000000 + micros).substr(1);
+    while (!frac.empty() && frac.back() == '0') frac.pop_back();
+    return "." + frac;
 }
 
 std::string format_mysql_datetime(uint16_t year,
@@ -2372,11 +2411,7 @@ std::string format_mysql_datetime(uint16_t year,
     std::string out = four_digits(year) + "-" + two_digits(month) + "-" + two_digits(day);
     if (!date_only) {
         out += " " + two_digits(hour) + ":" + two_digits(minute) + ":" + two_digits(second);
-        if (micros != 0) {
-            std::string frac = std::to_string(1000000 + micros).substr(1);
-            while (!frac.empty() && frac.back() == '0') frac.pop_back();
-            out += "." + frac;
-        }
+        out += fractional_suffix(micros);
     }
     return out;
 }
@@ -2555,6 +2590,9 @@ void append_bound_value(std::vector<uint8_t>& payload, const Value& value, const
         void operator()(const std::string& value) const { append_lenenc_encoded_string(payload, value, encoding); }
         void operator()(const Buffer& value) const { append_lenenc_buffer(payload, value); }
         void operator()(const RawSql&) const { throw Error("raw SQL values cannot be used as prepared statement parameters"); }
+        void operator()(const BinlogDateTime& value) const { append_lenenc_encoded_string(payload, value.to_string(), encoding); }
+        void operator()(const BinlogTime& value) const { append_lenenc_encoded_string(payload, value.to_string(), encoding); }
+        void operator()(const BinlogTimestamp& value) const { append_lenenc_encoded_string(payload, value.to_string(), encoding); }
     };
     std::visit(Visitor{payload, encoding}, value);
 }
@@ -2572,6 +2610,9 @@ std::pair<uint8_t, uint8_t> bound_type(const Value& value) {
         std::pair<uint8_t, uint8_t> operator()(const RawSql&) const {
             throw Error("raw SQL values cannot be used as prepared statement parameters");
         }
+        std::pair<uint8_t, uint8_t> operator()(const BinlogDateTime&) const { return {VAR_STRING, 0}; }
+        std::pair<uint8_t, uint8_t> operator()(const BinlogTime&) const { return {VAR_STRING, 0}; }
+        std::pair<uint8_t, uint8_t> operator()(const BinlogTimestamp&) const { return {VAR_STRING, 0}; }
     };
     return std::visit(Visitor{}, value);
 }
@@ -2949,10 +2990,6 @@ struct BinlogParserState {
     std::unordered_map<uint64_t, BinlogTableMapState> tables;
 };
 
-constexpr uint8_t kColumnTimestamp2 = 0x11;
-constexpr uint8_t kColumnDatetime2 = 0x12;
-constexpr uint8_t kColumnTime2 = 0x13;
-
 bool bitmap_has_bit(const Buffer& bitmap, std::size_t bit) {
     return bit / 8 < bitmap.length() && (bitmap[bit / 8] & (1u << (bit % 8))) != 0;
 }
@@ -2982,14 +3019,16 @@ uint16_t parse_table_map_column_metadata(PacketCursor& cursor, uint8_t type) {
         case LONG_BLOB:
         case JSON:
         case GEOMETRY:
-        case kColumnTimestamp2:
-        case kColumnDatetime2:
-        case kColumnTime2:
+        case TIMESTAMP2:
+        case DATETIME2:
+        case TIME2:
             return cursor.read_u8();
         case VARCHAR:
         case BIT:
+        case DECIMAL:
         case NEWDECIMAL:
         case STRING:
+        case VAR_STRING:
         case ENUM:
         case SET:
             return cursor.read_u16_le();
@@ -3033,6 +3072,15 @@ uint32_t read_be_integer(const std::vector<uint8_t>& bytes, std::size_t& offset,
     uint32_t value = 0;
     for (std::size_t i = 0; i < length; ++i) {
         value = (value << 8) | bytes[offset++];
+    }
+    return value;
+}
+
+uint64_t read_be_integer(PacketCursor& cursor, std::size_t length) {
+    uint64_t value = 0;
+    const auto bytes = cursor.read_buffer(length);
+    for (std::size_t i = 0; i < length; ++i) {
+        value = (value << 8) | bytes[i];
     }
     return value;
 }
@@ -3114,7 +3162,7 @@ std::string format_time_from_seconds(int64_t total_seconds) {
     const auto hours = total_seconds / 3600;
     const auto minutes = (total_seconds / 60) % 60;
     const auto seconds = total_seconds % 60;
-    return std::string(negative ? "-" : "") + std::to_string(hours) + ":" +
+    return std::string(negative ? "-" : "") + mysql_time_hours(static_cast<uint32_t>(hours)) + ":" +
            two_digits(static_cast<uint32_t>(minutes)) + ":" + two_digits(static_cast<uint32_t>(seconds));
 }
 
@@ -3123,6 +3171,99 @@ std::size_t fractional_second_storage_bytes(uint8_t decimals) {
     if (decimals <= 2) return 1;
     if (decimals <= 4) return 2;
     return 3;
+}
+
+uint32_t read_temporal_fraction(PacketCursor& cursor, uint8_t decimals) {
+    if (decimals > 6) {
+        throw Error("invalid temporal fractional precision in binlog row");
+    }
+    const auto byte_count = fractional_second_storage_bytes(decimals);
+    if (byte_count == 0) {
+        return 0;
+    }
+    uint32_t value = static_cast<uint32_t>(read_be_integer(cursor, byte_count));
+    for (uint8_t i = decimals; i < 6; ++i) {
+        value *= 10;
+    }
+    return value;
+}
+
+BinlogTimestamp read_binlog_timestamp2(PacketCursor& cursor, uint8_t decimals) {
+    BinlogTimestamp out;
+    out.seconds_since_epoch = read_be_integer(cursor, 4);
+    out.microsecond = read_temporal_fraction(cursor, decimals);
+    return out;
+}
+
+BinlogDateTime read_binlog_datetime2(PacketCursor& cursor, uint8_t decimals) {
+    const auto raw = static_cast<int64_t>(read_be_integer(cursor, 5)) - 0x8000000000LL;
+    const auto date_part = raw >> 17;
+    const auto time_part = raw & ((1 << 17) - 1);
+    const auto year_month = date_part >> 5;
+
+    BinlogDateTime out;
+    out.year = static_cast<uint16_t>(year_month / 13);
+    out.month = static_cast<uint8_t>(year_month % 13);
+    out.day = static_cast<uint8_t>(date_part & 0x1f);
+    out.hour = static_cast<uint8_t>((time_part >> 12) & 0x1f);
+    out.minute = static_cast<uint8_t>((time_part >> 6) & 0x3f);
+    out.second = static_cast<uint8_t>(time_part & 0x3f);
+    out.microsecond = read_temporal_fraction(cursor, decimals);
+    return out;
+}
+
+int64_t read_binlog_time2_packed(PacketCursor& cursor, uint8_t decimals) {
+    if (decimals > 6) {
+        throw Error("invalid temporal fractional precision in binlog row");
+    }
+    constexpr int64_t int_offset = 0x800000LL;
+    constexpr int64_t full_offset = 0x800000000000LL;
+    constexpr int64_t frac_base = 1LL << 24;
+    switch (decimals) {
+        case 0:
+        default: {
+            const auto int_part = static_cast<int64_t>(read_be_integer(cursor, 3)) - int_offset;
+            return int_part * frac_base;
+        }
+        case 1:
+        case 2: {
+            auto int_part = static_cast<int64_t>(read_be_integer(cursor, 3)) - int_offset;
+            auto fraction = static_cast<int64_t>(read_be_integer(cursor, 1));
+            if (int_part < 0 && fraction != 0) {
+                ++int_part;
+                fraction -= 0x100;
+            }
+            return int_part * frac_base + fraction * 10000;
+        }
+        case 3:
+        case 4: {
+            auto int_part = static_cast<int64_t>(read_be_integer(cursor, 3)) - int_offset;
+            auto fraction = static_cast<int64_t>(read_be_integer(cursor, 2));
+            if (int_part < 0 && fraction != 0) {
+                ++int_part;
+                fraction -= 0x10000;
+            }
+            return int_part * frac_base + fraction * 100;
+        }
+        case 5:
+        case 6:
+            return static_cast<int64_t>(read_be_integer(cursor, 6)) - full_offset;
+    }
+}
+
+BinlogTime read_binlog_time2(PacketCursor& cursor, uint8_t decimals) {
+    int64_t raw = read_binlog_time2_packed(cursor, decimals);
+    BinlogTime out;
+    if (raw < 0) {
+        out.negative = true;
+        raw = -raw;
+    }
+    const auto hms = raw >> 24;
+    out.hours = static_cast<uint32_t>((hms >> 12) & 0x3ff);
+    out.minutes = static_cast<uint8_t>((hms >> 6) & 0x3f);
+    out.seconds = static_cast<uint8_t>(hms & 0x3f);
+    out.microsecond = static_cast<uint32_t>(raw % (1LL << 24));
+    return out;
 }
 
 Value read_binlog_row_value(PacketCursor& cursor, uint8_t type, uint16_t metadata) {
@@ -3209,12 +3350,12 @@ Value read_binlog_row_value(PacketCursor& cursor, uint8_t type, uint16_t metadat
             const auto length = read_le_integer(cursor, length_size);
             return cursor.read_buffer(static_cast<std::size_t>(length));
         }
-        case kColumnTimestamp2:
-            return cursor.read_buffer(4 + fractional_second_storage_bytes(static_cast<uint8_t>(metadata)));
-        case kColumnDatetime2:
-            return cursor.read_buffer(5 + fractional_second_storage_bytes(static_cast<uint8_t>(metadata)));
-        case kColumnTime2:
-            return cursor.read_buffer(3 + fractional_second_storage_bytes(static_cast<uint8_t>(metadata)));
+        case TIMESTAMP2:
+            return read_binlog_timestamp2(cursor, static_cast<uint8_t>(metadata));
+        case DATETIME2:
+            return read_binlog_datetime2(cursor, static_cast<uint8_t>(metadata));
+        case TIME2:
+            return read_binlog_time2(cursor, static_cast<uint8_t>(metadata));
         case NULL_TYPE:
             return std::monostate{};
         default:
@@ -3347,7 +3488,9 @@ void parse_rows_event_body(BinlogEvent& event, PacketCursor& body_cursor, Binlog
     }
 }
 
-BinlogEvent parse_binlog_event_packet_impl(const Buffer& payload, BinlogParserState* state = nullptr) {
+BinlogEvent parse_binlog_event_packet_impl(const Buffer& payload,
+                                           BinlogParserState* state = nullptr,
+                                           bool has_crc32_checksum = false) {
     if (payload.length() == 0) {
         throw Error("empty binlog event packet");
     }
@@ -3367,7 +3510,17 @@ BinlogEvent parse_binlog_event_packet_impl(const Buffer& payload, BinlogParserSt
     event.header.flags = cursor.read_u16_le();
     event.name = binlog_event_name(event.header.event_type);
 
-    event.body = cursor.read_rest_buffer();
+    std::size_t body_end = payload.length();
+    if (has_crc32_checksum) {
+        if (body_end < cursor.offset() + 4) {
+            throw Error("binlog event with CRC32 checksum is too short");
+        }
+        body_end -= 4;
+        PacketCursor checksum_cursor(payload.slice(body_end, body_end + 4));
+        event.has_checksum = true;
+        event.checksum = checksum_cursor.read_u32_le();
+    }
+    event.body = payload.slice(cursor.offset(), body_end);
     PacketCursor body_cursor(event.body);
     switch (event.header.event_type) {
         case constants::binlog_event_type::QUERY: {
@@ -3440,6 +3593,9 @@ std::string value_to_string(const Value& value) {
         std::string operator()(const std::string& value) const { return escape(value); }
         std::string operator()(const Buffer& value) const { return "X'" + to_hex(value) + "'"; }
         std::string operator()(const RawSql& value) const { return value.sql; }
+        std::string operator()(const BinlogDateTime& value) const { return escape(value.to_string()); }
+        std::string operator()(const BinlogTime& value) const { return escape(value.to_string()); }
+        std::string operator()(const BinlogTimestamp& value) const { return escape(value.to_string()); }
     };
     return std::visit(Visitor{}, value);
 }
@@ -3813,6 +3969,7 @@ public:
         if (!callback) {
             throw Error("binlog_dump_each requires a callback");
         }
+        const bool has_crc32_checksum = prepare_binlog_checksum_session();
         write_packet(build_binlog_dump_payload(options), 0);
         BinlogParserState parser_state;
         std::size_t count = 0;
@@ -3822,9 +3979,10 @@ public:
                 throw parse_error_packet(frame.payload);
             }
             if (is_eof_packet(frame.payload)) {
+                close_transport_after_binlog_stop();
                 break;
             }
-            const auto event = parse_binlog_event_packet_impl(frame.payload, &parser_state);
+            const auto event = parse_binlog_event_packet_impl(frame.payload, &parser_state, has_crc32_checksum);
             ++count;
             const bool keep_going = callback(event);
             if (!keep_going || (options.max_events != 0 && count >= options.max_events)) {
@@ -3840,10 +3998,11 @@ public:
 
     BinlogStream create_binlog_stream(const BinlogDumpOptions& options) {
         ensure_connected();
+        const bool has_crc32_checksum = prepare_binlog_checksum_session();
         write_packet(build_binlog_dump_payload(options), 0);
 
         auto state = std::shared_ptr<BinlogStreamState>(
-            new BinlogStreamState{weak_from_this(), options},
+            new BinlogStreamState{weak_from_this(), options, has_crc32_checksum},
             [](BinlogStreamState* ptr) noexcept {
                 if (ptr) {
                     ptr->cleanup();
@@ -4120,6 +4279,7 @@ private:
     struct BinlogStreamState {
         std::weak_ptr<Impl> impl;
         BinlogDumpOptions options;
+        bool has_crc32_checksum = false;
         BinlogParserState parser_state;
         std::size_t count = 0;
         bool done = false;
@@ -4196,6 +4356,22 @@ private:
         if (!connected_) {
             traced("connect", "", [this] { connect(); });
         }
+    }
+
+    bool prepare_binlog_checksum_session() {
+        bool has_crc32_checksum = false;
+        try {
+            const auto result = query("SELECT @@global.binlog_checksum AS binlog_checksum");
+            if (!result.rows.empty()) {
+                has_crc32_checksum = server_value_to_string(result.rows[0].at("binlog_checksum")) == "CRC32";
+            }
+        } catch (...) {
+            return false;
+        }
+        if (has_crc32_checksum) {
+            query("SET @master_binlog_checksum = @@global.binlog_checksum");
+        }
+        return has_crc32_checksum;
     }
 
     RowStream make_ended_row_stream(std::vector<Field> fields = {}) {
@@ -4404,12 +4580,15 @@ private:
                 throw parse_error_packet(frame.payload);
             }
             if (is_eof_packet(frame.payload)) {
+                close_transport_after_binlog_stop();
                 finish_binlog_stream(state);
                 stream.pushEnd();
                 return;
             }
 
-            auto event = parse_binlog_event_packet_impl(frame.payload, &state.parser_state);
+            auto event = parse_binlog_event_packet_impl(frame.payload,
+                                                        &state.parser_state,
+                                                        state.has_crc32_checksum);
             ++state.count;
             const bool should_continue = stream.push(std::move(event));
             if (state.options.max_events != 0 && state.count >= state.options.max_events) {
@@ -5085,6 +5264,19 @@ uint16_t Error::code() const noexcept { return code_; }
 
 const std::string& Error::sql_state() const noexcept { return sql_state_; }
 
+std::string BinlogDateTime::to_string() const {
+    return format_mysql_datetime(year, month, day, hour, minute, second, microsecond, false);
+}
+
+std::string BinlogTime::to_string() const {
+    return std::string(negative ? "-" : "") + mysql_time_hours(hours) + ":" +
+           two_digits(minutes) + ":" + two_digits(seconds) + fractional_suffix(microsecond);
+}
+
+std::string BinlogTimestamp::to_string() const {
+    return std::to_string(seconds_since_epoch) + fractional_suffix(microsecond);
+}
+
 bool Field::is_unsigned() const noexcept { return (flags & constants::field_flags::UNSIGNED) != 0; }
 
 bool Field::is_binary() const noexcept { return (flags & constants::field_flags::BINARY) != 0; }
@@ -5261,6 +5453,10 @@ JsonValue value_to_json(const Value& value) {
             return item.toJSON();
         } else if constexpr (std::is_same_v<T, RawSql>) {
             return JsonValue(item.sql);
+        } else if constexpr (std::is_same_v<T, BinlogDateTime> ||
+                             std::is_same_v<T, BinlogTime> ||
+                             std::is_same_v<T, BinlogTimestamp>) {
+            return JsonValue(item.to_string());
         }
     }, value);
 }

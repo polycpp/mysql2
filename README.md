@@ -12,7 +12,7 @@ Compatibility note:
 
 - This repo does not imply full parity with upstream `mysql2`.
 - The implementation is a pure C++ MySQL/MariaDB wire-protocol client, not a wrapper around a native MySQL client library.
-- Implemented and deferred behavior is tracked in `docs/research.md`, `docs/api-mapping.md`, and `docs/divergences.md`.
+- Implemented behavior, intentional C++ adaptations, and unsupported runtime-only behavior are tracked in `docs/research.md`, `docs/api-mapping.md`, and `docs/divergences.md`.
 
 Implemented:
 
@@ -39,7 +39,7 @@ Implemented:
 - `COM_CHANGE_USER`, transaction helpers, ping, reset, graceful end, synchronous RAII pools, and pool clusters.
 - AWS RDS TLS profile CA data from `aws-ssl-profiles@1.1.2` via `SslOptions::profile = "Amazon RDS"`.
 - Parser-cache compatibility controls as no-op/static-parser audit hooks.
-- Bounded `COM_REGISTER_SLAVE`, `COM_BINLOG_DUMP`, and `COM_BINLOG_DUMP_GTID` support with typed parsing for Query, Rotate, FormatDescription, Xid, GTID, PreviousGTIDs, TableMap, and common row events, plus raw payload retention for audit and unsupported event types.
+- Bounded `COM_REGISTER_SLAVE`, `COM_BINLOG_DUMP`, and `COM_BINLOG_DUMP_GTID` support with CRC32 binlog-checksum negotiation, typed parsing for Query, Rotate, FormatDescription, Xid, GTID, PreviousGTIDs, TableMap, and common row events, typed TIME2/DATETIME2/TIMESTAMP2 row values, plus raw payload retention for audit and unsupported event types.
 - `BinlogStream`, a pull-based `polycpp::stream::Readable<BinlogEvent>` returned by `Connection::create_binlog_stream(...)`; callers consume events through `polycpp::stream::event::Data`.
 - `BinlogParser` for stateful table-map-aware row decoding and `Connection::binlog_dump_each(...)` for callback-controlled replication reads without accumulating an unbounded vector.
 - Adapted server protocol mode with `create_server`, `Server`, `ServerConnection`, TCP or Unix socket listening, optional MySQL in-protocol TLS upgrade, server-side protocol handshake/auth callback, typed query/ping/quit/init-db/field-list/statement command events, statement-prepare OK writers, and OK/ERR/text/binary result response writers.
@@ -54,8 +54,8 @@ Known divergences:
 - Server mode is adapted to a C++ server object. It supports TCP and Unix socket listening, MySQL in-protocol TLS upgrade when configured, handshake/auth inspection, command dispatch, packet observation, statement prepare OK packets, and OK/ERR/text/binary result writers; a full SQL engine is intentionally not implied.
 - Parser cache controls are compatibility no-ops because C++ uses static parsers.
 - Query attributes use `std::unordered_map`, so attribute wire order is not a public contract.
-- Binlog streams use typed C++ `BinlogStream` chunks instead of JavaScript object prototypes. A live `create_binlog_stream(...)` reserves the connection; EOF releases it, while `max_events` or destroying the stream before EOF closes the transport because the server is still in replication packet mode.
-- Bounded binlog dump closes the connection if `max_events` is reached before EOF, because the connection is otherwise left in the replication command stream. Use `create_binlog_stream(...)` or `binlog_dump_each(...)` when the caller wants stream-shaped or callback-controlled continuous consumption.
+- Binlog streams use typed C++ `BinlogStream` chunks instead of JavaScript object prototypes. A live `create_binlog_stream(...)` reserves the connection until EOF, `max_events`, or destroy/drop cleanup. Every terminal replication-stream path closes the transport because a MySQL replication command stream is not safely reusable as a normal command channel; the next command reconnects through the configured options.
+- Bounded and callback-controlled binlog dump reads close the transport when EOF, `max_events`, or callback stop ends the replication command stream. Use `create_binlog_stream(...)` or `binlog_dump_each(...)` when the caller wants stream-shaped or callback-controlled continuous consumption.
 
 ## Prerequisites
 
@@ -81,6 +81,18 @@ MYSQL2_TEST_USER=root \
 MYSQL2_TEST_PASSWORD=secret \
 MYSQL2_TEST_DATABASE=test \
 ctest --test-dir build --output-on-failure
+```
+
+Run the replication/binlog e2e path against a server started with binary logging and row format:
+
+```bash
+MYSQL2_TEST_REPLICATION=1 \
+MYSQL2_TEST_HOST=127.0.0.1 \
+MYSQL2_TEST_PORT=3306 \
+MYSQL2_TEST_USER=root \
+MYSQL2_TEST_PASSWORD=secret \
+MYSQL2_TEST_DATABASE=test \
+build/test_smoke --gtest_filter=mysql2_replication.binlog_stream_against_real_database_when_configured
 ```
 
 Run the TLS e2e path:

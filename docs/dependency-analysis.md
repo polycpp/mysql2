@@ -85,7 +85,7 @@ python3 /data/work/libgen/scripts/analyze-upstream-js.py /data/work/lib/mysql2 /
 - Node parity hints consumed: yes; callback, Promise, EventEmitter, stream, Buffer, URL, timer/process, crypto, compression, filesystem, network, and TLS surfaces were reviewed against polycpp APIs
 - security hints consumed: yes; package is security-sensitive because it handles credentials, crypto, network packets, and SQL escaping
 - security-sensitive package: yes
-- polycpp capability snapshot consumed: yes; `/data/repo/polycpp` HEAD `40bd73669e8105fcb8641ad6671dfd07141e9eff` was rechecked on May 2, 2026 before closing the Unix/IPC, server TLS, and typed binlog stream gaps.
+- polycpp capability snapshot consumed: yes; `/data/repo/polycpp` HEAD `40bd73669e8105fcb8641ad6671dfd07141e9eff` was rechecked on May 2, 2026 before closing the Unix/IPC, server TLS, typed stream, and typed binlog lifecycle gaps.
 - transport/listener capability hints consumed: yes; TCP, Unix/IPC path, cross-transport stream wrappers, and MySQL in-protocol TLS upgrade are mapped to current polycpp IO/TLS primitives.
 
 ### Node.js API usage
@@ -105,7 +105,7 @@ python3 /data/work/libgen/scripts/analyze-upstream-js.py /data/work/lib/mysql2 /
 - callbacks: implemented as `std::function` overloads over the typed connection, pool, and cluster operations.
 - Promise APIs: implemented as `polycpp::Promise` wrappers that settle from the typed implementation.
 - EventEmitter APIs: implemented through typed `polycpp::events::EventEmitter` forwarding on connections, pools, and pool clusters.
-- streams: query rows use pull-based `RowStream` typed chunks; binlog events use pull-based `BinlogStream` typed chunks; NDJSON output uses lazy `polycpp::stream::Readable<Buffer>` chunks over the same row stream.
+- streams: query rows use pull-based `RowStream` typed chunks; binlog events use pull-based `BinlogStream` typed chunks consumed with `polycpp::stream::event::Data`; replication stream terminal paths close the transport and subsequent normal commands reconnect through configured options; NDJSON output uses lazy `polycpp::stream::Readable<Buffer>` chunks over the same row stream.
 - Buffer and binary data: mapped to `polycpp::Buffer` for packets, binary SQL values, result columns, and LOCAL INFILE chunks.
 - URL/timer/process/filesystem APIs: URI parsing uses `polycpp::url`; connect and command inactivity timeouts use `polycpp::io::Timer`; pool wait timeouts use C++ chrono; process APIs are not public; filesystem access is limited to explicit TLS file options and caller-provided LOCAL INFILE buffers.
 - crypto/compression/TLS/network/HTTP APIs: crypto uses `polycpp::crypto`; compression uses `polycpp::zlib`; TCP/Unix/TLS uses `polycpp::io` and `polycpp::ssl`; HTTP APIs are not relevant to this protocol driver.

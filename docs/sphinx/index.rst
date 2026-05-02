@@ -16,7 +16,7 @@ Supported scope
 - Transactions, ping, reset, change-user, graceful shutdown, synchronous RAII pools, and pool clusters.
 - Callback overloads, ``polycpp::Promise`` wrappers, typed events, connection URI parsing, compression, and LOCAL INFILE handler hooks.
 - Trace events, connect and command timeout enforcement, AWS RDS TLS profile CA data, and parser-cache compatibility hooks.
-- Bounded register-slave/binlog-dump commands with typed parsing for common binlog event records.
+- Bounded register-slave/binlog-dump commands with CRC32 checksum handling, typed parsing for common binlog event records, and typed TIME2/DATETIME2/TIMESTAMP2 row values.
 - Binlog stream support through pull-based ``BinlogStream`` typed events over ``polycpp::stream::Readable<BinlogEvent>``.
 - Adapted server protocol mode with TCP or Unix socket listening, optional MySQL TLS upgrade, typed command events, and OK/ERR/text-result response writers.
 - Query stream support through pull-based ``RowStream`` typed rows and lazy newline-delimited JSON ``Readable<Buffer>`` chunks.
@@ -66,7 +66,8 @@ See
    .. grid-item-card:: Real e2e tested
       :margin: 1
 
-      The test suite can run against MariaDB/MySQL, including verified TLS.
+      The test suite can run against MariaDB/MySQL, including verified TLS
+      and binary-log replication coverage.
 
    .. grid-item-card:: Explicit gaps
       :margin: 1

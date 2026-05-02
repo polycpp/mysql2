@@ -97,7 +97,46 @@ struct RawSql {
     std::string sql;
 };
 
-using Value = std::variant<std::monostate, bool, int64_t, uint64_t, double, std::string, Buffer, RawSql>;
+struct BinlogDateTime {
+    uint16_t year = 0;
+    uint8_t month = 0;
+    uint8_t day = 0;
+    uint8_t hour = 0;
+    uint8_t minute = 0;
+    uint8_t second = 0;
+    uint32_t microsecond = 0;
+
+    std::string to_string() const;
+};
+
+struct BinlogTime {
+    bool negative = false;
+    uint32_t hours = 0;
+    uint8_t minutes = 0;
+    uint8_t seconds = 0;
+    uint32_t microsecond = 0;
+
+    std::string to_string() const;
+};
+
+struct BinlogTimestamp {
+    uint64_t seconds_since_epoch = 0;
+    uint32_t microsecond = 0;
+
+    std::string to_string() const;
+};
+
+using Value = std::variant<std::monostate,
+                           bool,
+                           int64_t,
+                           uint64_t,
+                           double,
+                           std::string,
+                           Buffer,
+                           RawSql,
+                           BinlogDateTime,
+                           BinlogTime,
+                           BinlogTimestamp>;
 using QueryAttributes = std::unordered_map<std::string, Value>;
 
 enum class CursorType : uint8_t {
@@ -260,6 +299,8 @@ struct BinlogEvent {
     BinlogEventHeader header;
     Buffer raw;
     Buffer body;
+    bool has_checksum = false;
+    uint32_t checksum = 0;
     Buffer status_vars;
     std::string schema;
     std::string query;
@@ -815,6 +856,9 @@ inline constexpr uint8_t YEAR = 0x0d;
 inline constexpr uint8_t NEWDATE = 0x0e;
 inline constexpr uint8_t VARCHAR = 0x0f;
 inline constexpr uint8_t BIT = 0x10;
+inline constexpr uint8_t TIMESTAMP2 = 0x11;
+inline constexpr uint8_t DATETIME2 = 0x12;
+inline constexpr uint8_t TIME2 = 0x13;
 inline constexpr uint8_t VECTOR = 0xf2;
 inline constexpr uint8_t JSON = 0xf5;
 inline constexpr uint8_t NEWDECIMAL = 0xf6;
