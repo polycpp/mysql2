@@ -96,7 +96,7 @@ python3 /data/work/libgen/scripts/analyze-upstream-js.py /data/work/lib/mysql2 /
 - `tls`: mapped to `polycpp::io::TlsContext`, `polycpp::io::TlsStream`, and `polycpp::ssl::X509Cert` for MySQL SSLRequest upgrades.
 - `zlib`: mapped to `polycpp::zlib` for the MySQL compressed packet protocol.
 - `events`: mapped to typed `polycpp::events::EventEmitter` integration on connections, pools, and pool clusters.
-- `stream`: Node object-mode row streams are adapted to typed `RowStream` rows and `polycpp::stream::Readable` byte chunks containing newline-delimited JSON rows.
+- `stream`: Node object-mode row streams map to `polycpp::stream::Readable<Row>` typed chunks; `query_stream_json()` exposes newline-delimited JSON `polycpp::stream::Readable<Buffer>` chunks.
 - `process`, `timers`: Node runtime command queue mechanics are adapted to synchronous typed execution; connect and command inactivity deadlines use `polycpp::io::Timer`; pool wait timeouts are represented with C++ chrono values.
 - `url`: mapped to `polycpp::url` for connection URI parsing.
 
@@ -105,7 +105,7 @@ python3 /data/work/libgen/scripts/analyze-upstream-js.py /data/work/lib/mysql2 /
 - callbacks: implemented as `std::function` overloads over the typed connection, pool, and cluster operations.
 - Promise APIs: implemented as `polycpp::Promise` wrappers that settle from the typed implementation.
 - EventEmitter APIs: implemented through typed `polycpp::events::EventEmitter` forwarding on connections, pools, and pool clusters.
-- streams: adapted to typed `RowStream` rows and `polycpp::stream::Readable` newline-delimited JSON `Buffer` chunks.
+- streams: query rows use `polycpp::stream::Readable<Row>` typed chunks; NDJSON output uses `polycpp::stream::Readable<Buffer>` chunks.
 - Buffer and binary data: mapped to `polycpp::Buffer` for packets, binary SQL values, result columns, and LOCAL INFILE chunks.
 - URL/timer/process/filesystem APIs: URI parsing uses `polycpp::url`; connect and command inactivity timeouts use `polycpp::io::Timer`; pool wait timeouts use C++ chrono; process APIs are not public; filesystem access is limited to explicit TLS file options and caller-provided LOCAL INFILE buffers.
 - crypto/compression/TLS/network/HTTP APIs: crypto uses `polycpp::crypto`; compression uses `polycpp::zlib`; TCP/Unix/TLS uses `polycpp::io` and `polycpp::ssl`; HTTP APIs are not relevant to this protocol driver.

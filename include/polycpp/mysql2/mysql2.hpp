@@ -305,24 +305,7 @@ private:
     std::unique_ptr<Impl> impl_;
 };
 
-class RowStream {
-public:
-    RowStream();
-    RowStream(std::vector<Field> fields, std::vector<Row> rows);
-
-    bool empty() const noexcept;
-    std::size_t size() const noexcept;
-    const std::vector<Field>& fields() const noexcept;
-    const std::vector<Row>& rows() const noexcept;
-    std::optional<Row> read();
-    std::vector<Row> to_vector() const;
-    std::vector<Buffer> to_json_line_buffers() const;
-
-private:
-    std::vector<Field> fields_;
-    std::vector<Row> rows_;
-    std::size_t offset_ = 0;
-};
+using RowStream = stream::Readable<Row>;
 
 class ServerConnection;
 
@@ -445,10 +428,10 @@ public:
     Promise<std::vector<QueryResult>> query_all_promise(const std::string& sql);
     Promise<std::vector<QueryResult>> query_all_promise(const std::string& sql, const QueryAttributes& attributes);
     Promise<std::vector<QueryResult>> query_all_promise(QueryOptions options);
-    RowStream query_stream(const std::string& sql);
-    RowStream query_stream(const QueryOptions& options);
-    stream::Readable query_stream_json(const std::string& sql);
-    stream::Readable query_stream_json(const QueryOptions& options);
+    stream::Readable<Row> query_stream(const std::string& sql);
+    stream::Readable<Row> query_stream(const QueryOptions& options);
+    stream::Readable<Buffer> query_stream_json(const std::string& sql);
+    stream::Readable<Buffer> query_stream_json(const QueryOptions& options);
     PreparedStatement prepare(const std::string& sql);
     PreparedStatement prepare(const std::string& sql, CommandOptions options);
     void prepare(const std::string& sql, PrepareCallback callback);

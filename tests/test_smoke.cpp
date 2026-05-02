@@ -261,17 +261,13 @@ TEST(rows, json_helpers_and_event_emitter_surface) {
     row.index_by_name = {{"id", 0}, {"name", 1}};
 
     EXPECT_EQ(mysql2::row_to_json_line(row, {id, name}), R"({"id":42,"name":"Ada"})" "\n");
-    mysql2::RowStream row_stream({id, name}, {row});
-    EXPECT_EQ(row_stream.size(), 1u);
-    EXPECT_FALSE(row_stream.empty());
+    mysql2::RowStream row_stream;
+    EXPECT_TRUE(row_stream.push(row));
+    row_stream.pushEnd();
     auto first = row_stream.read();
     ASSERT_TRUE(first.has_value());
     EXPECT_EQ(std::get<int64_t>(first->at("id")), 42);
-    EXPECT_TRUE(row_stream.empty());
     EXPECT_FALSE(row_stream.read().has_value());
-    const auto chunks = row_stream.to_json_line_buffers();
-    ASSERT_EQ(chunks.size(), 1u);
-    EXPECT_EQ(chunks[0].toString(), R"({"id":42,"name":"Ada"})" "\n");
 
     mysql2::Connection connection;
     bool saw_error = false;

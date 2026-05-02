@@ -33,7 +33,7 @@ Implemented:
 - Connection URI parsing through `polycpp::url`.
 - Connect timeout and per-command inactivity timeout enforcement through `polycpp::io::Timer`.
 - Connection attributes in the initial handshake and `COM_CHANGE_USER`.
-- `QueryOptions` / `ExecuteOptions` timeout wrappers, callback overloads, `polycpp::Promise` wrappers, typed `polycpp::events::EventEmitter` integration, trace events, typed `RowStream`, and JSON line `polycpp::stream::Readable` query output.
+- `QueryOptions` / `ExecuteOptions` timeout wrappers, callback overloads, `polycpp::Promise` wrappers, typed `polycpp::events::EventEmitter` integration, trace events, typed `polycpp::stream::Readable<Row>` row streams, and JSON line `polycpp::stream::Readable<Buffer>` query output.
 - MySQL compressed protocol using `polycpp::zlib`.
 - Explicit-policy LOCAL INFILE uploads through `ConnectionOptions::local_infile_handler`.
 - `COM_CHANGE_USER`, transaction helpers, ping, reset, graceful end, synchronous RAII pools, and pool clusters.
@@ -46,7 +46,6 @@ Implemented:
 
 Deferred:
 
-- Exact Node `Readable` object-mode row chunks. `query_stream(...)` provides a typed C++ row iterator and `query_stream_json()` exposes newline-delimited JSON `Buffer` chunks because polycpp streams currently emit byte/text chunks, not arbitrary row objects.
 - Exact Node `createBinlogStream` EventEmitter/object-stream shape. The C++ port exposes bounded vector reads, callback-controlled reads, and explicit parser state instead.
 
 Known divergences:
@@ -54,7 +53,7 @@ Known divergences:
 - C++ API shape is synchronous and typed first; callback and Promise wrappers execute the same typed operations and settle through polycpp primitives.
 - Native MySQL/MariaDB client SDKs are intentionally not linked.
 - Node diagnostic channels are adapted to typed `event::Trace` events.
-- Node object-mode row streaming is adapted to typed `RowStream` rows plus JSON line byte streams for auditability and `polycpp::stream` compatibility.
+- Node object-mode row streaming maps to `polycpp::stream::Readable<Row>` typed row chunks; `query_stream_json()` remains an explicit newline-delimited JSON `Readable<Buffer>` byte-stream serializer.
 - Server mode is adapted to a C++ server object. It supports TCP and Unix socket listening, MySQL in-protocol TLS upgrade when configured, handshake/auth inspection, command dispatch, packet observation, statement prepare OK packets, and OK/ERR/text/binary result writers; a full SQL engine is intentionally not implied.
 - Parser cache controls are compatibility no-ops because C++ uses static parsers.
 - Query attributes use `std::unordered_map`, so attribute wire order is not a public contract.

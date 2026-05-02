@@ -4826,36 +4826,28 @@ std::string row_to_json_line(const Row& row, const std::vector<Field>& fields) {
     return JSON::stringify(JsonValue(row.to_json_object(fields))) + "\n";
 }
 
-RowStream::RowStream() = default;
+namespace {
 
-RowStream::RowStream(std::vector<Field> fields, std::vector<Row> rows)
-    : fields_(std::move(fields)), rows_(std::move(rows)) {}
-
-bool RowStream::empty() const noexcept { return offset_ >= rows_.size(); }
-
-std::size_t RowStream::size() const noexcept { return rows_.size(); }
-
-const std::vector<Field>& RowStream::fields() const noexcept { return fields_; }
-
-const std::vector<Row>& RowStream::rows() const noexcept { return rows_; }
-
-std::optional<Row> RowStream::read() {
-    if (offset_ >= rows_.size()) {
-        return std::nullopt;
+stream::Readable<Row> make_row_stream(std::vector<Row> rows) {
+    stream::Readable<Row> readable;
+    for (auto& row : rows) {
+        readable.push(std::move(row));
     }
-    return rows_[offset_++];
+    readable.pushEnd();
+    return readable;
 }
 
-std::vector<Row> RowStream::to_vector() const { return rows_; }
-
-std::vector<Buffer> RowStream::to_json_line_buffers() const {
+std::vector<Buffer> rows_to_json_line_buffers(const std::vector<Field>& fields,
+                                              const std::vector<Row>& rows) {
     std::vector<Buffer> chunks;
-    chunks.reserve(rows_.size());
-    for (const auto& row : rows_) {
-        chunks.push_back(Buffer::from(row_to_json_line(row, fields_)));
+    chunks.reserve(rows.size());
+    for (const auto& row : rows) {
+        chunks.push_back(Buffer::from(row_to_json_line(row, fields)));
     }
     return chunks;
 }
+
+}  // namespace
 
 JsonValue QueryResult::to_json() const {
     JsonObject object;
@@ -5365,22 +5357,26 @@ Promise<std::vector<QueryResult>> Connection::query_all_promise(QueryOptions opt
     });
 }
 
-RowStream Connection::query_stream(const std::string& sql) {
+stream::Readable<Row> Connection::query_stream(const std::string& sql) {
     auto result = query(sql);
-    return RowStream(std::move(result.fields), std::move(result.rows));
+    return make_row_stream(std::move(result.rows));
 }
 
-RowStream Connection::query_stream(const QueryOptions& options) {
+stream::Readable<Row> Connection::query_stream(const QueryOptions& options) {
     auto result = query(options);
-    return RowStream(std::move(result.fields), std::move(result.rows));
+    return make_row_stream(std::move(result.rows));
 }
 
-stream::Readable Connection::query_stream_json(const std::string& sql) {
-    return stream::Readable::from(query_stream(sql).to_json_line_buffers());
+stream::Readable<Buffer> Connection::query_stream_json(const std::string& sql) {
+    auto result = query(sql);
+    return stream::Readable<Buffer>::from(
+        rows_to_json_line_buffers(result.fields, result.rows));
 }
 
-stream::Readable Connection::query_stream_json(const QueryOptions& options) {
-    return stream::Readable::from(query_stream(options).to_json_line_buffers());
+stream::Readable<Buffer> Connection::query_stream_json(const QueryOptions& options) {
+    auto result = query(options);
+    return stream::Readable<Buffer>::from(
+        rows_to_json_line_buffers(result.fields, result.rows));
 }
 
 PreparedStatement Connection::prepare(const std::string& sql) {

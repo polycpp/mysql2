@@ -18,15 +18,15 @@ Supported scope
 - Trace events, connect and command timeout enforcement, AWS RDS TLS profile CA data, and parser-cache compatibility hooks.
 - Bounded register-slave/binlog-dump commands with typed parsing for common binlog event records.
 - Adapted server protocol mode with TCP or Unix socket listening, optional MySQL TLS upgrade, typed command events, and OK/ERR/text-result response writers.
-- Query stream adaptation through typed rows and newline-delimited JSON ``Buffer`` chunks.
+- Query stream support through typed ``polycpp::stream::Readable<Row>`` rows and newline-delimited JSON ``Readable<Buffer>`` chunks.
 - SQL escaping, identifier escaping, positional formatting, and named formatting helpers.
 
 Not full upstream parity
 ------------------------
 
-Exact Node ``createBinlogStream`` object/EventEmitter shape and exact Node
-``Readable`` object-mode row chunks are intentionally not part of the current
-C++ surface.
+Exact Node ``createBinlogStream`` object/EventEmitter shape is adapted to
+bounded reads, callback-controlled reads, and explicit parser state. Query row
+object streams now use ``polycpp::stream::Readable<Row>``.
 Callback, Promise, EventEmitter, trace, query attributes, command timeouts,
 cursor fetch, compression, LOCAL INFILE, URI, parser-cache compatibility,
 GTID/binlog parser support, server mode, and pool-cluster surfaces are

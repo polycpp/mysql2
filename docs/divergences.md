@@ -32,7 +32,7 @@
 - Node diagnostic channels are adapted to typed `event::Trace` events on `Connection` for connect/query/execute start, success, and error phases.
 - Per-command query/execute inactivity timeout options are adapted to `QueryOptions::timeout_ms`, `ExecuteOptions::timeout_ms`, and `CommandOptions::timeout_ms`. A timeout closes the transport and marks the connection disconnected.
 - Replication commands are synchronous operations. `COM_REGISTER_SLAVE`, `COM_BINLOG_DUMP`, and `COM_BINLOG_DUMP_GTID` are available. `BinlogParser` keeps table-map state so TableMap and common WriteRows/UpdateRows/DeleteRows events decode into typed row changes; Query, Rotate, FormatDescription, Xid, GTID, and PreviousGTIDs events are also typed. Raw packet/body and row slices are retained for audit and unsupported event families.
-- Node object-mode row streams are adapted to typed `RowStream` rows plus newline-delimited JSON byte streams via `polycpp::stream::Readable`, because current polycpp stream chunks are `Buffer`/text rather than arbitrary row objects.
+- Node object-mode row streams map to `polycpp::stream::Readable<Row>` typed chunks. `query_stream_json()` remains an explicit newline-delimited JSON `polycpp::stream::Readable<Buffer>` serializer for byte-stream consumers.
 - LOCAL INFILE never opens a path by default. The caller must provide `ConnectionOptions::local_infile_handler`, which receives the server-requested path and returns explicit `polycpp::Buffer` chunks.
 - Query attributes use `QueryAttributes`, an `std::unordered_map<std::string, Value>`. Attribute ordering on the wire is intentionally not a C++ API guarantee.
 - Server-side prepared-statement cursors are explicit `StatementCursor` objects. Callers fetch batches with `Connection::fetch(...)` and close the underlying prepared statement when they are done.
@@ -43,7 +43,6 @@
 ## Deferred Features
 
 - Exact Node `createBinlogStream` EventEmitter/object-stream shape is adapted to synchronous `binlog_dump(...)`, callback-controlled `binlog_dump_each(...)`, and explicit `BinlogParser` state rather than a JavaScript stream object.
-- Exact Node `Readable` object-mode row chunks are deferred until polycpp stream supports arbitrary typed payload chunks.
 - Binlog TIME2/DATETIME2/TIMESTAMP2 row values are exposed as raw `Buffer` values in row changes. The current public `Value` variant has no temporal binary value type, and converting those packed values to strings would lose audit fidelity.
 
 ## Security-Driven Behavior Changes
