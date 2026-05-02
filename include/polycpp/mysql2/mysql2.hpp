@@ -305,7 +305,25 @@ private:
     std::unique_ptr<Impl> impl_;
 };
 
-using RowStream = stream::Readable<Row>;
+class RowStream : public stream::Readable<Row> {
+public:
+    using Reader = std::function<void(RowStream&, std::size_t)>;
+    using Cleanup = std::function<void()>;
+
+    RowStream();
+    RowStream(std::vector<Field> fields, Reader reader, Cleanup cleanup = {});
+
+    const std::vector<Field>& fields() const noexcept;
+
+protected:
+    void _read(std::size_t hint) override;
+    void _destroy(polycpp::Error::Ptr error, std::function<void(polycpp::Error::Ptr)> done) override;
+
+private:
+    std::vector<Field> fields_;
+    Reader reader_;
+    Cleanup cleanup_;
+};
 
 class ServerConnection;
 
@@ -428,8 +446,8 @@ public:
     Promise<std::vector<QueryResult>> query_all_promise(const std::string& sql);
     Promise<std::vector<QueryResult>> query_all_promise(const std::string& sql, const QueryAttributes& attributes);
     Promise<std::vector<QueryResult>> query_all_promise(QueryOptions options);
-    stream::Readable<Row> query_stream(const std::string& sql);
-    stream::Readable<Row> query_stream(const QueryOptions& options);
+    RowStream query_stream(const std::string& sql);
+    RowStream query_stream(const QueryOptions& options);
     stream::Readable<Buffer> query_stream_json(const std::string& sql);
     stream::Readable<Buffer> query_stream_json(const QueryOptions& options);
     PreparedStatement prepare(const std::string& sql);
@@ -529,7 +547,7 @@ public:
 
 private:
     class Impl;
-    Impl* impl_ = nullptr;
+    std::shared_ptr<Impl> impl_;
 };
 
 class ServerConnection : public events::EventEmitterForwarder {

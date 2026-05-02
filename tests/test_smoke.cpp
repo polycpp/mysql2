@@ -386,6 +386,23 @@ TEST(server_mode, loopback_query_uses_adapted_server_api) {
     const auto result = client.query("SELECT 42 AS answer");
     ASSERT_EQ(result.rows.size(), 1u);
     EXPECT_EQ(std::get<int64_t>(result.rows[0].at("answer")), 42);
+    auto stream = client.query_stream("SELECT 42 AS answer");
+    ASSERT_EQ(stream.fields().size(), 1u);
+    EXPECT_THROW(client.query("SELECT 42 AS answer"), mysql2::Error);
+    auto stream_row = stream.read();
+    ASSERT_TRUE(stream_row.has_value());
+    EXPECT_EQ(std::get<int64_t>(stream_row->at("answer")), 42);
+    EXPECT_FALSE(stream.read().has_value());
+    const auto after_stream = client.query("SELECT 42 AS answer");
+    ASSERT_EQ(after_stream.rows.size(), 1u);
+    EXPECT_EQ(std::get<int64_t>(after_stream.rows[0].at("answer")), 42);
+    {
+        auto abandoned_stream = client.query_stream("SELECT 42 AS answer");
+        ASSERT_EQ(abandoned_stream.fields().size(), 1u);
+    }
+    const auto after_abandoned_stream = client.query("SELECT 42 AS answer");
+    ASSERT_EQ(after_abandoned_stream.rows.size(), 1u);
+    EXPECT_EQ(std::get<int64_t>(after_abandoned_stream.rows[0].at("answer")), 42);
     client.query("PREPARE polycpp_stmt FROM 'SELECT 1'");
     client.query("EXECUTE polycpp_stmt");
     const auto statement = client.prepare("SELECT ? AS answer");
@@ -716,6 +733,7 @@ TEST(mysql2_integration, query_against_real_database_when_configured) {
 
     trace_step("typed row stream query");
     auto typed_stream = connection.query_stream("SELECT 9 AS nine");
+    ASSERT_EQ(typed_stream.fields().size(), 1u);
     auto typed_row = typed_stream.read();
     ASSERT_TRUE(typed_row.has_value());
     EXPECT_EQ(std::get<int64_t>(typed_row->at("nine")), 9);

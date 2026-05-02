@@ -3446,7 +3446,7 @@ std::string value_to_string(const Value& value) {
 
 }  // namespace
 
-class Connection::Impl {
+class Connection::Impl : public std::enable_shared_from_this<Connection::Impl> {
 public:
     explicit Impl(ConnectionOptions options) : options_(std::move(options)), socket_(ctx_) {
         options_.charset_number = charset_number_for_name(options_.charset, options_.charset_number);
@@ -3536,6 +3536,14 @@ public:
     std::vector<QueryResult> query_all(const QueryOptions& options) {
         return with_operation_timeout(options.timeout_ms, [this, &options] {
             return query_all(options.sql, options.attributes);
+        });
+    }
+
+    RowStream query_stream(const std::string& sql, const QueryAttributes& attributes, uint32_t timeout_ms) {
+        return with_operation_timeout(timeout_ms, [this, &sql, &attributes, timeout_ms] {
+            ensure_connected();
+            write_packet(build_query_payload(sql, attributes, client_encoding_, client_flags_), 0);
+            return open_query_stream(false, timeout_ms);
         });
     }
 
@@ -3942,6 +3950,11 @@ public:
         if (!connected_ && !transport_is_open()) {
             return;
         }
+        if (active_query_stream_ != nullptr) {
+            active_query_stream_->done = true;
+            active_query_stream_->cleanup_started = true;
+            active_query_stream_ = nullptr;
+        }
         const bool was_connected = connected_;
         try {
             if (transport_is_open()) {
@@ -4049,6 +4062,24 @@ public:
     void resume() noexcept { paused_ = false; }
 
 private:
+    struct QueryStreamState {
+        std::weak_ptr<Impl> impl;
+        std::vector<Field> fields;
+        uint32_t timeout_ms = 0;
+        bool done = false;
+        bool cleanup_started = false;
+
+        void cleanup() noexcept {
+            if (done || cleanup_started) {
+                return;
+            }
+            cleanup_started = true;
+            if (auto owner = impl.lock()) {
+                owner->cleanup_query_stream(*this);
+            }
+        }
+    };
+
     template <typename Fn>
     std::invoke_result_t<Fn> with_operation_timeout(uint32_t timeout_ms, Fn&& fn) {
         const auto previous = operation_timeout_ms_;
@@ -4100,9 +4131,177 @@ private:
     }
 
     void ensure_connected() {
+        if (active_query_stream_ != nullptr) {
+            throw Error("cannot start mysql2 command while a query stream is active");
+        }
         if (!connected_) {
             traced("connect", "", [this] { connect(); });
         }
+    }
+
+    RowStream make_ended_row_stream(std::vector<Field> fields = {}) {
+        RowStream stream(std::move(fields), {}, {});
+        stream.pushEnd();
+        return stream;
+    }
+
+    RowStream open_query_stream(bool binary_rows, uint32_t timeout_ms) {
+        const auto first = read_packet();
+        if (is_err_packet(first.payload)) {
+            throw parse_error_packet(first.payload);
+        }
+        if (is_ok_packet(first.payload)) {
+            QueryResult result;
+            result.ok = parse_ok_packet(first.payload, server_capability_flags_);
+            return make_ended_row_stream();
+        }
+        if (first.payload.length() > 0 && first.payload[0] == 0xfb) {
+            (void)handle_local_infile_request(first);
+            return make_ended_row_stream();
+        }
+
+        PacketCursor header(first.payload);
+        const auto field_count = header.read_lenenc_int();
+        if (!field_count) {
+            throw Error("unexpected NULL field count in resultset header");
+        }
+
+        std::vector<Field> fields;
+        fields.reserve(static_cast<std::size_t>(*field_count));
+        for (std::size_t i = 0; i < *field_count; ++i) {
+            const auto field_frame = read_packet();
+            if (is_err_packet(field_frame.payload)) {
+                throw parse_error_packet(field_frame.payload);
+            }
+            fields.push_back(parse_column_definition(field_frame.payload, client_encoding_));
+        }
+
+        const auto fields_end = read_packet();
+        if (!is_eof_packet(fields_end.payload) && !is_ok_packet(fields_end.payload)) {
+            throw Error("expected EOF/OK packet after column definitions");
+        }
+        const auto metadata_end = parse_resultset_end_packet(fields_end.payload, server_capability_flags_);
+        if ((metadata_end.server_status & server_status_flag::CURSOR_EXISTS) != 0) {
+            return make_ended_row_stream(std::move(fields));
+        }
+
+        auto state = std::shared_ptr<QueryStreamState>(
+            new QueryStreamState{weak_from_this(), std::move(fields), timeout_ms},
+            [](QueryStreamState* ptr) noexcept {
+                if (ptr) {
+                    ptr->cleanup();
+                    delete ptr;
+                }
+            });
+        active_query_stream_ = state.get();
+
+        auto reader = [state, binary_rows](RowStream& stream, std::size_t hint) {
+            auto owner = state->impl.lock();
+            if (!owner) {
+                stream.destroy(std::make_shared<polycpp::Error>("mysql2 connection no longer exists"));
+                return;
+            }
+            owner->read_query_stream_rows(*state, stream, hint, binary_rows);
+        };
+        auto cleanup = [state]() {
+            state->cleanup();
+        };
+        return RowStream(state->fields, std::move(reader), std::move(cleanup));
+    }
+
+    void finish_query_stream(QueryStreamState& state) noexcept {
+        if (active_query_stream_ == &state) {
+            active_query_stream_ = nullptr;
+        }
+        state.done = true;
+        state.cleanup_started = true;
+    }
+
+    void read_query_stream_rows(QueryStreamState& state,
+                                RowStream& stream,
+                                std::size_t hint,
+                                bool binary_rows) {
+        if (state.done) {
+            stream.pushEnd();
+            return;
+        }
+        if (active_query_stream_ != &state) {
+            state.done = true;
+            stream.destroy(std::make_shared<polycpp::Error>("mysql2 query stream is no longer active"));
+            return;
+        }
+
+        with_operation_timeout(state.timeout_ms, [this, &state, &stream, hint, binary_rows] {
+            const std::size_t target = std::max<std::size_t>(hint, 1);
+            for (std::size_t i = 0; i < target && !state.done && !stream.destroyed(); ++i) {
+                const auto row_frame = read_packet();
+                if (is_err_packet(row_frame.payload)) {
+                    finish_query_stream(state);
+                    throw parse_error_packet(row_frame.payload);
+                }
+                if (is_eof_packet(row_frame.payload)) {
+                    const auto end = parse_resultset_end_packet(row_frame.payload, server_capability_flags_);
+                    const bool has_more = (end.server_status & server_status_flag::MORE_RESULTS_EXISTS) != 0;
+                    finish_query_stream(state);
+                    if (has_more) {
+                        drain_remaining_query_results(binary_rows);
+                        throw Error("query returned multiple result sets; use query_all");
+                    }
+                    stream.pushEnd();
+                    return;
+                }
+
+                Row row = binary_rows
+                    ? parse_binary_row(row_frame.payload, state.fields, options_)
+                    : parse_text_row(row_frame.payload, state.fields, options_);
+                if (!stream.push(std::move(row))) {
+                    return;
+                }
+            }
+        });
+    }
+
+    void drain_remaining_query_results(bool binary_rows) {
+        while (true) {
+            auto result = read_query_result(binary_rows);
+            const bool has_more = (result.ok.server_status & server_status_flag::MORE_RESULTS_EXISTS) != 0;
+            if (!has_more) {
+                break;
+            }
+        }
+    }
+
+    void drain_active_query_stream(QueryStreamState& state, bool binary_rows) {
+        while (true) {
+            const auto row_frame = read_packet();
+            if (is_err_packet(row_frame.payload)) {
+                (void)parse_error_packet(row_frame.payload);
+                return;
+            }
+            if (is_eof_packet(row_frame.payload)) {
+                const auto end = parse_resultset_end_packet(row_frame.payload, server_capability_flags_);
+                if ((end.server_status & server_status_flag::MORE_RESULTS_EXISTS) != 0) {
+                    drain_remaining_query_results(binary_rows);
+                }
+                return;
+            }
+        }
+    }
+
+    void cleanup_query_stream(QueryStreamState& state) noexcept {
+        if (active_query_stream_ != &state) {
+            state.done = true;
+            return;
+        }
+        try {
+            drain_active_query_stream(state, false);
+        } catch (...) {
+            close_transport();
+            connected_ = false;
+            tls_active_ = false;
+            compression_active_ = false;
+        }
+        finish_query_stream(state);
     }
 
     void connect_socket() {
@@ -4744,6 +4943,7 @@ private:
     std::deque<std::string> statement_lru_;
     std::string client_encoding_ = "utf8";
     uint32_t operation_timeout_ms_ = 0;
+    QueryStreamState* active_query_stream_ = nullptr;
 };
 
 Error::Error(const std::string& message) : polycpp::Error(message) {}
@@ -4772,6 +4972,42 @@ const Value& Row::at(const std::string& name) const {
         throw std::out_of_range("mysql2 row field does not exist: " + name);
     }
     return at(it->second);
+}
+
+RowStream::RowStream() : stream::Readable<Row>() {}
+
+RowStream::RowStream(std::vector<Field> fields, Reader reader, Cleanup cleanup)
+    : stream::Readable<Row>(),
+      fields_(std::move(fields)),
+      reader_(std::move(reader)),
+      cleanup_(std::move(cleanup)) {}
+
+const std::vector<Field>& RowStream::fields() const noexcept {
+    return fields_;
+}
+
+void RowStream::_read(std::size_t hint) {
+    if (!reader_) {
+        return;
+    }
+    try {
+        reader_(*this, hint);
+    } catch (const std::exception& error) {
+        destroy(std::make_shared<polycpp::Error>(error.what()));
+    } catch (...) {
+        destroy(std::make_shared<polycpp::Error>("mysql2 query stream read failed"));
+    }
+}
+
+void RowStream::_destroy(polycpp::Error::Ptr error, std::function<void(polycpp::Error::Ptr)> done) {
+    auto cleanup = std::move(cleanup_);
+    reader_ = nullptr;
+    if (cleanup) {
+        cleanup();
+    }
+    if (done) {
+        done(std::move(error));
+    }
 }
 
 bool QueryResult::has_rows() const noexcept { return !fields.empty(); }
@@ -4828,24 +5064,37 @@ std::string row_to_json_line(const Row& row, const std::vector<Field>& fields) {
 
 namespace {
 
-stream::Readable<Row> make_row_stream(std::vector<Row> rows) {
-    stream::Readable<Row> readable;
-    for (auto& row : rows) {
-        readable.push(std::move(row));
-    }
-    readable.pushEnd();
-    return readable;
-}
+class JsonRowReadableImpl : public stream::impl::ReadableImpl {
+public:
+    explicit JsonRowReadableImpl(RowStream rows)
+        : row_stream_(std::move(rows)),
+          fields_(row_stream_.fields()) {}
 
-std::vector<Buffer> rows_to_json_line_buffers(const std::vector<Field>& fields,
-                                              const std::vector<Row>& rows) {
-    std::vector<Buffer> chunks;
-    chunks.reserve(rows.size());
-    for (const auto& row : rows) {
-        chunks.push_back(Buffer::from(row_to_json_line(row, fields)));
+protected:
+    void _read(std::size_t) override {
+        while (!destroyed() && readableLength() < readableHighWaterMark()) {
+            auto row = row_stream_.read();
+            if (!row) {
+                push(std::nullopt);
+                return;
+            }
+            if (!push(Buffer::from(row_to_json_line(*row, fields_)))) {
+                return;
+            }
+        }
     }
-    return chunks;
-}
+
+    void _destroy(polycpp::Error::Ptr error, std::function<void(polycpp::Error::Ptr)> done) override {
+        row_stream_.destroy(error);
+        if (done) {
+            done(std::move(error));
+        }
+    }
+
+private:
+    RowStream row_stream_;
+    std::vector<Field> fields_;
+};
 
 }  // namespace
 
@@ -5164,22 +5413,21 @@ Promise<void> promise_void_from(F&& work) {
     });
 }
 
-Connection::Connection() : impl_(new Impl(ConnectionOptions{})) {
+Connection::Connection() : impl_(std::make_shared<Impl>(ConnectionOptions{})) {
     setEmitter_(impl_->emitter());
 }
 
-Connection::Connection(ConnectionOptions options) : impl_(new Impl(std::move(options))) {
+Connection::Connection(ConnectionOptions options) : impl_(std::make_shared<Impl>(std::move(options))) {
     setEmitter_(impl_->emitter());
 }
 
 Connection::~Connection() {
     if (impl_) {
         impl_->end();
-        delete impl_;
     }
 }
 
-Connection::Connection(Connection&& other) noexcept : impl_(std::exchange(other.impl_, nullptr)) {
+Connection::Connection(Connection&& other) noexcept : impl_(std::move(other.impl_)) {
     if (impl_) {
         setEmitter_(impl_->emitter());
     }
@@ -5190,9 +5438,8 @@ Connection& Connection::operator=(Connection&& other) noexcept {
     if (this != &other) {
         if (impl_) {
             impl_->end();
-            delete impl_;
         }
-        impl_ = std::exchange(other.impl_, nullptr);
+        impl_ = std::move(other.impl_);
         if (impl_) {
             setEmitter_(impl_->emitter());
         } else {
@@ -5357,26 +5604,36 @@ Promise<std::vector<QueryResult>> Connection::query_all_promise(QueryOptions opt
     });
 }
 
-stream::Readable<Row> Connection::query_stream(const std::string& sql) {
-    auto result = query(sql);
-    return make_row_stream(std::move(result.rows));
+RowStream Connection::query_stream(const std::string& sql) {
+    try {
+        return impl_->traced("query_stream", sql, [this, &sql] {
+            return impl_->query_stream(sql, QueryAttributes{}, 0);
+        });
+    } catch (const Error& error) {
+        impl_->emit_error(error);
+        throw;
+    }
 }
 
-stream::Readable<Row> Connection::query_stream(const QueryOptions& options) {
-    auto result = query(options);
-    return make_row_stream(std::move(result.rows));
+RowStream Connection::query_stream(const QueryOptions& options) {
+    try {
+        return impl_->traced("query_stream", options.sql, [this, &options] {
+            return impl_->query_stream(options.sql, options.attributes, options.timeout_ms);
+        });
+    } catch (const Error& error) {
+        impl_->emit_error(error);
+        throw;
+    }
 }
 
 stream::Readable<Buffer> Connection::query_stream_json(const std::string& sql) {
-    auto result = query(sql);
-    return stream::Readable<Buffer>::from(
-        rows_to_json_line_buffers(result.fields, result.rows));
+    return stream::Readable<Buffer>(
+        std::make_shared<JsonRowReadableImpl>(query_stream(sql)));
 }
 
 stream::Readable<Buffer> Connection::query_stream_json(const QueryOptions& options) {
-    auto result = query(options);
-    return stream::Readable<Buffer>::from(
-        rows_to_json_line_buffers(result.fields, result.rows));
+    return stream::Readable<Buffer>(
+        std::make_shared<JsonRowReadableImpl>(query_stream(options)));
 }
 
 PreparedStatement Connection::prepare(const std::string& sql) {
