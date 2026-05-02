@@ -17,6 +17,7 @@ Supported scope
 - Callback overloads, ``polycpp::Promise`` wrappers, typed events, connection URI parsing, compression, and LOCAL INFILE handler hooks.
 - Trace events, connect and command timeout enforcement, AWS RDS TLS profile CA data, and parser-cache compatibility hooks.
 - Bounded register-slave/binlog-dump commands with typed parsing for common binlog event records.
+- Binlog stream support through pull-based ``BinlogStream`` typed events over ``polycpp::stream::Readable<BinlogEvent>``.
 - Adapted server protocol mode with TCP or Unix socket listening, optional MySQL TLS upgrade, typed command events, and OK/ERR/text-result response writers.
 - Query stream support through pull-based ``RowStream`` typed rows and lazy newline-delimited JSON ``Readable<Buffer>`` chunks.
 - SQL escaping, identifier escaping, positional formatting, and named formatting helpers.
@@ -24,10 +25,11 @@ Supported scope
 Not full upstream parity
 ------------------------
 
-Exact Node ``createBinlogStream`` object/EventEmitter shape is adapted to
-bounded reads, callback-controlled reads, and explicit parser state. Query row
-object streams now use ``RowStream``, a ``polycpp::stream::Readable<Row>``
-subclass.
+Exact JavaScript object identity/prototype behavior is not modeled. Query row
+object streams use ``RowStream``, a ``polycpp::stream::Readable<Row>``
+subclass. Binlog object streams use ``BinlogStream``, a
+``polycpp::stream::Readable<BinlogEvent>`` subclass whose chunks are consumed
+with ``polycpp::stream::event::Data``.
 Callback, Promise, EventEmitter, trace, query attributes, command timeouts,
 cursor fetch, compression, LOCAL INFILE, URI, parser-cache compatibility,
 GTID/binlog parser support, server mode, and pool-cluster surfaces are

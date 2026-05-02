@@ -312,6 +312,10 @@ public:
 
     RowStream();
     RowStream(std::vector<Field> fields, Reader reader, Cleanup cleanup = {});
+    RowStream(RowStream&& other) noexcept;
+    RowStream& operator=(RowStream&& other) noexcept;
+    RowStream(const RowStream&) = delete;
+    RowStream& operator=(const RowStream&) = delete;
 
     const std::vector<Field>& fields() const noexcept;
 
@@ -321,6 +325,30 @@ protected:
 
 private:
     std::vector<Field> fields_;
+    Reader reader_;
+    Cleanup cleanup_;
+};
+
+class BinlogStream : public stream::Readable<BinlogEvent> {
+public:
+    using Reader = std::function<void(BinlogStream&, std::size_t)>;
+    using Cleanup = std::function<void()>;
+
+    BinlogStream();
+    BinlogStream(BinlogDumpOptions options, Reader reader, Cleanup cleanup = {});
+    BinlogStream(BinlogStream&& other) noexcept;
+    BinlogStream& operator=(BinlogStream&& other) noexcept;
+    BinlogStream(const BinlogStream&) = delete;
+    BinlogStream& operator=(const BinlogStream&) = delete;
+
+    const BinlogDumpOptions& options() const noexcept;
+
+protected:
+    void _read(std::size_t hint) override;
+    void _destroy(polycpp::Error::Ptr error, std::function<void(polycpp::Error::Ptr)> done) override;
+
+private:
+    BinlogDumpOptions options_;
     Reader reader_;
     Cleanup cleanup_;
 };
@@ -507,6 +535,7 @@ public:
     Promise<OkPacket> register_slave_promise(RegisterSlaveOptions options);
     std::vector<BinlogEvent> binlog_dump(const BinlogDumpOptions& options = {});
     std::size_t binlog_dump_each(const BinlogDumpOptions& options, BinlogEventCallback callback);
+    BinlogStream create_binlog_stream(const BinlogDumpOptions& options = {});
     void binlog_dump(const BinlogDumpOptions& options, BinlogEventsCallback callback);
     Promise<std::vector<BinlogEvent>> binlog_dump_promise(BinlogDumpOptions options = {});
     void close_statement(const PreparedStatement& statement);

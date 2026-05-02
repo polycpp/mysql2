@@ -2,23 +2,18 @@
 
 ## Implemented With C++ Adaptation
 
-- The 2026-05-01 TypedEvent migration was rolled back the same day.
-  polycpp HEAD `75bc07df` restored the canonical
-  `events::TypedEvent<"name", Args...>` (fixed_string NTTP) form, the
-  non-CRTP `events::EventEmitterForwarder` base, and the
-  `events::ErrorEventOf<>` trait. mysql2 is back to the original shape
-  for all three. Event payload dispatch now goes through
-  `events::detail::DispatchArgStorage` instead of `std::any`, so the
-  `Connection&` / `ServerConnection&` lvalue-ref payloads on
-  `event::ConnectionCreated` / `Acquire` / `Release` and the server
-  command events work without the temporary `Connection*` / `ServerConnection*`
-  workaround.
+- Current validation targets polycpp HEAD `40bd73669e8105fcb8641ad6671dfd07141e9eff`.
+  It keeps the canonical `events::TypedEvent<"name", Args...>`
+  (fixed_string NTTP) form, the non-CRTP `events::EventEmitterForwarder`
+  base, and the `events::ErrorEventOf<>` trait. It also exposes typed
+  stream data delivery through `polycpp::stream::event::Data`, which mysql2
+  uses for both `RowStream` and `BinlogStream`.
 - The private `include/polycpp/mysql2/detail/socket_adapter.hpp`
   variant adapter introduced as a workaround in the same migration is
   gone. mysql2 now uses `polycpp::io::PipeSocket` /
   `polycpp::io::PipeAcceptor` / `polycpp::io::StreamSocket` /
   `polycpp::io::StreamAcceptor` directly — those four primitives are
-  exported by polycpp HEAD `75bc07df`.
+  exported by current polycpp HEAD.
 - The API is synchronous and typed first. Callback and `polycpp::Promise` wrappers are available, but they execute the same typed operations rather than introducing a separate JavaScript command queue.
 - Rows use `std::variant` values and explicit field lookup rather than mutable JavaScript objects.
 - Prepared statements are explicit C++ objects. `execute(sql, values)` also uses a bounded connection-local statement cache for upstream compatibility.
@@ -31,7 +26,7 @@
 - Parser-cache controls are exposed as compatibility/audit hooks, but they do not clear generated parser code because no generated parser cache exists.
 - Node diagnostic channels are adapted to typed `event::Trace` events on `Connection` for connect/query/execute start, success, and error phases.
 - Per-command query/execute inactivity timeout options are adapted to `QueryOptions::timeout_ms`, `ExecuteOptions::timeout_ms`, and `CommandOptions::timeout_ms`. A timeout closes the transport and marks the connection disconnected.
-- Replication commands are synchronous operations. `COM_REGISTER_SLAVE`, `COM_BINLOG_DUMP`, and `COM_BINLOG_DUMP_GTID` are available. `BinlogParser` keeps table-map state so TableMap and common WriteRows/UpdateRows/DeleteRows events decode into typed row changes; Query, Rotate, FormatDescription, Xid, GTID, and PreviousGTIDs events are also typed. Raw packet/body and row slices are retained for audit and unsupported event families.
+- Replication commands are typed C++ operations. `COM_REGISTER_SLAVE`, `COM_BINLOG_DUMP`, and `COM_BINLOG_DUMP_GTID` are available. `Connection::create_binlog_stream(...)` exposes `BinlogStream`, a pull-based `polycpp::stream::Readable<BinlogEvent>` subclass that emits chunks through `polycpp::stream::event::Data`. `BinlogParser` keeps table-map state so TableMap and common WriteRows/UpdateRows/DeleteRows events decode into typed row changes; Query, Rotate, FormatDescription, Xid, GTID, and PreviousGTIDs events are also typed. Raw packet/body and row slices are retained for audit and unsupported event families.
 - Node object-mode row streams map to `RowStream`, a `polycpp::stream::Readable<Row>` subclass. Result metadata is read when the stream is created; row packets are decoded on `read()` or flowing consumption. The connection remains reserved for that stream until EOF or destroy/drop cleanup drains the remaining packets. `query_stream_json()` is a lazy newline-delimited JSON `polycpp::stream::Readable<Buffer>` adapter for byte-stream consumers.
 - LOCAL INFILE never opens a path by default. The caller must provide `ConnectionOptions::local_infile_handler`, which receives the server-requested path and returns explicit `polycpp::Buffer` chunks.
 - Query attributes use `QueryAttributes`, an `std::unordered_map<std::string, Value>`. Attribute ordering on the wire is intentionally not a C++ API guarantee.
@@ -42,7 +37,6 @@
 
 ## Deferred Features
 
-- Exact Node `createBinlogStream` EventEmitter/object-stream shape is adapted to synchronous `binlog_dump(...)`, callback-controlled `binlog_dump_each(...)`, and explicit `BinlogParser` state rather than a JavaScript stream object.
 - Binlog TIME2/DATETIME2/TIMESTAMP2 row values are exposed as raw `Buffer` values in row changes. The current public `Value` variant has no temporal binary value type, and converting those packed values to strings would lose audit fidelity.
 
 ## Security-Driven Behavior Changes

@@ -269,6 +269,20 @@ TEST(rows, json_helpers_and_event_emitter_surface) {
     EXPECT_EQ(std::get<int64_t>(first->at("id")), 42);
     EXPECT_FALSE(row_stream.read().has_value());
 
+    mysql2::BinlogDumpOptions binlog_options;
+    binlog_options.server_id = 12345;
+    mysql2::BinlogStream binlog_stream(binlog_options, {}, {});
+    EXPECT_EQ(binlog_stream.options().server_id, 12345u);
+    bool saw_binlog_event = false;
+    binlog_stream.on(polycpp::stream::event::Data, [&](const mysql2::BinlogEvent& event) {
+        saw_binlog_event = event.name == "QueryEvent";
+    });
+    mysql2::BinlogEvent binlog_event;
+    binlog_event.name = "QueryEvent";
+    EXPECT_TRUE(binlog_stream.push(binlog_event));
+    binlog_stream.pushEnd();
+    EXPECT_TRUE(saw_binlog_event);
+
     mysql2::Connection connection;
     bool saw_error = false;
     connection.on(mysql2::event::Error_, [&](const mysql2::Error& error) {

@@ -15,6 +15,7 @@
 - SSL profile helper coverage verifies the generated AWS RDS CA bundle is loadable as PEM strings.
 - Parser-cache compatibility hooks are covered as no-op static-parser controls.
 - Typed `RowStream` coverage verifies row iteration, field metadata exposure, active-stream connection reservation, and cleanup after abandoned streams. NDJSON `Readable<Buffer>` coverage verifies lazy byte serialization over the row stream.
+- Typed `BinlogStream` coverage verifies `polycpp::stream::event::Data` delivery for `BinlogEvent` chunks. Replication e2e should validate active-stream connection reservation, EOF release, `max_events` transport close, and destroy-before-EOF transport close against a binary-log-enabled server.
 - Binlog packet parser coverage includes QueryEvent fixtures, GTID set parsing, and stateful TableMap plus WriteRows decoding. Rotate, FormatDescription, Xid, GTID packet, PreviousGTIDs packet, update/delete rows, and unknown-event fixtures should be expanded.
 - Adapted server mode loopback coverage creates a `Server`, accepts a `Connection` client over TCP and Unix socket paths, validates handshake auth/connect attributes, dispatches query, ping, statement prepare, and statement execute events, writes text/OK responses, writes a prepared-statement OK packet and binary result rows for a real client `prepare`/`execute`, observes quit, and verifies auth callback rejection returns a MySQL ERR packet.
 
@@ -52,7 +53,7 @@
 - RSA auth path uses OAEP SHA1 to match upstream caching_sha2_password behavior.
 - Single-result APIs drain additional result sets before throwing so the connection is reusable.
 - Per-command inactivity timeout closes the transport and marks the connection disconnected.
-- Bounded binlog dump closes the connection if `max_events` is reached before EOF, so callers do not accidentally reuse a connection that is still inside a replication stream. Callback-controlled `binlog_dump_each` is the documented escape hatch for continuous consumption.
+- Bounded binlog dump and `create_binlog_stream(...)` close the connection if `max_events` is reached before EOF, so callers do not accidentally reuse a connection that is still inside a replication stream. Callback-controlled `binlog_dump_each` and `create_binlog_stream(...)` with `max_events = 0` are the documented continuous-consumption surfaces.
 - Server auth callbacks can reject a client by returning an `Error`; accepted clients expose parsed `ServerAuthInfo` without validating passwords implicitly. Rejection is covered by a loopback test that expects error code 1045 / SQL state 28000.
 
 ## Release-Blocking Behaviors
@@ -61,7 +62,7 @@
 - Real MariaDB e2e passes without TLS.
 - Real MariaDB e2e passes with verified TLS.
 - Real MySQL 8 e2e passes before claiming MySQL 8 auth parity.
-- Stream adaptation, command timeout behavior, compression, LOCAL INFILE policy, callback/Promise wrappers, EventEmitter/trace behavior, adapted TCP/Unix server mode, bounded/callback binlog behavior, parser-cache compatibility hooks, and SSL profile data remain documented with exact C++ semantics.
+- Stream adaptation, command timeout behavior, compression, LOCAL INFILE policy, callback/Promise wrappers, EventEmitter/trace behavior, adapted TCP/Unix server mode, bounded/callback/typed-stream binlog behavior, parser-cache compatibility hooks, and SSL profile data remain documented with exact C++ semantics.
 - Third-party license notices are complete.
 - Documentation builds with `python3 docs/build.py`.
 - GitHub repo remains private until production-grade quality and public docs are ready.
@@ -114,6 +115,23 @@ cmake --build build -j$(nproc)
 ```
 
 Result: `100% tests passed, 0 tests failed out of 14` in 0.09 s
+(12 ran, 2 skipped — `server_mode.loopback_query_supports_tls_upgrade_when_configured`
+needs `MYSQL2_TEST_SERVER_TLS_CERT_FILE`/`MYSQL2_TEST_SERVER_TLS_KEY_FILE`,
+`mysql2_integration.query_against_real_database_when_configured` needs
+`MYSQL2_TEST_HOST`/`MYSQL2_TEST_USER`).
+
+Additional validation on May 2, 2026 against polycpp HEAD
+`40bd73669e8105fcb8641ad6671dfd07141e9eff` after adopting
+`polycpp::stream::event::Data` for typed binlog streams and adding explicit
+mysql2 stream-wrapper move constructors required by the current non-movable
+`polycpp::stream::Readable<T>` facade:
+
+```bash
+cmake --build build -j2
+ctest --test-dir build --output-on-failure
+```
+
+Result: `100% tests passed, 0 tests failed out of 14` in 0.39 s
 (12 ran, 2 skipped — `server_mode.loopback_query_supports_tls_upgrade_when_configured`
 needs `MYSQL2_TEST_SERVER_TLS_CERT_FILE`/`MYSQL2_TEST_SERVER_TLS_KEY_FILE`,
 `mysql2_integration.query_against_real_database_when_configured` needs

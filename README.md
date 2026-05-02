@@ -40,13 +40,10 @@ Implemented:
 - AWS RDS TLS profile CA data from `aws-ssl-profiles@1.1.2` via `SslOptions::profile = "Amazon RDS"`.
 - Parser-cache compatibility controls as no-op/static-parser audit hooks.
 - Bounded `COM_REGISTER_SLAVE`, `COM_BINLOG_DUMP`, and `COM_BINLOG_DUMP_GTID` support with typed parsing for Query, Rotate, FormatDescription, Xid, GTID, PreviousGTIDs, TableMap, and common row events, plus raw payload retention for audit and unsupported event types.
+- `BinlogStream`, a pull-based `polycpp::stream::Readable<BinlogEvent>` returned by `Connection::create_binlog_stream(...)`; callers consume events through `polycpp::stream::event::Data`.
 - `BinlogParser` for stateful table-map-aware row decoding and `Connection::binlog_dump_each(...)` for callback-controlled replication reads without accumulating an unbounded vector.
 - Adapted server protocol mode with `create_server`, `Server`, `ServerConnection`, TCP or Unix socket listening, optional MySQL in-protocol TLS upgrade, server-side protocol handshake/auth callback, typed query/ping/quit/init-db/field-list/statement command events, statement-prepare OK writers, and OK/ERR/text/binary result response writers.
 - Optional real MariaDB/MySQL e2e tests controlled by `MYSQL2_TEST_*` environment variables.
-
-Deferred:
-
-- Exact Node `createBinlogStream` EventEmitter/object-stream shape. The C++ port exposes bounded vector reads, callback-controlled reads, and explicit parser state instead.
 
 Known divergences:
 
@@ -57,7 +54,8 @@ Known divergences:
 - Server mode is adapted to a C++ server object. It supports TCP and Unix socket listening, MySQL in-protocol TLS upgrade when configured, handshake/auth inspection, command dispatch, packet observation, statement prepare OK packets, and OK/ERR/text/binary result writers; a full SQL engine is intentionally not implied.
 - Parser cache controls are compatibility no-ops because C++ uses static parsers.
 - Query attributes use `std::unordered_map`, so attribute wire order is not a public contract.
-- Bounded binlog dump closes the connection if `max_events` is reached before EOF, because the connection is otherwise left in the replication command stream. Use `binlog_dump_each(...)` when the caller wants callback-controlled continuous consumption.
+- Binlog streams use typed C++ `BinlogStream` chunks instead of JavaScript object prototypes. A live `create_binlog_stream(...)` reserves the connection; EOF releases it, while `max_events` or destroying the stream before EOF closes the transport because the server is still in replication packet mode.
+- Bounded binlog dump closes the connection if `max_events` is reached before EOF, because the connection is otherwise left in the replication command stream. Use `create_binlog_stream(...)` or `binlog_dump_each(...)` when the caller wants stream-shaped or callback-controlled continuous consumption.
 
 ## Prerequisites
 
@@ -178,6 +176,26 @@ conn.binlog_dump_each(stream_dump, [](const polycpp::mysql2::BinlogEvent& event)
         }
     }
     return true; // return false to close the replication command stream
+});
+```
+
+Typed binlog stream:
+
+```cpp
+polycpp::mysql2::BinlogDumpOptions stream_options;
+stream_options.flags = 0;
+stream_options.max_events = 0;
+stream_options.server_id = 12345;
+
+auto binlog = conn.create_binlog_stream(stream_options);
+binlog.on(polycpp::stream::event::Data, [](const polycpp::mysql2::BinlogEvent& event) {
+    if (event.name == "RotateEvent") {
+        (void)event.next_binlog;
+    }
+});
+binlog.on(polycpp::stream::event::End, [] {});
+binlog.on(polycpp::stream::event::Error_, [](const polycpp::Error& error) {
+    (void)error;
 });
 ```
 

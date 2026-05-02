@@ -3447,6 +3447,10 @@ std::string value_to_string(const Value& value) {
 }  // namespace
 
 class Connection::Impl : public std::enable_shared_from_this<Connection::Impl> {
+private:
+    struct QueryStreamState;
+    struct BinlogStreamState;
+
 public:
     explicit Impl(ConnectionOptions options) : options_(std::move(options)), socket_(ctx_) {
         options_.charset_number = charset_number_for_name(options_.charset, options_.charset_number);
@@ -3834,6 +3838,34 @@ public:
         return count;
     }
 
+    BinlogStream create_binlog_stream(const BinlogDumpOptions& options) {
+        ensure_connected();
+        write_packet(build_binlog_dump_payload(options), 0);
+
+        auto state = std::shared_ptr<BinlogStreamState>(
+            new BinlogStreamState{weak_from_this(), options},
+            [](BinlogStreamState* ptr) noexcept {
+                if (ptr) {
+                    ptr->cleanup();
+                    delete ptr;
+                }
+            });
+        active_binlog_stream_ = state.get();
+
+        auto reader = [state](BinlogStream& stream, std::size_t hint) {
+            auto owner = state->impl.lock();
+            if (!owner) {
+                stream.destroy(std::make_shared<polycpp::Error>("mysql2 connection no longer exists"));
+                return;
+            }
+            owner->read_binlog_stream_events(*state, stream, hint);
+        };
+        auto cleanup = [state]() {
+            state->cleanup();
+        };
+        return BinlogStream(options, std::move(reader), std::move(cleanup));
+    }
+
     void close_statement(const PreparedStatement& statement) {
         ensure_connected();
         if (statement.id == 0) {
@@ -3954,6 +3986,11 @@ public:
             active_query_stream_->done = true;
             active_query_stream_->cleanup_started = true;
             active_query_stream_ = nullptr;
+        }
+        if (active_binlog_stream_ != nullptr) {
+            active_binlog_stream_->done = true;
+            active_binlog_stream_->cleanup_started = true;
+            active_binlog_stream_ = nullptr;
         }
         const bool was_connected = connected_;
         try {
@@ -4080,6 +4117,25 @@ private:
         }
     };
 
+    struct BinlogStreamState {
+        std::weak_ptr<Impl> impl;
+        BinlogDumpOptions options;
+        BinlogParserState parser_state;
+        std::size_t count = 0;
+        bool done = false;
+        bool cleanup_started = false;
+
+        void cleanup() noexcept {
+            if (done || cleanup_started) {
+                return;
+            }
+            cleanup_started = true;
+            if (auto owner = impl.lock()) {
+                owner->cleanup_binlog_stream(*this);
+            }
+        }
+    };
+
     template <typename Fn>
     std::invoke_result_t<Fn> with_operation_timeout(uint32_t timeout_ms, Fn&& fn) {
         const auto previous = operation_timeout_ms_;
@@ -4134,15 +4190,20 @@ private:
         if (active_query_stream_ != nullptr) {
             throw Error("cannot start mysql2 command while a query stream is active");
         }
+        if (active_binlog_stream_ != nullptr) {
+            throw Error("cannot start mysql2 command while a binlog stream is active");
+        }
         if (!connected_) {
             traced("connect", "", [this] { connect(); });
         }
     }
 
     RowStream make_ended_row_stream(std::vector<Field> fields = {}) {
-        RowStream stream(std::move(fields), {}, {});
-        stream.pushEnd();
-        return stream;
+        return RowStream(std::move(fields),
+                         [](RowStream& stream, std::size_t) {
+                             stream.pushEnd();
+                         },
+                         {});
     }
 
     RowStream open_query_stream(bool binary_rows, uint32_t timeout_ms) {
@@ -4302,6 +4363,74 @@ private:
             compression_active_ = false;
         }
         finish_query_stream(state);
+    }
+
+    void finish_binlog_stream(BinlogStreamState& state) noexcept {
+        if (active_binlog_stream_ == &state) {
+            active_binlog_stream_ = nullptr;
+        }
+        state.done = true;
+        state.cleanup_started = true;
+    }
+
+    void close_transport_after_binlog_stop() noexcept {
+        try {
+            close_transport();
+        } catch (...) {
+        }
+        connected_ = false;
+        tls_active_ = false;
+        compression_active_ = false;
+    }
+
+    void read_binlog_stream_events(BinlogStreamState& state,
+                                   BinlogStream& stream,
+                                   std::size_t hint) {
+        if (state.done) {
+            stream.pushEnd();
+            return;
+        }
+        if (active_binlog_stream_ != &state) {
+            state.done = true;
+            stream.destroy(std::make_shared<polycpp::Error>("mysql2 binlog stream is no longer active"));
+            return;
+        }
+
+        const std::size_t target = std::max<std::size_t>(hint, 1);
+        for (std::size_t i = 0; i < target && !state.done && !stream.destroyed(); ++i) {
+            const auto frame = read_packet();
+            if (is_err_packet(frame.payload)) {
+                finish_binlog_stream(state);
+                throw parse_error_packet(frame.payload);
+            }
+            if (is_eof_packet(frame.payload)) {
+                finish_binlog_stream(state);
+                stream.pushEnd();
+                return;
+            }
+
+            auto event = parse_binlog_event_packet_impl(frame.payload, &state.parser_state);
+            ++state.count;
+            const bool should_continue = stream.push(std::move(event));
+            if (state.options.max_events != 0 && state.count >= state.options.max_events) {
+                close_transport_after_binlog_stop();
+                finish_binlog_stream(state);
+                stream.pushEnd();
+                return;
+            }
+            if (!should_continue) {
+                return;
+            }
+        }
+    }
+
+    void cleanup_binlog_stream(BinlogStreamState& state) noexcept {
+        if (active_binlog_stream_ != &state) {
+            state.done = true;
+            return;
+        }
+        close_transport_after_binlog_stop();
+        finish_binlog_stream(state);
     }
 
     void connect_socket() {
@@ -4944,6 +5073,7 @@ private:
     std::string client_encoding_ = "utf8";
     uint32_t operation_timeout_ms_ = 0;
     QueryStreamState* active_query_stream_ = nullptr;
+    BinlogStreamState* active_binlog_stream_ = nullptr;
 };
 
 Error::Error(const std::string& message) : polycpp::Error(message) {}
@@ -4982,6 +5112,31 @@ RowStream::RowStream(std::vector<Field> fields, Reader reader, Cleanup cleanup)
       reader_(std::move(reader)),
       cleanup_(std::move(cleanup)) {}
 
+RowStream::RowStream(RowStream&& other) noexcept
+    : stream::Readable<Row>(),
+      fields_(std::move(other.fields_)),
+      reader_(std::move(other.reader_)),
+      cleanup_(std::move(other.cleanup_)) {
+    other.reader_ = nullptr;
+    other.cleanup_ = nullptr;
+}
+
+RowStream& RowStream::operator=(RowStream&& other) noexcept {
+    if (this != &other) {
+        auto cleanup = std::move(cleanup_);
+        reader_ = nullptr;
+        if (cleanup) {
+            cleanup();
+        }
+        fields_ = std::move(other.fields_);
+        reader_ = std::move(other.reader_);
+        cleanup_ = std::move(other.cleanup_);
+        other.reader_ = nullptr;
+        other.cleanup_ = nullptr;
+    }
+    return *this;
+}
+
 const std::vector<Field>& RowStream::fields() const noexcept {
     return fields_;
 }
@@ -5000,6 +5155,67 @@ void RowStream::_read(std::size_t hint) {
 }
 
 void RowStream::_destroy(polycpp::Error::Ptr error, std::function<void(polycpp::Error::Ptr)> done) {
+    auto cleanup = std::move(cleanup_);
+    reader_ = nullptr;
+    if (cleanup) {
+        cleanup();
+    }
+    if (done) {
+        done(std::move(error));
+    }
+}
+
+BinlogStream::BinlogStream() : stream::Readable<BinlogEvent>() {}
+
+BinlogStream::BinlogStream(BinlogDumpOptions options, Reader reader, Cleanup cleanup)
+    : stream::Readable<BinlogEvent>(),
+      options_(std::move(options)),
+      reader_(std::move(reader)),
+      cleanup_(std::move(cleanup)) {}
+
+BinlogStream::BinlogStream(BinlogStream&& other) noexcept
+    : stream::Readable<BinlogEvent>(),
+      options_(std::move(other.options_)),
+      reader_(std::move(other.reader_)),
+      cleanup_(std::move(other.cleanup_)) {
+    other.reader_ = nullptr;
+    other.cleanup_ = nullptr;
+}
+
+BinlogStream& BinlogStream::operator=(BinlogStream&& other) noexcept {
+    if (this != &other) {
+        auto cleanup = std::move(cleanup_);
+        reader_ = nullptr;
+        if (cleanup) {
+            cleanup();
+        }
+        options_ = std::move(other.options_);
+        reader_ = std::move(other.reader_);
+        cleanup_ = std::move(other.cleanup_);
+        other.reader_ = nullptr;
+        other.cleanup_ = nullptr;
+    }
+    return *this;
+}
+
+const BinlogDumpOptions& BinlogStream::options() const noexcept {
+    return options_;
+}
+
+void BinlogStream::_read(std::size_t hint) {
+    if (!reader_) {
+        return;
+    }
+    try {
+        reader_(*this, hint);
+    } catch (const std::exception& error) {
+        destroy(std::make_shared<polycpp::Error>(error.what()));
+    } catch (...) {
+        destroy(std::make_shared<polycpp::Error>("mysql2 binlog stream read failed"));
+    }
+}
+
+void BinlogStream::_destroy(polycpp::Error::Ptr error, std::function<void(polycpp::Error::Ptr)> done) {
     auto cleanup = std::move(cleanup_);
     reader_ = nullptr;
     if (cleanup) {
@@ -6045,6 +6261,15 @@ std::vector<BinlogEvent> Connection::binlog_dump(const BinlogDumpOptions& option
 std::size_t Connection::binlog_dump_each(const BinlogDumpOptions& options, BinlogEventCallback callback) {
     try {
         return impl_->binlog_dump_each(options, callback);
+    } catch (const Error& error) {
+        impl_->emit_error(error);
+        throw;
+    }
+}
+
+BinlogStream Connection::create_binlog_stream(const BinlogDumpOptions& options) {
+    try {
+        return impl_->create_binlog_stream(options);
     } catch (const Error& error) {
         impl_->emit_error(error);
         throw;

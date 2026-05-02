@@ -85,7 +85,7 @@ python3 /data/work/libgen/scripts/analyze-upstream-js.py /data/work/lib/mysql2 /
 - Node parity hints consumed: yes; callback, Promise, EventEmitter, stream, Buffer, URL, timer/process, crypto, compression, filesystem, network, and TLS surfaces were reviewed against polycpp APIs
 - security hints consumed: yes; package is security-sensitive because it handles credentials, crypto, network packets, and SQL escaping
 - security-sensitive package: yes
-- polycpp capability snapshot consumed: yes; `/data/repo/polycpp` HEAD `103496f2f50aad410dc63415a7f176182fb1ddd3` was rechecked on April 28, 2026 before closing the Unix/IPC and server TLS gaps.
+- polycpp capability snapshot consumed: yes; `/data/repo/polycpp` HEAD `40bd73669e8105fcb8641ad6671dfd07141e9eff` was rechecked on May 2, 2026 before closing the Unix/IPC, server TLS, and typed binlog stream gaps.
 - transport/listener capability hints consumed: yes; TCP, Unix/IPC path, cross-transport stream wrappers, and MySQL in-protocol TLS upgrade are mapped to current polycpp IO/TLS primitives.
 
 ### Node.js API usage
@@ -96,7 +96,7 @@ python3 /data/work/libgen/scripts/analyze-upstream-js.py /data/work/lib/mysql2 /
 - `tls`: mapped to `polycpp::io::TlsContext`, `polycpp::io::TlsStream`, and `polycpp::ssl::X509Cert` for MySQL SSLRequest upgrades.
 - `zlib`: mapped to `polycpp::zlib` for the MySQL compressed packet protocol.
 - `events`: mapped to typed `polycpp::events::EventEmitter` integration on connections, pools, and pool clusters.
-- `stream`: Node object-mode row streams map to `RowStream`, a pull-based `polycpp::stream::Readable<Row>` subclass; `query_stream_json()` exposes lazy newline-delimited JSON `polycpp::stream::Readable<Buffer>` chunks.
+- `stream`: Node object-mode row streams map to `RowStream`, a pull-based `polycpp::stream::Readable<Row>` subclass; `createBinlogStream` maps to `BinlogStream`, a pull-based `polycpp::stream::Readable<BinlogEvent>` subclass consumed with `polycpp::stream::event::Data`; `query_stream_json()` exposes lazy newline-delimited JSON `polycpp::stream::Readable<Buffer>` chunks.
 - `process`, `timers`: Node runtime command queue mechanics are adapted to synchronous typed execution; connect and command inactivity deadlines use `polycpp::io::Timer`; pool wait timeouts are represented with C++ chrono values.
 - `url`: mapped to `polycpp::url` for connection URI parsing.
 
@@ -105,7 +105,7 @@ python3 /data/work/libgen/scripts/analyze-upstream-js.py /data/work/lib/mysql2 /
 - callbacks: implemented as `std::function` overloads over the typed connection, pool, and cluster operations.
 - Promise APIs: implemented as `polycpp::Promise` wrappers that settle from the typed implementation.
 - EventEmitter APIs: implemented through typed `polycpp::events::EventEmitter` forwarding on connections, pools, and pool clusters.
-- streams: query rows use pull-based `RowStream` typed chunks; NDJSON output uses lazy `polycpp::stream::Readable<Buffer>` chunks over the same row stream.
+- streams: query rows use pull-based `RowStream` typed chunks; binlog events use pull-based `BinlogStream` typed chunks; NDJSON output uses lazy `polycpp::stream::Readable<Buffer>` chunks over the same row stream.
 - Buffer and binary data: mapped to `polycpp::Buffer` for packets, binary SQL values, result columns, and LOCAL INFILE chunks.
 - URL/timer/process/filesystem APIs: URI parsing uses `polycpp::url`; connect and command inactivity timeouts use `polycpp::io::Timer`; pool wait timeouts use C++ chrono; process APIs are not public; filesystem access is limited to explicit TLS file options and caller-provided LOCAL INFILE buffers.
 - crypto/compression/TLS/network/HTTP APIs: crypto uses `polycpp::crypto`; compression uses `polycpp::zlib`; TCP/Unix/TLS uses `polycpp::io` and `polycpp::ssl`; HTTP APIs are not relevant to this protocol driver.
