@@ -72,6 +72,10 @@ cmake --build build -j$(nproc)
 ctest --test-dir build --output-on-failure
 ```
 
+Additional hardening and e2e suites live under `tests/e2e/`. See
+`tests/e2e/README.md` for environment variables and reproducible Docker
+commands.
+
 Run the real database e2e test:
 
 ```bash
@@ -80,7 +84,7 @@ MYSQL2_TEST_PORT=3306 \
 MYSQL2_TEST_USER=root \
 MYSQL2_TEST_PASSWORD=secret \
 MYSQL2_TEST_DATABASE=test \
-ctest --test-dir build --output-on-failure
+ctest --test-dir build --output-on-failure -R mysql2_e2e_real_database
 ```
 
 Run the replication/binlog e2e path against a server started with binary logging and row format:
@@ -92,7 +96,7 @@ MYSQL2_TEST_PORT=3306 \
 MYSQL2_TEST_USER=root \
 MYSQL2_TEST_PASSWORD=secret \
 MYSQL2_TEST_DATABASE=test \
-build/test_smoke --gtest_filter=mysql2_replication.binlog_stream_against_real_database_when_configured
+ctest --test-dir build --output-on-failure -R mysql2_e2e_replication
 ```
 
 Run the TLS e2e path:
@@ -108,6 +112,12 @@ MYSQL2_TEST_SSL_REJECT_UNAUTHORIZED=1 \
 MYSQL2_TEST_SSL_VERIFY_IDENTITY=1 \
 MYSQL2_TEST_SSL_CA_FILE=/path/to/ca.pem \
 ctest --test-dir build --output-on-failure
+```
+
+Run loopback server protocol hardening, including ERR packet handling:
+
+```bash
+ctest --test-dir build --output-on-failure -R mysql2_e2e_server_protocol
 ```
 
 ## Usage

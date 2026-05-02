@@ -71,10 +71,20 @@ if(POLYCPP_MYSQL2_BUILD_TESTS)
     )
     FetchContent_MakeAvailable(googletest)
 
-    add_executable(test_smoke tests/test_smoke.cpp)
-    target_link_libraries(test_smoke PRIVATE polycpp_mysql2 GTest::gtest_main)
     include(GoogleTest)
-    gtest_discover_tests(test_smoke)
+
+    function(polycpp_mysql2_add_test target)
+        add_executable(${target} ${ARGN})
+        target_link_libraries(${target} PRIVATE polycpp_mysql2 GTest::gtest_main)
+        target_include_directories(${target} PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/tests)
+        gtest_discover_tests(${target})
+    endfunction()
+
+    polycpp_mysql2_add_test(test_smoke tests/test_smoke.cpp)
+    polycpp_mysql2_add_test(test_protocol_hardening tests/test_protocol_hardening.cpp)
+    polycpp_mysql2_add_test(test_e2e_server_protocol tests/e2e/test_server_protocol.cpp)
+    polycpp_mysql2_add_test(test_e2e_real_database tests/e2e/test_real_database.cpp)
+    polycpp_mysql2_add_test(test_e2e_replication tests/e2e/test_replication.cpp)
 endif()
 
 option(POLYCPP_MYSQL2_BUILD_EXAMPLES "Build examples" OFF)

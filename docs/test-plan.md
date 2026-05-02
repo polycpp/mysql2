@@ -8,37 +8,36 @@
 - Positional formatting for values and identifiers.
 - Named placeholder formatting, including missing value failure.
 - Row lookup by index and field name.
-- Auth token fixtures for mysql_native_password and caching_sha2_password should be added from upstream-compatible vectors.
-- Packet cursor fixtures for length-coded integers and malformed packet failures should be added before expanding protocol scope.
-- Prepared-statement parameter encoding fixtures should cover NULL, signed/unsigned integers, double, string, and Buffer.
-- Binary row parser fixtures should cover numeric, decimal, date/time/datetime, binary string/blob, JSON text, and NULL bitmap behavior.
+- Authentication coverage includes real MySQL 8 `caching_sha2_password`, native-password loopback auth, auth rejection, and TLS-gated `mysql_clear_password` through `tests/e2e/test_server_protocol.cpp`.
+- Packet hardening coverage includes malformed binlog packet failures, truncated row events, unsupported row column types, invalid temporal precision, SQL formatting fixture edges, and missing named placeholder failure in `tests/test_protocol_hardening.cpp`.
+- Prepared-statement parameter encoding coverage includes real DB execute paths, server-side statement execute event parsing, NULL, signed integers, string, Buffer/binary values, and query attribute execution.
+- Binary/text row parser coverage includes numeric, decimal, date/time/datetime, binary string/blob, JSON text, empty binary values, NULL values, and server-side binary result rows.
 - SSL profile helper coverage verifies the generated AWS RDS CA bundle is loadable as PEM strings.
 - Parser-cache compatibility hooks are covered as no-op static-parser controls.
 - Typed `RowStream` coverage verifies row iteration, field metadata exposure, active-stream connection reservation, and cleanup after abandoned streams. NDJSON `Readable<Buffer>` coverage verifies lazy byte serialization over the row stream.
 - Typed `BinlogStream` coverage verifies `polycpp::stream::event::Data` delivery for `BinlogEvent` chunks. Replication e2e validates active-stream command rejection, CRC32 checksum negotiation, typed temporal row values, EOF transport close with reconnect-on-next-command behavior, `max_events` transport close, and destroy-before-EOF transport close against a binary-log-enabled server.
-- Binlog packet parser coverage includes QueryEvent fixtures, GTID set parsing, stateful TableMap plus WriteRows decoding, Rotate, FormatDescription, Xid, GTID packet, PreviousGTIDs packet, update/delete rows, unknown-event fixtures, TIME2/DATETIME2/TIMESTAMP2 row values, and negative TIME2 fractional encoding. Additional future fixtures should focus on malformed packets and less-common row column families.
+- Binlog packet parser coverage includes QueryEvent fixtures, GTID set parsing, stateful TableMap plus WriteRows decoding, Rotate, FormatDescription, Xid, GTID packet, PreviousGTIDs packet, update/delete rows, unknown-event fixtures, TIME2/DATETIME2/TIMESTAMP2 row values, negative TIME2 fractional encoding, malformed packet failures, unsupported column fail-closed behavior, and less-common row column families including integer widths, float/double, YEAR, DATE, TIME, DATETIME, TIMESTAMP, NEWDECIMAL, BIT, BLOB, JSON, ENUM, and SET.
 - Adapted server mode loopback coverage creates a `Server`, accepts a `Connection` client over TCP and Unix socket paths, validates handshake auth/connect attributes, dispatches query, ping, statement prepare, and statement execute events, writes text/OK responses, writes a prepared-statement OK packet and binary result rows for a real client `prepare`/`execute`, observes quit, and verifies auth callback rejection returns a MySQL ERR packet.
 
 ## Integration Tests
 
 - Environment-driven MariaDB/MySQL test using `MYSQL2_TEST_HOST`, `MYSQL2_TEST_PORT`, `MYSQL2_TEST_USER`, `MYSQL2_TEST_PASSWORD`, and `MYSQL2_TEST_DATABASE`.
 - Current e2e coverage connects to MariaDB/MySQL, runs ping, checks typed trace events, selects scalar values, exercises `QueryOptions`/`ExecuteOptions` with command timeouts, sends query attributes when supported, preserves empty binary values as Buffer, creates a temporary table, inserts rows, selects them back, uses prepared statements, prepared-statement query attributes, server-side cursor fetch, and cached execute, tests transactions, resets the connection, changes user state, tests multi-result queries, exercises callback/Promise wrappers, consumes lazy JSON line byte streams and typed row object streams, verifies compression when enabled, optionally uploads LOCAL INFILE data when the server allows it, exercises the RAII pool, exercises a single-node pool cluster, and verifies that command inactivity timeout closes the connection. Local loopback coverage validates the adapted server protocol mode, active-stream command rejection, and abandoned-stream cleanup without requiring an external database.
-- TLS e2e is controlled by `MYSQL2_TEST_SSL`, `MYSQL2_TEST_SSL_REJECT_UNAUTHORIZED`, `MYSQL2_TEST_SSL_VERIFY_IDENTITY`, and `MYSQL2_TEST_SSL_CA_FILE`.
+- TLS e2e is controlled by `MYSQL2_TEST_SSL`, `MYSQL2_TEST_SSL_REJECT_UNAUTHORIZED`, `MYSQL2_TEST_SSL_VERIFY_IDENTITY`, and `MYSQL2_TEST_SSL_CA_FILE`. Loopback server TLS clear-password auth is controlled by `MYSQL2_TEST_SERVER_TLS_CERT_FILE` and `MYSQL2_TEST_SERVER_TLS_KEY_FILE`.
 - MySQL 8 coverage runs against a Dockerized MySQL 8.4 server and validates the default `caching_sha2_password` path.
 - MySQL 8 coverage validates `CLIENT_QUERY_ATTRIBUTES` for both `COM_QUERY` and `COM_STMT_EXECUTE`.
-- Add a dedicated MySQL 8 TLS clear password auth path test if a server/user is configured to require it.
-- Add server ERR packet coverage with invalid SQL and access denied scenarios.
-- Add charset coverage for utf8mb4, latin1, binary, and representative non-UTF encodings through `iconv-lite`.
-- Add pool contention and wait-timeout coverage.
-- Add multi-result stored procedure coverage.
+- Dedicated TLS clear-password auth coverage is in `tests/e2e/test_server_protocol.cpp`; it verifies cleartext is rejected unless `enable_cleartext_plugin` is set and the transport is TLS.
+- Server ERR packet coverage is in `tests/e2e/test_server_protocol.cpp`; auth rejection and query ERR packets verify MySQL error code and SQL state propagation.
+- Charset coverage is in `tests/e2e/test_real_database.cpp`; it verifies utf8mb4, latin1, binary Buffer preservation, and Shift-JIS/iconv decoding when the server advertises `sjis`.
+- Pool contention and wait-timeout recovery coverage is in `tests/e2e/test_real_database.cpp`.
+- Stored-procedure multi-result coverage is in `tests/e2e/test_real_database.cpp`.
 - Environment-gated replication e2e coverage runs against a server configured with binary logging, row format, and a replication-capable user.
 
 ## Compatibility Tests Adapted From Upstream
 
-- Adapt upstream SQL escaping and formatting fixtures.
-- Adapt upstream auth plugin unit tests.
-- Adapt upstream packet parser tests for length-coded numbers, OK packets, ERR packets, column definitions, text rows, and binary rows.
-- Adapt upstream integration tests for simple query, insert/update, transactions, errors, charset behavior, prepared statements, TLS, compression, LOCAL INFILE, callbacks, Promise wrappers, streams, pooling, and pool clusters.
+- Upstream-style SQL escaping and formatting edge fixtures are covered in `tests/test_protocol_hardening.cpp` and `tests/test_smoke.cpp`.
+- Upstream-style auth, ERR packet, column, text row, binary row, prepared statement, stream, pooling, and pool-cluster behavior is covered by a mix of loopback server tests and environment-gated real database tests.
+- Additional upstream fixture mining remains useful for breadth, but the current v0 release-blocking surfaces are represented by repo-owned tests.
 
 ## Security and Fail-Closed Tests
 
@@ -174,3 +173,56 @@ Result: local `ctest` passed `18/18` with 3 expected environment-gated skips
 warnings as errors; `git diff --check` was clean; the live MySQL 8.4
 replication e2e passed in 203 ms; the live MySQL 8.4 database e2e passed in
 47 ms.
+
+Additional validation on May 2, 2026 after adding dedicated test-hardening
+executables for malformed packets, less-common binlog row column families,
+TLS-gated clear-password auth, server ERR packets, charset matrix coverage,
+pool contention/wait-timeout, stored-procedure multi-results, and
+upstream-style SQL fixture edges:
+
+```bash
+cmake --build build -j2
+ctest --test-dir build --output-on-failure
+python3 docs/build.py
+git diff --check
+
+docker run -d --name polycpp-mysql2-e2e-tests \
+  -e MYSQL_ROOT_PASSWORD=polycpp \
+  -e MYSQL_DATABASE=polycpp_test \
+  mysql:8.4 \
+  --server-id=1 \
+  --log-bin=mysql-bin \
+  --binlog-format=ROW \
+  --local-infile=1 \
+  --mysqlx=0
+
+docker run --rm --network container:polycpp-mysql2-e2e-tests \
+  -v /data/work/lib/mysql2:/work \
+  -w /work \
+  ubuntu:22.04 \
+  bash -lc 'apt-get update >/dev/null && apt-get install -y libicu70 libssl3 >/dev/null && MYSQL2_TEST_HOST=127.0.0.1 MYSQL2_TEST_PORT=3306 MYSQL2_TEST_USER=root MYSQL2_TEST_PASSWORD=polycpp MYSQL2_TEST_DATABASE=polycpp_test MYSQL2_TEST_TRACE=1 build/test_e2e_real_database'
+
+docker run --rm --network container:polycpp-mysql2-e2e-tests \
+  -v /data/work/lib/mysql2:/work \
+  -w /work \
+  ubuntu:22.04 \
+  bash -lc 'apt-get update >/dev/null && apt-get install -y libicu70 libssl3 >/dev/null && MYSQL2_TEST_REPLICATION=1 MYSQL2_TEST_HOST=127.0.0.1 MYSQL2_TEST_PORT=3306 MYSQL2_TEST_USER=root MYSQL2_TEST_PASSWORD=polycpp MYSQL2_TEST_DATABASE=polycpp_test MYSQL2_TEST_TRACE=1 build/test_e2e_replication'
+
+mkdir -p build/e2e-tls
+openssl req -x509 -newkey rsa:2048 -nodes -days 1 \
+  -keyout build/e2e-tls/server-key.pem \
+  -out build/e2e-tls/server-cert.pem \
+  -subj '/CN=127.0.0.1'
+
+MYSQL2_TEST_SERVER_TLS_CERT_FILE=$PWD/build/e2e-tls/server-cert.pem \
+MYSQL2_TEST_SERVER_TLS_KEY_FILE=$PWD/build/e2e-tls/server-key.pem \
+build/test_e2e_server_protocol --gtest_filter=mysql2_e2e_server_protocol.tls_clear_password_auth_sends_cleartext_only_when_enabled
+
+docker rm -f polycpp-mysql2-e2e-tests
+```
+
+Result: local `ctest` passed `29/29` with 8 expected environment-gated skips;
+docs built successfully with warnings as errors; `git diff --check` was clean;
+the live MySQL 8.4 real database e2e passed 3 tests in 190 ms; the live MySQL
+8.4 replication e2e passed in 144 ms; the TLS clear-password loopback e2e
+passed in 56 ms.
