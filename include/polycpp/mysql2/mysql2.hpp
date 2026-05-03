@@ -23,8 +23,10 @@
 namespace polycpp::mysql2 {
 
 using Buffer = polycpp::buffer::Buffer;
+/// Caller-provided memory source for explicit-policy LOCAL INFILE uploads.
 using LocalInfileHandler = std::function<std::vector<Buffer>(const std::string& path)>;
 
+/// MySQL-aware error that may include a server error code and SQL state.
 class Error : public polycpp::Error {
 public:
     explicit Error(const std::string& message);
@@ -90,6 +92,7 @@ struct ConnectionOptions {
     SslOptions ssl;
 };
 
+/// Column metadata returned by text, binary, server-mode, and binlog APIs.
 struct Field {
     std::string catalog;
     std::string schema;
@@ -108,10 +111,12 @@ struct Field {
     bool is_binary() const noexcept;
 };
 
+/// Explicit SQL fragment marker used by formatting helpers to bypass escaping.
 struct RawSql {
     std::string sql;
 };
 
+/// DATETIME2 value decoded from a binary log row event.
 struct BinlogDateTime {
     uint16_t year = 0;
     uint8_t month = 0;
@@ -124,6 +129,7 @@ struct BinlogDateTime {
     std::string to_string() const;
 };
 
+/// TIME2 value decoded from a binary log row event.
 struct BinlogTime {
     bool negative = false;
     uint32_t hours = 0;
@@ -134,6 +140,7 @@ struct BinlogTime {
     std::string to_string() const;
 };
 
+/// TIMESTAMP2 value decoded from a binary log row event.
 struct BinlogTimestamp {
     uint64_t seconds_since_epoch = 0;
     uint32_t microsecond = 0;
@@ -141,6 +148,7 @@ struct BinlogTimestamp {
     std::string to_string() const;
 };
 
+/// Public scalar value variant used for query parameters, rows, and binlog rows.
 using Value = std::variant<std::monostate,
                            bool,
                            int64_t,
@@ -152,8 +160,10 @@ using Value = std::variant<std::monostate,
                            BinlogDateTime,
                            BinlogTime,
                            BinlogTimestamp>;
+/// Per-command query attributes sent when the server advertises support.
 using QueryAttributes = std::unordered_map<std::string, Value>;
 
+/// Server-side prepared-statement cursor mode.
 enum class CursorType : uint8_t {
     None = 0,
     ReadOnly = 1,
@@ -161,6 +171,7 @@ enum class CursorType : uint8_t {
     Scrollable = 3
 };
 
+/// Materialized query row with typed values and field-name lookup.
 struct Row {
     std::vector<Value> values;
     std::unordered_map<std::string, std::size_t> index_by_name;
@@ -196,6 +207,7 @@ struct RawRowView {
     const RawValueView& at(const std::string& name) const;
 };
 
+/// Parsed OK packet data for successful non-row MySQL commands.
 struct OkPacket {
     uint64_t affected_rows = 0;
     uint64_t insert_id = 0;
@@ -205,6 +217,7 @@ struct OkPacket {
     uint64_t changed_rows = 0;
 };
 
+/// Materialized result set or OK response returned by query/execute APIs.
 struct QueryResult {
     OkPacket ok;
     std::vector<Field> fields;
@@ -215,11 +228,13 @@ struct QueryResult {
     JsonValue to_json() const;
 };
 
+/// Generic command options for prepare/fetch and similar non-SQL wrappers.
 struct CommandOptions {
     /// Command inactivity timeout in milliseconds. Zero disables the deadline.
     uint32_t timeout_ms = 0;
 };
 
+/// Text-protocol query request with SQL, attributes, and timeout.
 struct QueryOptions {
     std::string sql;
     QueryAttributes attributes;
@@ -227,6 +242,7 @@ struct QueryOptions {
     uint32_t timeout_ms = 0;
 };
 
+/// Prepared-statement execution request with SQL, values, attributes, and timeout.
 struct ExecuteOptions {
     std::string sql;
     std::vector<Value> values;
@@ -235,6 +251,7 @@ struct ExecuteOptions {
     uint32_t timeout_ms = 0;
 };
 
+/// Server-side prepared statement id plus parameter and result metadata.
 struct PreparedStatement {
     uint32_t id = 0;
     std::string query;
@@ -242,6 +259,7 @@ struct PreparedStatement {
     std::vector<Field> columns;
 };
 
+/// Active server-side prepared-statement cursor used with fetch.
 struct StatementCursor {
     PreparedStatement statement;
     std::vector<Field> fields;
@@ -250,6 +268,7 @@ struct StatementCursor {
     bool open() const noexcept;
 };
 
+/// Connection pool sizing, waiting, idle, and release-reset policy.
 struct PoolOptions {
     ConnectionOptions connection;
     std::size_t connection_limit = 10;
@@ -264,12 +283,14 @@ struct PoolOptions {
     bool reset_on_release = false;
 };
 
+/// Pool-cluster node selection strategy.
 enum class PoolSelector {
     RoundRobin,
     Random,
     Order
 };
 
+/// Pool-cluster retry, offline, restore, and default selector policy.
 struct PoolClusterOptions {
     bool can_retry = true;
     /// Error count before a node is removed or temporarily marked offline.
@@ -279,6 +300,7 @@ struct PoolClusterOptions {
     PoolSelector default_selector = PoolSelector::RoundRobin;
 };
 
+/// Connection metadata emitted with the connect event.
 struct ConnectionInfo {
     uint32_t connection_id = 0;
     std::string server_version;
@@ -286,6 +308,7 @@ struct ConnectionInfo {
     bool encrypted = false;
 };
 
+/// Typed trace payload emitted around connect/query/execute phases.
 struct TraceEvent {
     std::string operation;
     std::string phase;
@@ -298,6 +321,7 @@ struct TraceEvent {
     std::string error;
 };
 
+/// COM_REGISTER_SLAVE identity payload for classic replication setup.
 struct RegisterSlaveOptions {
     uint32_t server_id = 0;
     std::string slave_hostname;
@@ -308,6 +332,7 @@ struct RegisterSlaveOptions {
     uint32_t master_id = 0;
 };
 
+/// Options for COM_BINLOG_DUMP and COM_BINLOG_DUMP_GTID reads.
 struct BinlogDumpOptions {
     uint64_t binlog_position = 4;
     uint16_t flags = 0x01;
@@ -320,6 +345,7 @@ struct BinlogDumpOptions {
     std::string gtid_set;
 };
 
+/// Common binary log event header fields.
 struct BinlogEventHeader {
     uint32_t timestamp = 0;
     uint8_t event_type = 0;
@@ -329,6 +355,7 @@ struct BinlogEventHeader {
     uint16_t flags = 0;
 };
 
+/// Decoded before/after row values and raw row bytes from a row event.
 struct BinlogRowChange {
     std::vector<Value> before;
     std::vector<Value> after;
@@ -336,16 +363,19 @@ struct BinlogRowChange {
     Buffer raw_after;
 };
 
+/// Half-open GTID interval for one source UUID.
 struct BinlogGtidInterval {
     uint64_t start = 0;
     uint64_t end = 0;
 };
 
+/// GTID source UUID and its decoded intervals.
 struct BinlogGtidSource {
     std::string sid;
     std::vector<BinlogGtidInterval> intervals;
 };
 
+/// Parsed binary log event with typed fields for supported event families.
 struct BinlogEvent {
     std::string name;
     BinlogEventHeader header;
@@ -379,6 +409,7 @@ struct BinlogEvent {
     std::vector<BinlogGtidSource> previous_gtids;
 };
 
+/// Stateful table-map-aware parser for saved or custom binlog packet streams.
 class BinlogParser {
 public:
     BinlogParser();
@@ -398,6 +429,7 @@ private:
     std::unique_ptr<Impl> impl_;
 };
 
+/// Pull-based typed row stream returned by query_stream.
 class RowStream : public stream::Readable<Row> {
 public:
     using Reader = std::function<void(RowStream&, std::size_t)>;
@@ -422,6 +454,7 @@ private:
     Cleanup cleanup_;
 };
 
+/// Pull-based typed replication stream returned by create_binlog_stream.
 class BinlogStream : public stream::Readable<BinlogEvent> {
 public:
     using Reader = std::function<void(BinlogStream&, std::size_t)>;
@@ -448,6 +481,7 @@ private:
 
 class ServerConnection;
 
+/// Parsed client handshake/authentication metadata for server-mode callbacks.
 struct ServerAuthInfo {
     std::string user;
     std::string database;
@@ -460,6 +494,7 @@ struct ServerAuthInfo {
     std::unordered_map<std::string, std::string> connect_attributes;
 };
 
+/// Decoded COM_STMT_EXECUTE payload for server-mode prepared statement handlers.
 struct ServerStatementExecuteInfo {
     uint32_t statement_id = 0;
     uint8_t flags = 0;
@@ -469,8 +504,10 @@ struct ServerStatementExecuteInfo {
     Buffer raw_payload;
 };
 
+/// Server-mode auth gate; return an Error to reject the client.
 using ServerAuthCallback = std::function<std::optional<Error>(const ServerAuthInfo&)>;
 
+/// Server-mode greeting, capability, charset, status, and auth policy.
 struct ServerHandshakeOptions {
     uint8_t protocol_version = 10;
     std::string server_version = "polycpp-mysql2";
@@ -508,14 +545,21 @@ struct ServerOptions {
     ServerTlsOptions tls;
 };
 
+/// Callback used by APIs that complete without a value.
 using VoidCallback = std::function<void(std::exception_ptr)>;
+/// Callback used by APIs that return an OK packet.
 using OkCallback = std::function<void(std::exception_ptr, OkPacket)>;
+/// Callback used by APIs that return one query result.
 using QueryCallback = std::function<void(std::exception_ptr, QueryResult)>;
+/// Callback used by APIs that return multiple query results.
 using QueryAllCallback = std::function<void(std::exception_ptr, std::vector<QueryResult>)>;
 /// Callback used by `Connection::query_each_raw` for one-pass raw row scans.
 using RawRowCallback = std::function<void(const RawRowView&)>;
+/// Callback used by asynchronous prepare wrappers.
 using PrepareCallback = std::function<void(std::exception_ptr, PreparedStatement)>;
+/// Callback used by bounded binlog dump wrappers.
 using BinlogEventsCallback = std::function<void(std::exception_ptr, std::vector<BinlogEvent>)>;
+/// Per-event callback used by callback-controlled binlog reads.
 using BinlogEventCallback = std::function<bool(const BinlogEvent&)>;
 
 RawSql raw(std::string sql);
@@ -543,6 +587,7 @@ void clear_parser_cache() noexcept;
 BinlogEvent parse_binlog_event_packet(const Buffer& payload);
 std::vector<BinlogGtidSource> parse_gtid_set(const std::string& gtid_set);
 
+/// One MySQL protocol session with query, prepared statement, stream, pool, and replication APIs.
 class Connection : public events::EventEmitterForwarder {
 public:
     Connection();
@@ -690,6 +735,7 @@ private:
     std::shared_ptr<Impl> impl_;
 };
 
+/// Accepted client session in adapted MySQL server mode.
 class ServerConnection : public events::EventEmitterForwarder {
 public:
     ~ServerConnection();
@@ -733,6 +779,7 @@ private:
 
 class ServerImpl;
 
+/// Adapted MySQL protocol listener for fixtures, tests, and proxy surfaces.
 class Server : public events::EventEmitterForwarder {
 public:
     explicit Server(ServerOptions options = {});
@@ -761,6 +808,7 @@ private:
 
 class PoolImpl;
 
+/// Move-only RAII checkout handle that returns a connection to its pool.
 class PoolConnection {
 public:
     ~PoolConnection();
@@ -788,6 +836,7 @@ private:
     std::shared_ptr<Connection> connection_;
 };
 
+/// Synchronous RAII pool of reusable MySQL connections.
 class Pool : public events::EventEmitterForwarder {
 public:
     explicit Pool(PoolOptions options);
@@ -826,6 +875,7 @@ private:
 
 class PoolClusterImpl;
 
+/// Pattern-bound view over a PoolCluster with a fixed selector.
 class PoolNamespace {
 public:
     PoolNamespace();
@@ -844,6 +894,7 @@ private:
     PoolSelector selector_ = PoolSelector::RoundRobin;
 };
 
+/// Named pool cluster with wildcard node selection and retry/offline policy.
 class PoolCluster : public events::EventEmitterForwarder {
 public:
     explicit PoolCluster(PoolClusterOptions options = {});
