@@ -31,6 +31,7 @@
 - Charset coverage is in `tests/e2e/test_real_database.cpp`; it verifies utf8mb4, latin1, binary Buffer preservation, and Shift-JIS/iconv decoding when the server advertises `sjis`.
 - Pool contention and wait-timeout recovery coverage is in `tests/e2e/test_real_database.cpp`.
 - Stored-procedure multi-result coverage is in `tests/e2e/test_real_database.cpp`.
+- Extended real database operations coverage is in `tests/e2e/test_real_database_operations.cpp`; it verifies prepared statement type round trips, statement-cache reuse, transaction/savepoint rollback, post-error connection reuse, compressed protocol negotiation, LOCAL INFILE fail-closed and explicit memory handler paths, and pool `reset_on_release` session cleanup.
 - Environment-gated replication e2e coverage runs against a server configured with binary logging, row format, and a replication-capable user.
 
 ## Compatibility Tests Adapted From Upstream
@@ -65,6 +66,7 @@
 - Stream adaptation, command timeout behavior, compression, LOCAL INFILE policy, callback/Promise wrappers, EventEmitter/trace behavior, adapted TCP/Unix server mode, bounded/callback/typed-stream binlog behavior, parser-cache compatibility hooks, and SSL profile data remain documented with exact C++ semantics.
 - Third-party license notices are complete.
 - Documentation builds with `python3 docs/build.py`.
+- Optional benchmark tooling builds with `POLYCPP_MYSQL2_BUILD_BENCHMARKS=ON`. Native MySQL C API comparison is explicitly opt-in through `POLYCPP_MYSQL2_BENCHMARK_NATIVE_C_API=ON` and is not linked into the production companion library.
 - GitHub repo remains private until production-grade quality and public docs are ready.
 
 ## Current validation
@@ -226,3 +228,50 @@ docs built successfully with warnings as errors; `git diff --check` was clean;
 the live MySQL 8.4 real database e2e passed 3 tests in 190 ms; the live MySQL
 8.4 replication e2e passed in 144 ms; the TLS clear-password loopback e2e
 passed in 56 ms.
+
+Additional validation on May 3, 2026 after adding the extended real database
+operations e2e suite and optional benchmark tooling:
+
+```bash
+cmake -B build \
+  -DPOLYCPP_MYSQL2_BUILD_TESTS=ON \
+  -DPOLYCPP_MYSQL2_BUILD_BENCHMARKS=ON \
+  -DPOLYCPP_MYSQL2_BENCHMARK_NATIVE_C_API=ON
+cmake --build build -j2
+ctest --test-dir build --output-on-failure
+
+docker run -d --name polycpp-mysql2-e2e-tests \
+  -e MYSQL_ROOT_PASSWORD=polycpp \
+  -e MYSQL_DATABASE=polycpp_test \
+  mysql:8.4 \
+  --server-id=1 \
+  --log-bin=mysql-bin \
+  --binlog-format=ROW \
+  --local-infile=1 \
+  --mysqlx=0
+
+docker run --rm --network container:polycpp-mysql2-e2e-tests \
+  -v /data/work/lib/mysql2:/work \
+  -w /work \
+  ubuntu:22.04 \
+  bash -lc 'apt-get update >/dev/null && apt-get install -y libicu70 libssl3 >/dev/null && MYSQL2_TEST_HOST=127.0.0.1 MYSQL2_TEST_PORT=3306 MYSQL2_TEST_USER=root MYSQL2_TEST_PASSWORD=polycpp MYSQL2_TEST_DATABASE=polycpp_test MYSQL2_TEST_TRACE=1 build/test_e2e_real_database_operations'
+
+docker run --rm --network container:polycpp-mysql2-e2e-tests \
+  -v /data/work/lib/mysql2:/work \
+  -w /work \
+  ubuntu:22.04 \
+  bash -lc 'apt-get update >/dev/null && apt-get install -y libicu70 libssl3 >/dev/null && MYSQL2_TEST_HOST=127.0.0.1 MYSQL2_TEST_PORT=3306 MYSQL2_TEST_USER=root MYSQL2_TEST_PASSWORD=polycpp MYSQL2_TEST_DATABASE=polycpp_test MYSQL2_TEST_TRACE=1 build/test_e2e_real_database && MYSQL2_TEST_REPLICATION=1 MYSQL2_TEST_HOST=127.0.0.1 MYSQL2_TEST_PORT=3306 MYSQL2_TEST_USER=root MYSQL2_TEST_PASSWORD=polycpp MYSQL2_TEST_DATABASE=polycpp_test MYSQL2_TEST_TRACE=1 build/test_e2e_replication'
+
+docker run --rm --network container:polycpp-mysql2-e2e-tests \
+  -v /data/work/lib/mysql2:/work \
+  -w /work \
+  ubuntu:22.04 \
+  bash -lc 'apt-get update >/dev/null && apt-get install -y libicu70 libssl3 libmariadb3 >/dev/null && MYSQL2_TEST_HOST=127.0.0.1 MYSQL2_TEST_PORT=3306 MYSQL2_TEST_USER=root MYSQL2_TEST_PASSWORD=polycpp MYSQL2_TEST_DATABASE=polycpp_test MYSQL2_BENCHMARK_ITERATIONS=20 MYSQL2_BENCHMARK_ROWS=20 build/bench_mysql2'
+```
+
+Result: local `ctest` passed `33/33` with 12 expected environment-gated skips;
+the extended live MySQL 8.4 operations e2e passed 4 tests in 74 ms; the existing
+live MySQL 8.4 real database e2e passed 3 tests in 276 ms; the live MySQL 8.4
+replication e2e passed in 198 ms; the opt-in native C API benchmark executable
+built and produced CSV comparison output for `text_select_1`, `prepared_add`,
+and `fetch_rows`.

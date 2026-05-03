@@ -120,6 +120,17 @@ Run loopback server protocol hardening, including ERR packet handling:
 ctest --test-dir build --output-on-failure -R mysql2_e2e_server_protocol
 ```
 
+Optional benchmarks are available under `benchmarks/`. The native MySQL C API
+comparison is opt-in and is linked only into the benchmark executable, never
+into `polycpp_mysql2`.
+
+```bash
+cmake -B build -DCMAKE_BUILD_TYPE=Release \
+  -DPOLYCPP_MYSQL2_BUILD_BENCHMARKS=ON \
+  -DPOLYCPP_MYSQL2_BENCHMARK_NATIVE_C_API=OFF
+cmake --build build -j$(nproc) --target bench_mysql2
+```
+
 ## Usage
 
 ```cpp

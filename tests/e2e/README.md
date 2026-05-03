@@ -52,6 +52,18 @@ docker run --rm --network container:polycpp-mysql2-e2e-tests \
 ```
 
 The real database e2e suite covers charset/binary decoding, stored-procedure multi-results, and pool contention/wait-timeout recovery.
+The extended operations suite covers prepared statement type matrices,
+statement-cache reuse, transaction/savepoint recovery, SQL error recovery,
+compressed protocol, LOCAL INFILE policy and memory uploads, and pool
+`reset_on_release` session cleanup:
+
+```bash
+docker run --rm --network container:polycpp-mysql2-e2e-tests \
+  -v /data/work/lib/mysql2:/work \
+  -w /work \
+  ubuntu:22.04 \
+  bash -lc 'apt-get update >/dev/null && apt-get install -y libicu70 libssl3 >/dev/null && MYSQL2_TEST_HOST=127.0.0.1 MYSQL2_TEST_PORT=3306 MYSQL2_TEST_USER=root MYSQL2_TEST_PASSWORD=polycpp MYSQL2_TEST_DATABASE=polycpp_test MYSQL2_TEST_TRACE=1 build/test_e2e_real_database_operations'
+```
 
 ## Replication
 
