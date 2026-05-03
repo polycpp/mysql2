@@ -37,6 +37,7 @@ private:
     std::string sql_state_;
 };
 
+/// Client-side TLS options for the MySQL SSLRequest upgrade.
 struct SslOptions {
     bool enabled = false;
     bool reject_unauthorized = true;
@@ -52,6 +53,11 @@ struct SslOptions {
     std::string profile;
 };
 
+/// Client connection configuration.
+///
+/// `socket_path` selects Unix socket transport and bypasses TCP host/port.
+/// `local_infile_handler` is intentionally required for LOCAL INFILE uploads;
+/// the driver never opens a server-requested path implicitly.
 struct ConnectionOptions {
     std::string host = "127.0.0.1";
     uint16_t port = 3306;
@@ -59,19 +65,26 @@ struct ConnectionOptions {
     std::string user;
     std::string password;
     std::string database;
+    /// Initial TCP or Unix socket connect timeout. Zero disables the deadline.
     uint32_t connect_timeout_ms = 10000;
     bool enable_keep_alive = true;
+    /// Enables multi-statement SQL text. Prefer false unless the caller needs it.
     bool multiple_statements = false;
     bool support_big_numbers = true;
+    /// Return BIGINT/LONGLONG values as strings when exact text is required.
     bool big_number_strings = false;
+    /// Parse DECIMAL as double. Leave false when decimal precision matters.
     bool decimal_numbers = false;
     std::string charset = "utf8mb4";
     uint16_t charset_number = 224;  // UTF8MB4_UNICODE_CI, matching mysql2 default.
     std::string server_public_key_pem;
+    /// Allows mysql_clear_password only when TLS or socket_path protects it.
     bool enable_cleartext_plugin = false;
+    /// Requests MySQL compressed packet protocol during handshake.
     bool compress = false;
     std::size_t max_prepared_statements = 16000;
     std::unordered_map<std::string, std::string> connect_attributes;
+    // Memory-backed LOCAL INFILE upload hook. Returning empty chunks is allowed.
     std::function<std::vector<Buffer>(const std::string& path)> local_infile_handler;
     SslOptions ssl;
 };
@@ -202,12 +215,14 @@ struct QueryResult {
 };
 
 struct CommandOptions {
+    /// Command inactivity timeout in milliseconds. Zero disables the deadline.
     uint32_t timeout_ms = 0;
 };
 
 struct QueryOptions {
     std::string sql;
     QueryAttributes attributes;
+    /// Query inactivity timeout in milliseconds. On expiry the transport closes.
     uint32_t timeout_ms = 0;
 };
 
@@ -215,6 +230,7 @@ struct ExecuteOptions {
     std::string sql;
     std::vector<Value> values;
     QueryAttributes attributes;
+    /// Execute inactivity timeout in milliseconds. On expiry the transport closes.
     uint32_t timeout_ms = 0;
 };
 
@@ -237,10 +253,13 @@ struct PoolOptions {
     ConnectionOptions connection;
     std::size_t connection_limit = 10;
     std::size_t max_idle = 10;
+    /// Maximum number of waiting callers. Zero means unbounded.
     std::size_t queue_limit = 0;
+    /// Checkout wait timeout in milliseconds. Zero waits without a deadline.
     uint32_t wait_timeout_ms = 10000;
     uint32_t idle_timeout_ms = 60000;
     bool wait_for_connections = true;
+    /// Send COM_RESET_CONNECTION before returning a connection to idle storage.
     bool reset_on_release = false;
 };
 
@@ -252,7 +271,9 @@ enum class PoolSelector {
 
 struct PoolClusterOptions {
     bool can_retry = true;
+    /// Error count before a node is removed or temporarily marked offline.
     std::size_t remove_node_error_count = 5;
+    /// Offline duration in milliseconds. Zero removes nodes instead of restoring.
     uint32_t restore_node_timeout_ms = 0;
     PoolSelector default_selector = PoolSelector::RoundRobin;
 };
@@ -289,8 +310,10 @@ struct RegisterSlaveOptions {
 struct BinlogDumpOptions {
     uint64_t binlog_position = 4;
     uint16_t flags = 0x01;
+    /// Replication client id. Use a value unique for the connected server.
     uint32_t server_id = 0;
     std::string filename;
+    /// Maximum events for bounded reads. Zero means continuous stream/callback.
     std::size_t max_events = 1024;
     bool use_gtid = false;
     std::string gtid_set;
@@ -455,9 +478,11 @@ struct ServerHandshakeOptions {
     uint8_t character_set = 224;
     uint16_t status_flags = 2;
     std::string auth_plugin_name = "mysql_native_password";
+    /// Optional auth gate. Return Error to send ERR and close the client.
     ServerAuthCallback auth_callback;
 };
 
+/// Server-side TLS material for MySQL in-protocol TLS upgrade after SSLRequest.
 struct ServerTlsOptions {
     bool enabled = false;
     std::string cert_pem;
@@ -467,11 +492,16 @@ struct ServerTlsOptions {
     std::string key_passphrase;
 };
 
+/// Adapted MySQL protocol server options.
+///
+/// Server mode is a protocol/test/proxy surface. It dispatches typed command
+/// events and response writers; it does not include a SQL execution engine.
 struct ServerOptions {
     std::string host = "127.0.0.1";
     uint16_t port = 0;
     std::string socket_path;
     int backlog = 128;
+    /// Automatically run the server handshake when a client is accepted.
     bool auto_handshake = true;
     ServerHandshakeOptions handshake;
     ServerTlsOptions tls;

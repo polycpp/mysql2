@@ -65,6 +65,24 @@ Known divergences:
 - A local `polycpp` checkout or network access for FetchContent
 - Optional: MariaDB/MySQL server for e2e tests
 
+## Documentation
+
+The Sphinx documentation covers installation, query/prepared flows, raw scans,
+pooling and pool clusters, server protocol mode, binlog/replication reads,
+TLS, connection configuration, callbacks/promises/events/streams, testing, and
+benchmarking.
+
+```bash
+python3 docs/build.py
+```
+
+Important audit notes remain in Markdown:
+
+- `docs/api-mapping.md`
+- `docs/divergences.md`
+- `docs/test-plan.md`
+- `docs/performance-analysis.md`
+
 ## Build
 
 ```bash

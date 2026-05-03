@@ -30,12 +30,26 @@ Core types
 ``PoolOptions``, ``Pool``, ``PoolConnection``
     Synchronous RAII connection pooling.
 
+``PoolClusterOptions``, ``PoolCluster``, ``PoolNamespace``
+    Named pool cluster with wildcard selection, retry/offline/remove policy,
+    and typed cluster events.
+
 ``ServerOptions``, ``ServerHandshakeOptions``, ``ServerAuthInfo``
     Adapted server protocol configuration and parsed client handshake data.
+
+``ServerTlsOptions``
+    Server-side certificate/key material for MySQL in-protocol TLS upgrade.
 
 ``Server``, ``ServerConnection``
     TCP server listener and per-client protocol connection with typed command
     events and OK/ERR/text-result writers.
+
+``BinlogDumpOptions``, ``BinlogEvent``, ``BinlogStream``, ``BinlogParser``
+    Replication command options, typed binlog event records, pull-based binlog
+    stream, and table-map-aware parser state.
+
+``BinlogDateTime``, ``BinlogTime``, ``BinlogTimestamp``
+    Typed values used by decoded temporal binlog row events.
 
 ``QueryResult``, ``OkPacket``, ``Field``, ``Row``, ``Value``
     Result metadata and typed row values.

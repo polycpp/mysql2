@@ -58,7 +58,7 @@ html_theme_options = {
     'sidebar_hide_name': False,
     'navigation_with_keys': True,
     'source_repository': 'https://github.com/polycpp/mysql2',
-    'source_branch': 'master',
+    'source_branch': 'main',
     'source_directory': 'docs/sphinx/',
 }
 html_static_path = ['_static']

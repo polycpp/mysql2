@@ -7,3 +7,5 @@ Tutorials
    query-and-prepared
    raw-row-scans
    pooling
+   server-mode
+   binlog-replication

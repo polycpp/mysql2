@@ -86,4 +86,6 @@ Next steps
 
 - :doc:`../tutorials/index` for task-oriented walkthroughs.
 - :doc:`../guides/index` for focused operational recipes.
+- :doc:`../guides/connection-configuration` for URI, timeout, compression,
+  LOCAL INFILE, and charset options.
 - :doc:`../api/index` for the public API summary.

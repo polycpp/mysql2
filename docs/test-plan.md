@@ -275,3 +275,19 @@ live MySQL 8.4 real database e2e passed 3 tests in 276 ms; the live MySQL 8.4
 replication e2e passed in 198 ms; the opt-in native C API benchmark executable
 built and produced CSV comparison output for `text_select_1`, `prepared_add`,
 and `fetch_rows`.
+
+Additional validation on May 3, 2026 after expanding Sphinx documentation for
+connection configuration, callback/Promise/event/stream adapters, pool
+clusters, server protocol mode, binlog/replication reads, benchmarking, and
+public option comments:
+
+```bash
+python3 docs/build.py
+cmake --build build -j2
+git diff --check
+ctest --test-dir build --output-on-failure
+```
+
+Result: docs built successfully with warnings as errors; `cmake --build` passed;
+`git diff --check` was clean; local `ctest` passed `33/33` with 12 expected
+environment-gated skips.
