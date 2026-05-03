@@ -2431,6 +2431,22 @@ Row parse_text_row(const Buffer& payload,
     return row;
 }
 
+void parse_text_row_view(const Buffer& payload,
+                         std::size_t field_count,
+                         std::vector<RawValueView>& values) {
+    PacketCursor cursor(payload);
+    values.clear();
+    values.reserve(field_count);
+    for (std::size_t i = 0; i < field_count; ++i) {
+        auto bytes = cursor.read_lenenc_view();
+        if (!bytes) {
+            values.push_back(RawValueView{true, {}});
+        } else {
+            values.push_back(RawValueView{false, *bytes});
+        }
+    }
+}
+
 std::string two_digits(uint32_t value) {
     std::string out;
     out.push_back(static_cast<char>('0' + ((value / 10) % 10)));
@@ -3762,6 +3778,17 @@ public:
     std::vector<QueryResult> query_all(const QueryOptions& options) {
         return with_operation_timeout(options.timeout_ms, [this, &options] {
             return query_all(options.sql, options.attributes);
+        });
+    }
+
+    void query_each_raw(const std::string& sql,
+                        const QueryAttributes& attributes,
+                        uint32_t timeout_ms,
+                        const RawRowCallback& callback) {
+        with_operation_timeout(timeout_ms, [this, &sql, &attributes, &callback] {
+            ensure_connected();
+            write_packet(build_query_payload(sql, attributes, client_encoding_, client_flags_), 0);
+            read_query_result_raw(callback);
         });
     }
 
@@ -5303,6 +5330,77 @@ private:
         return result;
     }
 
+    void read_query_result_raw(const RawRowCallback& callback) {
+        const auto first = read_packet();
+        if (is_err_packet(first.payload)) {
+            throw parse_error_packet(first.payload);
+        }
+        if (is_ok_packet(first.payload)) {
+            return;
+        }
+        if (first.payload.length() > 0 && first.payload[0] == 0xfb) {
+            (void)handle_local_infile_request(first);
+            return;
+        }
+
+        PacketCursor header(first.payload);
+        const auto field_count = header.read_lenenc_int();
+        if (!field_count) {
+            throw Error("unexpected NULL field count in resultset header");
+        }
+
+        std::vector<Field> fields;
+        fields.reserve(static_cast<std::size_t>(*field_count));
+        for (std::size_t i = 0; i < *field_count; ++i) {
+            const auto field_frame = read_packet();
+            if (is_err_packet(field_frame.payload)) {
+                throw parse_error_packet(field_frame.payload);
+            }
+            fields.push_back(parse_column_definition(field_frame.payload, client_encoding_));
+        }
+
+        const auto fields_end = read_packet();
+        if (!is_eof_packet(fields_end.payload) && !is_ok_packet(fields_end.payload)) {
+            throw Error("expected EOF/OK packet after column definitions");
+        }
+        auto end = parse_resultset_end_packet(fields_end.payload, server_capability_flags_);
+        if ((end.server_status & server_status_flag::CURSOR_EXISTS) != 0) {
+            return;
+        }
+
+        std::vector<RawValueView> values;
+        values.reserve(fields.size());
+        while (true) {
+            const auto row_frame = read_packet();
+            if (is_err_packet(row_frame.payload)) {
+                throw parse_error_packet(row_frame.payload);
+            }
+            if (is_eof_packet(row_frame.payload)) {
+                end = parse_resultset_end_packet(row_frame.payload, server_capability_flags_);
+                break;
+            }
+            parse_text_row_view(row_frame.payload, fields.size(), values);
+            if (callback) {
+                try {
+                    const RawRowView row(fields, values);
+                    callback(row);
+                } catch (...) {
+                    transport_read_buffer_.clear();
+                    transport_read_offset_ = 0;
+                    compressed_plain_buffer_.clear();
+                    compressed_plain_offset_ = 0;
+                    abort_transport_for_timeout();
+                    throw;
+                }
+            }
+        }
+
+        if ((end.server_status & server_status_flag::MORE_RESULTS_EXISTS) != 0) {
+            drain_remaining_query_results(false);
+            throw Error("query returned multiple result sets; raw row scan supports one result set");
+        }
+    }
+
     QueryResult handle_local_infile_request(const PacketFrame& request) {
         if (!options_.local_infile_handler) {
             write_packet(Buffer{}, static_cast<uint8_t>(request.sequence_id + 1));
@@ -5417,6 +5515,25 @@ const Value& Row::at(const std::string& name) const {
         throw std::out_of_range("mysql2 row field does not exist: " + name);
     }
     return at(it->second);
+}
+
+RawRowView::RawRowView(const std::vector<Field>& fields_ref, const std::vector<RawValueView>& values_ref)
+    : fields(fields_ref), values(values_ref) {}
+
+const RawValueView& RawRowView::at(std::size_t index) const {
+    if (index >= values.size()) {
+        throw std::out_of_range("mysql2 raw row index is out of range");
+    }
+    return values[index];
+}
+
+const RawValueView& RawRowView::at(const std::string& name) const {
+    for (std::size_t i = 0; i < fields.size(); ++i) {
+        if (fields[i].name == name) {
+            return at(i);
+        }
+    }
+    throw std::out_of_range("mysql2 raw row field does not exist: " + name);
 }
 
 RowStream::RowStream() : stream::Readable<Row>() {}
@@ -6137,6 +6254,28 @@ Promise<std::vector<QueryResult>> Connection::query_all_promise(QueryOptions opt
     return promise_from<std::vector<QueryResult>>([this, options = std::move(options)] {
         return query_all(options);
     });
+}
+
+void Connection::query_each_raw(const std::string& sql, RawRowCallback callback) {
+    try {
+        impl_->traced("query_each_raw", sql, [this, &sql, &callback] {
+            impl_->query_each_raw(sql, QueryAttributes{}, 0, callback);
+        });
+    } catch (const Error& error) {
+        impl_->emit_error(error);
+        throw;
+    }
+}
+
+void Connection::query_each_raw(const QueryOptions& options, RawRowCallback callback) {
+    try {
+        impl_->traced("query_each_raw", options.sql, [this, &options, &callback] {
+            impl_->query_each_raw(options.sql, options.attributes, options.timeout_ms, callback);
+        });
+    } catch (const Error& error) {
+        impl_->emit_error(error);
+        throw;
+    }
 }
 
 RowStream Connection::query_stream(const std::string& sql) {

@@ -690,6 +690,16 @@ TEST(server_mode, loopback_query_uses_adapted_server_api) {
     const auto result = client.query("SELECT 42 AS answer");
     ASSERT_EQ(result.rows.size(), 1u);
     EXPECT_EQ(std::get<int64_t>(result.rows[0].at("answer")), 42);
+    int raw_count = 0;
+    client.query_each_raw("SELECT 42 AS answer", [&](const mysql2::RawRowView& row) {
+        ++raw_count;
+        ASSERT_EQ(row.fields.size(), 1u);
+        EXPECT_EQ(row.fields[0].name, "answer");
+        const auto& value = row.at("answer");
+        EXPECT_FALSE(value.is_null);
+        EXPECT_EQ(std::string(value.bytes), "42");
+    });
+    EXPECT_EQ(raw_count, 1);
     auto stream = client.query_stream("SELECT 42 AS answer");
     ASSERT_EQ(stream.fields().size(), 1u);
     EXPECT_THROW(client.query("SELECT 42 AS answer"), mysql2::Error);

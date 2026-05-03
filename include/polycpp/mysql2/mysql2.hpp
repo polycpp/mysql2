@@ -8,6 +8,7 @@
 #include <memory>
 #include <optional>
 #include <string>
+#include <string_view>
 #include <unordered_map>
 #include <variant>
 #include <vector>
@@ -154,6 +155,22 @@ struct Row {
     const Value& at(std::size_t index) const;
     const Value& at(const std::string& name) const;
     JsonObject to_json_object(const std::vector<Field>& fields) const;
+};
+
+struct RawValueView {
+    bool is_null = false;
+    // Packet-backed bytes are valid only during the query_each_raw callback.
+    std::string_view bytes;
+};
+
+struct RawRowView {
+    RawRowView(const std::vector<Field>& fields, const std::vector<RawValueView>& values);
+
+    const std::vector<Field>& fields;
+    const std::vector<RawValueView>& values;
+
+    const RawValueView& at(std::size_t index) const;
+    const RawValueView& at(const std::string& name) const;
 };
 
 struct OkPacket {
@@ -455,6 +472,7 @@ using VoidCallback = std::function<void(std::exception_ptr)>;
 using OkCallback = std::function<void(std::exception_ptr, OkPacket)>;
 using QueryCallback = std::function<void(std::exception_ptr, QueryResult)>;
 using QueryAllCallback = std::function<void(std::exception_ptr, std::vector<QueryResult>)>;
+using RawRowCallback = std::function<void(const RawRowView&)>;
 using PrepareCallback = std::function<void(std::exception_ptr, PreparedStatement)>;
 using BinlogEventsCallback = std::function<void(std::exception_ptr, std::vector<BinlogEvent>)>;
 using BinlogEventCallback = std::function<bool(const BinlogEvent&)>;
@@ -517,6 +535,8 @@ public:
     Promise<std::vector<QueryResult>> query_all_promise(const std::string& sql);
     Promise<std::vector<QueryResult>> query_all_promise(const std::string& sql, const QueryAttributes& attributes);
     Promise<std::vector<QueryResult>> query_all_promise(QueryOptions options);
+    void query_each_raw(const std::string& sql, RawRowCallback callback);
+    void query_each_raw(const QueryOptions& options, RawRowCallback callback);
     RowStream query_stream(const std::string& sql);
     RowStream query_stream(const QueryOptions& options);
     stream::Readable<Buffer> query_stream_json(const std::string& sql);

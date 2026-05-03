@@ -33,7 +33,7 @@ Implemented:
 - Connection URI parsing through `polycpp::url`.
 - Connect timeout and per-command inactivity timeout enforcement through `polycpp::io::Timer`.
 - Connection attributes in the initial handshake and `COM_CHANGE_USER`.
-- `QueryOptions` / `ExecuteOptions` timeout wrappers, callback overloads, `polycpp::Promise` wrappers, typed `polycpp::events::EventEmitter` integration, trace events, pull-based `RowStream` row streams over `polycpp::stream::Readable<Row>`, and lazy JSON line `polycpp::stream::Readable<Buffer>` query output.
+- `QueryOptions` / `ExecuteOptions` timeout wrappers, callback overloads, `polycpp::Promise` wrappers, typed `polycpp::events::EventEmitter` integration, trace events, pull-based `RowStream` row streams over `polycpp::stream::Readable<Row>`, lazy JSON line `polycpp::stream::Readable<Buffer>` query output, and scan-oriented `query_each_raw(...)` packet byte views.
 - MySQL compressed protocol using `polycpp::zlib`.
 - Explicit-policy LOCAL INFILE uploads through `ConnectionOptions::local_infile_handler`.
 - `COM_CHANGE_USER`, transaction helpers, ping, reset, graceful end, synchronous RAII pools, and pool clusters.
@@ -51,6 +51,7 @@ Known divergences:
 - Native MySQL/MariaDB client SDKs are intentionally not linked.
 - Node diagnostic channels are adapted to typed `event::Trace` events.
 - Node object-mode row streaming maps to `RowStream`, a `polycpp::stream::Readable<Row>` subclass. `query_stream(...)` reads result metadata up front and decodes row packets on `read()`/flowing consumption; the connection stays busy until the stream reaches EOF or is destroyed/dropped. `query_stream_json()` is a lazy newline-delimited JSON `Readable<Buffer>` adapter over the same row stream.
+- `query_each_raw(...)` is a C++-specific scan extension. `RawRowView` / `RawValueView` bytes are packet-backed `std::string_view` values and are valid only during the callback.
 - Server mode is adapted to a C++ server object. It supports TCP and Unix socket listening, MySQL in-protocol TLS upgrade when configured, handshake/auth inspection, command dispatch, packet observation, statement prepare OK packets, and OK/ERR/text/binary result writers; a full SQL engine is intentionally not implied.
 - Parser cache controls are compatibility no-ops because C++ uses static parsers.
 - Query attributes use `std::unordered_map`, so attribute wire order is not a public contract.
@@ -314,6 +315,13 @@ while (auto row = rows.read()) {
     (void)*row;
 }
 auto stream = conn.query_stream_json(query_options);
+
+conn.query_each_raw(query_options, [](const polycpp::mysql2::RawRowView& row) {
+    if (!row.at(0).is_null) {
+        auto bytes = row.at(0).bytes; // valid only during this callback
+        (void)bytes;
+    }
+});
 ```
 
 Formatting helpers:

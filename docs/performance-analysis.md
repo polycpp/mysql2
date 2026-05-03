@@ -111,6 +111,38 @@ matches the earlier upstream `mysql2` JavaScript result and is within roughly
 slightly because fewer read operations are scheduled while consuming result
 metadata and row packets.
 
+### After stream, prepared, and raw-scan benchmark additions
+
+This revision added benchmark coverage for three follow-up hypotheses:
+
+- `fetch_rows_stream`: `query_stream(...)` avoids retaining every row in
+  `QueryResult::rows`, but still constructs typed `Row`/`Value` objects.
+- `fetch_rows_prepared`: prepared/binary result rows avoid text numeric parsing.
+- `fetch_rows_raw`: `query_each_raw(...)` exposes callback-scoped packet byte
+  views and avoids constructing typed `Row`/`Value` objects.
+
+| client | workload | processed units | total ms | throughput |
+| --- | --- | ---: | ---: | ---: |
+| polycpp_mysql2 | text_select_1 | 1000 queries | 73.263 | 13,649.423 q/s |
+| polycpp_mysql2 | prepared_add | 1000 queries | 63.283 | 15,802.095 q/s |
+| polycpp_mysql2 | fetch_rows | 100000 rows | 43.284 | 2,310,323.215 rows/s |
+| polycpp_mysql2 | fetch_rows_raw | 100000 rows | 30.288 | 3,301,604.256 rows/s |
+| polycpp_mysql2 | fetch_rows_stream | 100000 rows | 43.692 | 2,288,736.202 rows/s |
+| polycpp_mysql2 | fetch_rows_materialized | 100000 rows | 45.313 | 2,206,885.106 rows/s |
+| polycpp_mysql2 | fetch_rows_prepared | 100000 rows | 40.948 | 2,442,135.194 rows/s |
+| native_c_api | text_select_1 | 1000 queries | 63.985 | 15,628.656 q/s |
+| native_c_api | prepared_add | 1000 queries | 56.002 | 17,856.402 q/s |
+| native_c_api | fetch_rows | 100000 rows | 27.276 | 3,666,247.957 rows/s |
+| native_c_api | fetch_rows_materialized | 100000 rows | 27.795 | 3,597,829.314 rows/s |
+| native_c_api | fetch_rows_prepared | 100000 rows | 23.912 | 4,182,086.193 rows/s |
+
+The data shows that `query_stream(...)` is not materially faster for this small
+row shape because its main benefit is memory retention, not per-row decode cost.
+Prepared/binary rows are moderately faster, but still build typed retained rows.
+`query_each_raw(...)` is the large API-level win: raw scan throughput reaches
+roughly 3.30M rows/s, close to the native text C API's 3.67M rows/s for the same
+run, because it avoids per-row `std::vector<Value>` and variant construction.
+
 `fetch_rows_materialized` explicitly copies parsed first-column integers into an
 application vector/array and computes a checksum. For this one-int-column query,
 that extra work is still small compared with each driver's core row handling.
@@ -150,17 +182,21 @@ C API has already buffered raw row bytes.
   into owning `std::string` values.
 - Parsed rows share one result-level field-name index for `Row::at("name")`;
   manually constructed rows can still use the per-row `index_by_name` fallback.
-- `Row` stores `std::vector<Value>`, so every retained row still owns a dynamic
-  values container even for a one-column result.
+- `Row` stores `std::vector<Value>`, so every retained or streamed typed row
+  still owns a dynamic values container even for a one-column result.
+- `query_each_raw(...)` is the explicit scan-oriented escape hatch. It exposes
+  packet-backed `std::string_view` values that are valid only during the
+  callback, so it avoids constructing `Row` and `Value` objects.
 - The synchronous client now has a transport read-ahead buffer. Without that
   buffer, every row packet caused separate event-loop read operations for its
   header and payload, which was the dominant cost in the original benchmark.
 
 Relevant source locations:
 
-- `src/mysql2.cpp` (`PacketCursor`, `parse_text_value`, `parse_text_row`)
+- `src/mysql2.cpp` (`PacketCursor`, `parse_text_value`, `parse_text_row`,
+  `parse_text_row_view`)
 - `src/mysql2.cpp` (`read_exact_into`, `read_uncompressed_packet`)
-- `src/mysql2.cpp` (`read_query_result` row loop)
+- `src/mysql2.cpp` (`read_query_result`, `read_query_result_raw` row loops)
 - `include/polycpp/mysql2/mysql2.hpp:149` (`Row` layout)
 
 ## Main conclusion
@@ -184,17 +220,14 @@ comparison for the public `QueryResult` API.
 
 ## Optimization candidates
 
-1. Add a raw or lightweight row view API for benchmark-sensitive scans. Example:
-   a `query_rows_raw(...)`/`query_each(...)` path that exposes field buffers or
-   typed values without retaining every row in a full `QueryResult`.
-2. Benchmark binary prepared-result rows separately from text rows. Binary rows
-   avoid decimal text parsing for numeric fields and may be a better high-volume
-   path.
-3. Consider an arena or slab allocator for retained `QueryResult` rows/values.
+1. Consider an arena or slab allocator for retained `QueryResult` rows/values.
    This would move polycpp closer to the native C API's allocation shape without
    exposing raw `char**` as the default API.
-4. Consider a row container optimization for one-column or small fixed-column
+2. Consider a row container optimization for one-column or small fixed-column
    results if profiling shows `std::vector<Value>` allocation is still material.
+3. Add raw/binary scan variants later if needed. `query_each_raw(...)` currently
+   covers text protocol raw scans; prepared/binary raw scans would require a
+   separate typed packet-view surface.
 
 Completed optimizations:
 
@@ -206,6 +239,10 @@ Completed optimizations:
   single-packet fast path.
 - The synchronous client uses a 64 KiB transport read-ahead buffer for socket,
   pipe, and TLS reads.
+- Benchmark coverage now includes `query_stream(...)` and prepared/binary bulk
+  fetch rows.
+- `query_each_raw(...)` exposes callback-scoped raw row packet views for
+  high-throughput scan workloads.
 
 ## Benchmark methodology changes made
 

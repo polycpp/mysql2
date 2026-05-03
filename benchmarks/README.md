@@ -57,10 +57,18 @@ from `polycpp_mysql2`.
 - `text_select_1`: repeated `SELECT 1` text protocol queries.
 - `prepared_add`: repeated prepared statement execute/fetch for `SELECT ? + ?`.
 - `fetch_rows`: one recursive CTE result-set fetch of `MYSQL2_BENCHMARK_ROWS` rows.
+- `fetch_rows_raw`: one recursive CTE result-set scan through
+  `Connection::query_each_raw(...)`, validating callback-scoped raw value views
+  without constructing typed `Row`/`Value` objects.
+- `fetch_rows_stream`: one recursive CTE result-set read through
+  `Connection::query_stream(...)`, avoiding full result retention while still
+  constructing typed `Row` values.
 - `fetch_rows_materialized`: one recursive CTE result-set fetch plus explicit
   application-side materialization into an integer vector/array and checksum.
-  Fetch workloads repeat `MYSQL2_BENCHMARK_FETCH_REPEATS` times and report total
-  rows processed.
+- `fetch_rows_prepared`: one prepared/binary recursive CTE result-set fetch.
+
+Fetch workloads repeat `MYSQL2_BENCHMARK_FETCH_REPEATS` times and report total
+rows processed.
 
 Keep benchmark results out of correctness claims. They are environment-sensitive
 and should be compared only on the same machine, build type, database server,

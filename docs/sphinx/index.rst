@@ -20,6 +20,7 @@ Supported scope
 - Binlog stream support through pull-based ``BinlogStream`` typed events over ``polycpp::stream::Readable<BinlogEvent>``.
 - Adapted server protocol mode with TCP or Unix socket listening, optional MySQL TLS upgrade, typed command events, and OK/ERR/text-result response writers.
 - Query stream support through pull-based ``RowStream`` typed rows and lazy newline-delimited JSON ``Readable<Buffer>`` chunks.
+- Scan-oriented ``query_each_raw`` callback API with packet-backed raw value views for high-throughput one-pass reads.
 - SQL escaping, identifier escaping, positional formatting, and named formatting helpers.
 
 Not full upstream parity
@@ -34,6 +35,8 @@ Callback, Promise, EventEmitter, trace, query attributes, command timeouts,
 cursor fetch, compression, LOCAL INFILE, URI, parser-cache compatibility,
 GTID/binlog parser support, server mode, and pool-cluster surfaces are
 implemented with C++ adaptations.
+``query_each_raw`` is a C++-specific scan extension: raw value bytes are
+``std::string_view`` objects valid only during the callback.
 See
 ``docs/divergences.md`` in the repository for the detailed list.
 

@@ -115,6 +115,37 @@ void run_polycpp(const Options& options) {
     });
     print_result("polycpp_mysql2", "fetch_rows", options.fetch_rows * options.fetch_repeats, fetch_ms);
 
+    const auto raw_ms = measure_ms([&] {
+        for (int repeat = 0; repeat < options.fetch_repeats; ++repeat) {
+            int count = 0;
+            connection.query_each_raw(fetch_sql, [&](const mysql2::RawRowView& row) {
+                const auto& value = row.at(0);
+                if (value.is_null) {
+                    throw std::runtime_error("polycpp raw fetch expected non-null value");
+                }
+                ++count;
+            });
+            if (count != options.fetch_rows) {
+                throw std::runtime_error("polycpp raw fetch row count mismatch");
+            }
+        }
+    });
+    print_result("polycpp_mysql2", "fetch_rows_raw", options.fetch_rows * options.fetch_repeats, raw_ms);
+
+    const auto stream_ms = measure_ms([&] {
+        for (int repeat = 0; repeat < options.fetch_repeats; ++repeat) {
+            auto stream = connection.query_stream(fetch_sql);
+            int count = 0;
+            while (auto row = stream.read()) {
+                ++count;
+            }
+            if (count != options.fetch_rows) {
+                throw std::runtime_error("polycpp stream fetch row count mismatch");
+            }
+        }
+    });
+    print_result("polycpp_mysql2", "fetch_rows_stream", options.fetch_rows * options.fetch_repeats, stream_ms);
+
     const auto materialize_ms = measure_ms([&] {
         for (int repeat = 0; repeat < options.fetch_repeats; ++repeat) {
             const auto result = connection.query(fetch_sql);
@@ -132,6 +163,18 @@ void run_polycpp(const Options& options) {
         }
     });
     print_result("polycpp_mysql2", "fetch_rows_materialized", options.fetch_rows * options.fetch_repeats, materialize_ms);
+
+    auto fetch_statement = connection.prepare(fetch_sql);
+    const auto prepared_fetch_ms = measure_ms([&] {
+        for (int repeat = 0; repeat < options.fetch_repeats; ++repeat) {
+            const auto result = connection.execute(fetch_statement);
+            if (static_cast<int>(result.rows.size()) != options.fetch_rows) {
+                throw std::runtime_error("polycpp prepared fetch row count mismatch");
+            }
+        }
+    });
+    print_result("polycpp_mysql2", "fetch_rows_prepared", options.fetch_rows * options.fetch_repeats, prepared_fetch_ms);
+    connection.close_statement(fetch_statement);
 }
 
 #if defined(POLYCPP_MYSQL2_HAS_NATIVE_C_API)
@@ -214,6 +257,47 @@ std::vector<int64_t> native_query_int64_vector(MYSQL* mysql, const std::string& 
     return values;
 }
 
+void native_prepared_query(MYSQL_STMT* statement, int expected_rows) {
+    long long value = 0;
+    unsigned long length = 0;
+#if defined(MARIADB_BASE_VERSION) || defined(MARIADB_VERSION_ID)
+    my_bool is_null = 0;
+#else
+    bool is_null = false;
+#endif
+    MYSQL_BIND result_bind[1]{};
+    result_bind[0].buffer_type = MYSQL_TYPE_LONGLONG;
+    result_bind[0].buffer = &value;
+    result_bind[0].is_null = &is_null;
+    result_bind[0].length = &length;
+
+    if (mysql_stmt_bind_result(statement, result_bind) != 0) {
+        throw std::runtime_error(std::string("mysql_stmt_bind_result failed: ") + mysql_stmt_error(statement));
+    }
+    if (mysql_stmt_execute(statement) != 0 || mysql_stmt_store_result(statement) != 0) {
+        throw std::runtime_error(std::string("mysql_stmt_execute failed: ") + mysql_stmt_error(statement));
+    }
+
+    int count = 0;
+    while (true) {
+        const int status = mysql_stmt_fetch(statement);
+        if (status == MYSQL_NO_DATA) {
+            break;
+        }
+        if (status != 0 && status != MYSQL_DATA_TRUNCATED) {
+            throw std::runtime_error(std::string("mysql_stmt_fetch failed: ") + mysql_stmt_error(statement));
+        }
+        if (is_null) {
+            throw std::runtime_error("native prepared fetch expected non-null numeric value");
+        }
+        ++count;
+    }
+    mysql_stmt_free_result(statement);
+    if (count != expected_rows) {
+        throw std::runtime_error("native prepared fetch row count mismatch");
+    }
+}
+
 void run_native(const Options& options) {
     NativeConnection connection(options);
     native_query(connection.get(), "SELECT 1 AS one");
@@ -288,6 +372,23 @@ void run_native(const Options& options) {
         }
     });
     print_result("native_c_api", "fetch_rows_materialized", options.fetch_rows * options.fetch_repeats, materialize_ms);
+
+    MYSQL_STMT* fetch_statement = mysql_stmt_init(connection.get());
+    if (!fetch_statement) throw std::runtime_error("mysql_stmt_init failed");
+    if (mysql_stmt_prepare(fetch_statement,
+                           fetch_sql.c_str(),
+                           static_cast<unsigned long>(fetch_sql.size())) != 0) {
+        const std::string error = mysql_stmt_error(fetch_statement);
+        mysql_stmt_close(fetch_statement);
+        throw std::runtime_error("mysql_stmt_prepare failed: " + error);
+    }
+    const auto prepared_fetch_ms = measure_ms([&] {
+        for (int repeat = 0; repeat < options.fetch_repeats; ++repeat) {
+            native_prepared_query(fetch_statement, options.fetch_rows);
+        }
+    });
+    print_result("native_c_api", "fetch_rows_prepared", options.fetch_rows * options.fetch_repeats, prepared_fetch_ms);
+    mysql_stmt_close(fetch_statement);
 }
 
 #endif
