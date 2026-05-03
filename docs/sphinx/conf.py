@@ -15,7 +15,7 @@ copyright = '2026, polycpp contributors'
 author = 'polycpp contributors'
 
 _version_file = _HERE.parent.parent / 'VERSION.txt'
-version = _version_file.read_text().strip() if _version_file.exists() else '0.1.0'
+version = _version_file.read_text().strip() if _version_file.exists() else '1.0.0'
 release = version
 
 extensions = [

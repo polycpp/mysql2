@@ -4,7 +4,7 @@
 
 PROJECT_NAME           = "mysql2"
 PROJECT_BRIEF          = "C++ companion port of mysql2"
-PROJECT_NUMBER         = 0.1.0
+PROJECT_NUMBER         = 1.0.0
 
 OUTPUT_DIRECTORY       = build/doxygen
 INPUT                  = ../include

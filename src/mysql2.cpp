@@ -1397,7 +1397,7 @@ Buffer calculate_auth_token(const std::string& plugin, const std::string& passwo
 void append_connect_attributes(std::vector<uint8_t>& out, const ConnectionOptions& options, const std::string& encoding) {
     std::map<std::string, std::string> attributes = {
         {"_client_name", "polycpp-mysql2"},
-        {"_client_version", "0.1.0"},
+        {"_client_version", "1.0.0"},
     };
     for (const auto& [key, value] : options.connect_attributes) {
         attributes[key] = value;

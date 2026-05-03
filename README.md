@@ -4,7 +4,7 @@ C++ companion port of [mysql2](https://www.npmjs.com/package/mysql2) for [polycp
 
 ## Status
 
-Port version: `0.1.0`
+Port version: `1.0.0`
 
 Initial port based on upstream version: `3.22.2`
 
