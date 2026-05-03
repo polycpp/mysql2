@@ -38,7 +38,7 @@ else()
     FetchContent_Declare(
         polycpp_iconv_lite
         GIT_REPOSITORY git@github.com:polycpp/iconv-lite.git
-        GIT_TAG        main
+        GIT_TAG        master
         GIT_SHALLOW    TRUE
     )
 endif()

@@ -14,7 +14,7 @@ CMake FetchContent
    FetchContent_Declare(
        polycpp_mysql2
        GIT_REPOSITORY https://github.com/polycpp/mysql2.git
-       GIT_TAG        main
+       GIT_TAG        master
    )
    FetchContent_MakeAvailable(polycpp_mysql2)
 
