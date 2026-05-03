@@ -24,6 +24,8 @@ Release build, MySQL 8.4 Docker server, container-network path, GCC 11.4,
 `MYSQL2_BENCHMARK_ITERATIONS=1000`, `MYSQL2_BENCHMARK_ROWS=1000`,
 `MYSQL2_BENCHMARK_FETCH_REPEATS=100`.
 
+### Baseline before shared field index
+
 | client | workload | processed units | total ms | throughput |
 | --- | --- | ---: | ---: | ---: |
 | polycpp_mysql2 | text_select_1 | 1000 queries | 93.733 | 10,668.598 q/s |
@@ -38,6 +40,29 @@ Release build, MySQL 8.4 Docker server, container-network path, GCC 11.4,
 | mysql2_js | prepared_add | 1000 queries | 159.157 | 6,283.101 q/s |
 | mysql2_js | fetch_rows | 100000 rows | 46.628 | 2,144,650.776 rows/s |
 | mysql2_js | fetch_rows_materialized | 100000 rows | 44.957 | 2,224,369.332 rows/s |
+
+### After shared field index
+
+This revision removes parsed-row per-row `unordered_map` construction. Parsed
+rows now point at one field-name index built from result metadata, while manual
+rows can still use `Row::index_by_name` as a fallback.
+
+| client | workload | processed units | total ms | throughput |
+| --- | --- | ---: | ---: | ---: |
+| polycpp_mysql2 | text_select_1 | 1000 queries | 95.190 | 10,505.351 q/s |
+| polycpp_mysql2 | prepared_add | 1000 queries | 86.564 | 11,552.114 q/s |
+| polycpp_mysql2 | fetch_rows | 100000 rows | 538.586 | 185,671.522 rows/s |
+| polycpp_mysql2 | fetch_rows_materialized | 100000 rows | 532.858 | 187,667.257 rows/s |
+| native_c_api | text_select_1 | 1000 queries | 65.866 | 15,182.445 q/s |
+| native_c_api | prepared_add | 1000 queries | 57.518 | 17,385.747 q/s |
+| native_c_api | fetch_rows | 100000 rows | 27.743 | 3,604,514.149 rows/s |
+| native_c_api | fetch_rows_materialized | 100000 rows | 28.347 | 3,527,695.230 rows/s |
+
+The shared-index change improves the one-column fetch workload by roughly 5-7%.
+That is useful, but it proves the per-row name map was not the dominant cost for
+this benchmark. The remaining gap is mostly in typed value construction,
+per-row `Row`/`std::vector<Value>` allocation, text decoding, and result
+retention semantics.
 
 `fetch_rows_materialized` explicitly copies parsed first-column integers into an
 application vector/array and computes a checksum. For this one-int-column query,
@@ -102,24 +127,25 @@ comparison for the public `QueryResult` API.
 
 ## Optimization candidates
 
-1. Remove per-row `unordered_map` construction. Store field-name lookup once on
-   `QueryResult` or share a `std::shared_ptr<const FieldIndex>` from all rows.
-2. Reserve `QueryResult::rows` when the OK/metadata path can know or estimate row
+1. Reserve `QueryResult::rows` when the OK/metadata path can know or estimate row
    counts. For text protocol this may require a growth heuristic rather than an
    exact count.
-3. Add a raw or lightweight row view API for benchmark-sensitive scans. Example:
+2. Add a raw or lightweight row view API for benchmark-sensitive scans. Example:
    a `query_rows_raw(...)`/`query_each(...)` path that exposes field buffers or
    typed values without retaining every row in a full `QueryResult`.
-4. Add a result option for index-only rows when callers do not need
+3. Add a result option for index-only rows when callers do not need
    `Row::at(name)`. This keeps the current ergonomic API but lets hot paths avoid
    name-map work.
-5. Profile `PacketCursor::decode_buffer(...)` and numeric parsing separately.
+4. Profile `PacketCursor::decode_buffer(...)` and numeric parsing separately.
    For ASCII-compatible numeric fields, parse directly from packet bytes without
    constructing an intermediate `std::string` when charset conversion is not
    needed.
-6. Benchmark binary prepared-result rows separately from text rows. Binary rows
+5. Benchmark binary prepared-result rows separately from text rows. Binary rows
    avoid decimal text parsing for numeric fields and may be a better high-volume
    path.
+6. Consider an arena or slab allocator for retained `QueryResult` rows/values.
+   This would move polycpp closer to the native C API's allocation shape without
+   exposing raw `char**` as the default API.
 
 ## Benchmark methodology changes made
 

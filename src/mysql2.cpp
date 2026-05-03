@@ -2352,9 +2352,24 @@ Value parse_text_value(const Field& field, const Buffer& bytes, const Connection
     }
 }
 
-Row parse_text_row(const Buffer& payload, const std::vector<Field>& fields, const ConnectionOptions& options) {
+using RowIndex = std::unordered_map<std::string, std::size_t>;
+
+std::shared_ptr<const RowIndex> make_row_index(const std::vector<Field>& fields) {
+    auto index = std::make_shared<RowIndex>();
+    index->reserve(fields.size());
+    for (std::size_t i = 0; i < fields.size(); ++i) {
+        index->emplace(fields[i].name, i);
+    }
+    return index;
+}
+
+Row parse_text_row(const Buffer& payload,
+                   const std::vector<Field>& fields,
+                   const ConnectionOptions& options,
+                   std::shared_ptr<const RowIndex> row_index = {}) {
     PacketCursor cursor(payload);
     Row row;
+    row.shared_index_by_name = std::move(row_index);
     row.values.reserve(fields.size());
     for (std::size_t i = 0; i < fields.size(); ++i) {
         auto bytes = cursor.read_lenenc_buffer();
@@ -2363,7 +2378,6 @@ Row parse_text_row(const Buffer& payload, const std::vector<Field>& fields, cons
         } else {
             row.values.emplace_back(parse_text_value(fields[i], *bytes, options));
         }
-        row.index_by_name.emplace(fields[i].name, i);
     }
     return row;
 }
@@ -2528,7 +2542,10 @@ Value parse_binary_value(PacketCursor& cursor, const Field& field, const Connect
     }
 }
 
-Row parse_binary_row(const Buffer& payload, const std::vector<Field>& fields, const ConnectionOptions& options) {
+Row parse_binary_row(const Buffer& payload,
+                     const std::vector<Field>& fields,
+                     const ConnectionOptions& options,
+                     std::shared_ptr<const RowIndex> row_index = {}) {
     PacketCursor cursor(payload);
     if (cursor.read_u8() != 0) {
         throw Error("malformed binary row packet");
@@ -2536,6 +2553,7 @@ Row parse_binary_row(const Buffer& payload, const std::vector<Field>& fields, co
     const std::size_t null_bitmap_length = (fields.size() + 7 + 2) / 8;
     const auto null_bitmap = cursor.read_buffer(null_bitmap_length);
     Row row;
+    row.shared_index_by_name = std::move(row_index);
     row.values.reserve(fields.size());
     for (std::size_t i = 0; i < fields.size(); ++i) {
         const auto bit = i + 2;
@@ -2545,7 +2563,6 @@ Row parse_binary_row(const Buffer& payload, const std::vector<Field>& fields, co
         } else {
             row.values.emplace_back(parse_binary_value(cursor, fields[i], options));
         }
-        row.index_by_name.emplace(fields[i].name, i);
     }
     return row;
 }
@@ -3905,6 +3922,7 @@ public:
         if (!cursor.open()) {
             QueryResult result;
             result.fields = cursor.fields;
+            result.shared_index_by_name = make_row_index(result.fields);
             result.ok.server_status = cursor.server_status;
             return result;
         }
@@ -3917,6 +3935,7 @@ public:
 
         QueryResult result;
         result.fields = cursor.fields;
+        result.shared_index_by_name = make_row_index(result.fields);
         while (true) {
             const auto row_frame = read_packet();
             if (is_err_packet(row_frame.payload)) {
@@ -3927,7 +3946,7 @@ public:
                 cursor.server_status = result.ok.server_status;
                 break;
             }
-            result.rows.push_back(parse_binary_row(row_frame.payload, result.fields, options_));
+            result.rows.push_back(parse_binary_row(row_frame.payload, result.fields, options_, result.shared_index_by_name));
         }
         return result;
     }
@@ -4261,6 +4280,7 @@ private:
     struct QueryStreamState {
         std::weak_ptr<Impl> impl;
         std::vector<Field> fields;
+        std::shared_ptr<const RowIndex> row_index;
         uint32_t timeout_ms = 0;
         bool done = false;
         bool cleanup_started = false;
@@ -4422,8 +4442,9 @@ private:
             return make_ended_row_stream(std::move(fields));
         }
 
+        auto row_index = make_row_index(fields);
         auto state = std::shared_ptr<QueryStreamState>(
-            new QueryStreamState{weak_from_this(), std::move(fields), timeout_ms},
+            new QueryStreamState{weak_from_this(), std::move(fields), std::move(row_index), timeout_ms},
             [](QueryStreamState* ptr) noexcept {
                 if (ptr) {
                     ptr->cleanup();
@@ -4489,8 +4510,8 @@ private:
                 }
 
                 Row row = binary_rows
-                    ? parse_binary_row(row_frame.payload, state.fields, options_)
-                    : parse_text_row(row_frame.payload, state.fields, options_);
+                    ? parse_binary_row(row_frame.payload, state.fields, options_, state.row_index)
+                    : parse_text_row(row_frame.payload, state.fields, options_, state.row_index);
                 if (!stream.push(std::move(row))) {
                     return;
                 }
@@ -5166,6 +5187,7 @@ private:
             }
             result.fields.push_back(parse_column_definition(field_frame.payload, client_encoding_));
         }
+        result.shared_index_by_name = make_row_index(result.fields);
         const auto fields_end = read_packet();
         if (!is_eof_packet(fields_end.payload) && !is_ok_packet(fields_end.payload)) {
             throw Error("expected EOF/OK packet after column definitions");
@@ -5185,8 +5207,8 @@ private:
                 break;
             }
             result.rows.push_back(binary_rows
-                ? parse_binary_row(row_frame.payload, result.fields, options_)
-                : parse_text_row(row_frame.payload, result.fields, options_));
+                ? parse_binary_row(row_frame.payload, result.fields, options_, result.shared_index_by_name)
+                : parse_text_row(row_frame.payload, result.fields, options_, result.shared_index_by_name));
         }
         return result;
     }
@@ -5289,8 +5311,17 @@ const Value& Row::at(std::size_t index) const {
 }
 
 const Value& Row::at(const std::string& name) const {
-    const auto it = index_by_name.find(name);
-    if (it == index_by_name.end()) {
+    const RowIndex* index = nullptr;
+    if (!index_by_name.empty()) {
+        index = &index_by_name;
+    } else if (shared_index_by_name) {
+        index = shared_index_by_name.get();
+    }
+    if (!index) {
+        throw std::out_of_range("mysql2 row field does not exist: " + name);
+    }
+    const auto it = index->find(name);
+    if (it == index->end()) {
         throw std::out_of_range("mysql2 row field does not exist: " + name);
     }
     return at(it->second);

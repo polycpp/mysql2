@@ -149,6 +149,7 @@ enum class CursorType : uint8_t {
 struct Row {
     std::vector<Value> values;
     std::unordered_map<std::string, std::size_t> index_by_name;
+    std::shared_ptr<const std::unordered_map<std::string, std::size_t>> shared_index_by_name;
 
     const Value& at(std::size_t index) const;
     const Value& at(const std::string& name) const;
@@ -167,6 +168,7 @@ struct OkPacket {
 struct QueryResult {
     OkPacket ok;
     std::vector<Field> fields;
+    std::shared_ptr<const std::unordered_map<std::string, std::size_t>> shared_index_by_name;
     std::vector<Row> rows;
 
     bool has_rows() const noexcept;
