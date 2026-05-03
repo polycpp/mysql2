@@ -127,3 +127,11 @@ For one-pass reads where callback-scoped raw packet bytes are enough, use
 
 See :doc:`raw-row-scans` for a complete tutorial and
 :doc:`/guides/raw-row-scans` for lifetime and parsing rules.
+
+Related guides
+--------------
+
+- :doc:`/guides/sql-formatting` for escaping, identifiers, named
+  placeholders, and ``raw`` fragments.
+- :doc:`/guides/lifecycle-and-safety` for multi-result draining, stream
+  connection ownership, timeouts, reset, and change-user behavior.

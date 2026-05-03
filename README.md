@@ -69,8 +69,8 @@ Known divergences:
 
 The Sphinx documentation covers installation, query/prepared flows, raw scans,
 pooling and pool clusters, server protocol mode, binlog/replication reads,
-TLS, connection configuration, callbacks/promises/events/streams, testing, and
-benchmarking.
+TLS, connection configuration, lifecycle/fail-closed behavior, SQL formatting,
+callbacks/promises/events/streams, testing, and benchmarking.
 
 ```bash
 python3 docs/build.py

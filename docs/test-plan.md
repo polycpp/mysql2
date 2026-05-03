@@ -291,3 +291,18 @@ ctest --test-dir build --output-on-failure
 Result: docs built successfully with warnings as errors; `cmake --build` passed;
 `git diff --check` was clean; local `ctest` passed `33/33` with 12 expected
 environment-gated skips.
+
+Additional validation on May 3, 2026 after the final documentation audit added
+SQL formatting/escaping guidance, lifecycle and fail-closed semantics, expanded
+API summary coverage, and focused e2e testing notes:
+
+```bash
+python3 docs/build.py
+git diff --check
+ctest --test-dir build --output-on-failure
+cmake --build build -j2
+```
+
+Result: docs built successfully with warnings as errors; `git diff --check` was
+clean; local `ctest` passed `33/33` with 12 expected environment-gated skips;
+`cmake --build` reported no work to do.

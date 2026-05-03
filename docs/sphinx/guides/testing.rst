@@ -5,6 +5,8 @@ Unit tests run without an external database server:
 
 .. code-block:: bash
 
+   cmake -B build -DPOLYCPP_MYSQL2_BUILD_TESTS=ON
+   cmake --build build -j$(nproc)
    ctest --test-dir build --output-on-failure
 
 Real database tests are enabled by environment variables:
@@ -44,3 +46,19 @@ INFILE policy, pooling, pool clusters, and optional TLS. The local loopback
 tests cover the adapted server protocol mode over TCP and Unix socket paths by
 connecting the port's client to ``create_server`` and validating handshake,
 query, ping, text-result, and quit behavior.
+
+Focused e2e binaries
+--------------------
+
+The repository keeps focused e2e binaries under ``tests/e2e`` so agents and CI
+can rerun protocol-sensitive paths without rediscovering commands:
+
+.. code-block:: bash
+
+   build/test_e2e_server_protocol
+   build/test_e2e_real_database
+   build/test_e2e_real_database_operations
+   MYSQL2_TEST_REPLICATION=1 build/test_e2e_replication
+
+``tests/e2e/README.md`` contains reproducible Docker commands for MySQL 8.4,
+row-binlog replication, and loopback TLS clear-password auth.

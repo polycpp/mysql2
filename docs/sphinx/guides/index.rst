@@ -6,6 +6,8 @@ How-to Guides
 
    testing
    connection-configuration
+   lifecycle-and-safety
+   sql-formatting
    callbacks-promises-events
    tls
    type-mapping
