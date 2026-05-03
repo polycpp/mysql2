@@ -37,6 +37,7 @@
 #include <optional>
 #include <random>
 #include <sstream>
+#include <string_view>
 #include <thread>
 #include <system_error>
 #include <type_traits>
@@ -109,6 +110,7 @@ constexpr std::size_t kPacketHeaderLength = 4;
 constexpr std::size_t kCompressedPacketHeaderLength = 7;
 constexpr std::size_t kMaxPacketPayloadLength = 0x00ffffff;
 constexpr std::size_t kMaxCompressedPayloadInputLength = 16777210;
+constexpr std::size_t kTransportReadBufferSize = 64 * 1024;
 constexpr uint16_t kBinlogDumpNonBlock = 0x01;
 
 std::atomic<std::size_t> g_parser_cache_max{0};
@@ -257,45 +259,46 @@ struct PacketFrame {
 
 class PacketCursor {
 public:
-    explicit PacketCursor(Buffer payload) : payload_(std::move(payload)) {}
+    explicit PacketCursor(const Buffer& payload) : payload_(&payload) {}
+    explicit PacketCursor(Buffer&& payload) : owned_payload_(std::move(payload)), payload_(&owned_payload_) {}
 
-    bool has_more() const noexcept { return offset_ < payload_.length(); }
+    bool has_more() const noexcept { return offset_ < payload().length(); }
     std::size_t offset() const noexcept { return offset_; }
-    std::size_t length() const noexcept { return payload_.length(); }
-    const Buffer& payload() const noexcept { return payload_; }
+    std::size_t length() const noexcept { return payload().length(); }
+    const Buffer& payload() const noexcept { return *payload_; }
 
     uint8_t peek_u8() const {
         ensure(1);
-        return payload_[offset_];
+        return payload()[offset_];
     }
 
     uint8_t read_u8() {
         ensure(1);
-        return payload_[offset_++];
+        return payload()[offset_++];
     }
 
     uint16_t read_u16_le() {
         ensure(2);
-        const auto value = static_cast<uint16_t>(payload_[offset_] | (payload_[offset_ + 1] << 8));
+        const auto value = static_cast<uint16_t>(payload()[offset_] | (payload()[offset_ + 1] << 8));
         offset_ += 2;
         return value;
     }
 
     uint32_t read_u24_le() {
         ensure(3);
-        const auto value = static_cast<uint32_t>(payload_[offset_] |
-                                                (payload_[offset_ + 1] << 8) |
-                                                (payload_[offset_ + 2] << 16));
+        const auto value = static_cast<uint32_t>(payload()[offset_] |
+                                                (payload()[offset_ + 1] << 8) |
+                                                (payload()[offset_ + 2] << 16));
         offset_ += 3;
         return value;
     }
 
     uint32_t read_u32_le() {
         ensure(4);
-        const auto value = static_cast<uint32_t>(payload_[offset_] |
-                                                (payload_[offset_ + 1] << 8) |
-                                                (payload_[offset_ + 2] << 16) |
-                                                (payload_[offset_ + 3] << 24));
+        const auto value = static_cast<uint32_t>(payload()[offset_] |
+                                                (payload()[offset_ + 1] << 8) |
+                                                (payload()[offset_ + 2] << 16) |
+                                                (payload()[offset_ + 3] << 24));
         offset_ += 4;
         return value;
     }
@@ -304,7 +307,7 @@ public:
         ensure(8);
         uint64_t value = 0;
         for (int i = 0; i < 8; ++i) {
-            value |= static_cast<uint64_t>(payload_[offset_ + i]) << (8 * i);
+            value |= static_cast<uint64_t>(payload()[offset_ + i]) << (8 * i);
         }
         offset_ += 8;
         return value;
@@ -329,7 +332,7 @@ public:
     float read_float_le() {
         ensure(4);
         float value = 0;
-        std::memcpy(&value, payload_.data() + offset_, 4);
+        std::memcpy(&value, payload().data() + offset_, 4);
         offset_ += 4;
         return value;
     }
@@ -337,39 +340,39 @@ public:
     double read_double_le() {
         ensure(8);
         double value = 0;
-        std::memcpy(&value, payload_.data() + offset_, 8);
+        std::memcpy(&value, payload().data() + offset_, 8);
         offset_ += 8;
         return value;
     }
 
     Buffer read_buffer(std::size_t length) {
         ensure(length);
-        auto out = payload_.slice(offset_, offset_ + length);
+        auto out = payload().slice(offset_, offset_ + length);
         offset_ += length;
         return out;
     }
 
     Buffer read_rest_buffer() {
-        return read_buffer(payload_.length() - offset_);
+        return read_buffer(payload().length() - offset_);
     }
 
     std::string read_ascii(std::size_t length) {
         ensure(length);
-        std::string out(reinterpret_cast<const char*>(payload_.data() + offset_), length);
+        std::string out(reinterpret_cast<const char*>(payload().data() + offset_), length);
         offset_ += length;
         return out;
     }
 
     std::string read_null_terminated_ascii() {
         const auto start = offset_;
-        while (offset_ < payload_.length() && payload_[offset_] != 0) {
+        while (offset_ < payload().length() && payload()[offset_] != 0) {
             ++offset_;
         }
         const auto end = offset_;
-        if (offset_ < payload_.length()) {
+        if (offset_ < payload().length()) {
             ++offset_;
         }
-        return bytes_to_ascii(payload_, start, end);
+        return bytes_to_ascii(payload(), start, end);
     }
 
     std::optional<uint64_t> read_lenenc_int() {
@@ -403,17 +406,39 @@ public:
         return read_buffer(static_cast<std::size_t>(*length));
     }
 
+    std::optional<std::string_view> read_lenenc_view() {
+        const auto length = read_lenenc_int();
+        if (!length) {
+            return std::nullopt;
+        }
+        if (*length > static_cast<uint64_t>(std::numeric_limits<std::size_t>::max())) {
+            throw Error("length-encoded field is too large");
+        }
+        return read_view(static_cast<std::size_t>(*length));
+    }
+
     std::optional<std::string> read_lenenc_string(const std::string& encoding = "utf8") {
-        const auto bytes = read_lenenc_buffer();
+        const auto bytes = read_lenenc_view();
         if (!bytes) {
             return std::nullopt;
         }
-        return decode_buffer(*bytes, encoding);
+        return decode_view(*bytes, encoding);
     }
 
     void skip(std::size_t length) {
         ensure(length);
         offset_ += length;
+    }
+
+    std::string_view read_view(std::size_t length) {
+        ensure(length);
+        std::string_view out(reinterpret_cast<const char*>(payload().data() + offset_), length);
+        offset_ += length;
+        return out;
+    }
+
+    static Buffer buffer_from_view(std::string_view bytes) {
+        return Buffer::from(reinterpret_cast<const uint8_t*>(bytes.data()), bytes.size());
     }
 
     static std::string decode_buffer(const Buffer& buffer, const std::string& encoding) {
@@ -435,14 +460,25 @@ public:
         return buffer.toString("utf8");
     }
 
+    static std::string decode_view(std::string_view bytes, const std::string& encoding) {
+        if (bytes.empty()) {
+            return {};
+        }
+        if (encoding.empty() || encoding == "utf8" || encoding == "utf8mb4" || encoding == "cesu8") {
+            return std::string(bytes);
+        }
+        return decode_buffer(buffer_from_view(bytes), encoding);
+    }
+
 private:
     void ensure(std::size_t length) const {
-        if (offset_ + length > payload_.length()) {
+        if (offset_ + length > payload().length()) {
             throw Error("malformed MySQL packet: unexpected end of packet");
         }
     }
 
-    Buffer payload_;
+    Buffer owned_payload_;
+    const Buffer* payload_ = nullptr;
     std::size_t offset_ = 0;
 };
 
@@ -2288,23 +2324,29 @@ bool parse_uint64(std::string_view text, uint64_t& out) {
     return result.ec == std::errc{} && result.ptr == last;
 }
 
-bool parse_double_value(const std::string& text, double& out) {
-    char* end = nullptr;
-    out = std::strtod(text.c_str(), &end);
-    return end == text.c_str() + text.size();
+bool parse_double_value(std::string_view text, double& out) {
+    const auto first = text.data();
+    const auto last = text.data() + text.size();
+    const auto result = std::from_chars(first, last, out);
+    return result.ec == std::errc{} && result.ptr == last;
 }
 
-Value parse_text_value(const Field& field, const Buffer& bytes, const ConnectionOptions& options) {
+std::string field_text_encoding(const Field& field) {
+    return field.column_type == constants::column_type::JSON ? "utf8" : (field.encoding.empty() ? "utf8" : field.encoding);
+}
+
+Value parse_text_value(const Field& field, std::string_view bytes, const ConnectionOptions& options) {
     using namespace constants::column_type;
     if (field.column_type != JSON &&
         (field_is_blob(field.column_type) || field_is_string_like(field.column_type)) &&
         (field.character_set == 63 || field.is_binary())) {
-        return bytes;
+        return PacketCursor::buffer_from_view(bytes);
     }
 
-    const auto text = PacketCursor::decode_buffer(
-        bytes,
-        field.column_type == JSON ? "utf8" : (field.encoding.empty() ? "utf8" : field.encoding));
+    const auto decode_text = [&]() {
+        return PacketCursor::decode_view(bytes, field_text_encoding(field));
+    };
+
     switch (field.column_type) {
         case TINY:
         case SHORT:
@@ -2313,43 +2355,50 @@ Value parse_text_value(const Field& field, const Buffer& bytes, const Connection
         case YEAR: {
             if (field.is_unsigned()) {
                 uint64_t value = 0;
-                if (parse_uint64(text, value)) return value;
+                if (parse_uint64(bytes, value)) return value;
             } else {
                 int64_t value = 0;
-                if (parse_int64(text, value)) return value;
+                if (parse_int64(bytes, value)) return value;
             }
-            return text;
+            return decode_text();
         }
         case LONGLONG: {
             if (options.big_number_strings) {
-                return text;
+                return decode_text();
             }
             if (field.is_unsigned()) {
                 uint64_t value = 0;
-                if (parse_uint64(text, value)) return value;
+                if (parse_uint64(bytes, value)) return value;
             } else {
                 int64_t value = 0;
-                if (parse_int64(text, value)) return value;
+                if (parse_int64(bytes, value)) return value;
             }
-            return text;
+            return decode_text();
         }
         case FLOAT:
         case DOUBLE: {
             double value = 0;
-            if (parse_double_value(text, value)) return value;
-            return text;
+            if (parse_double_value(bytes, value)) return value;
+            return decode_text();
         }
         case NEWDECIMAL:
         case DECIMAL: {
             if (options.decimal_numbers) {
                 double value = 0;
-                if (parse_double_value(text, value)) return value;
+                if (parse_double_value(bytes, value)) return value;
             }
-            return text;
+            return decode_text();
         }
         default:
-            return text;
+            return decode_text();
     }
+}
+
+Value parse_text_value(const Field& field, const Buffer& bytes, const ConnectionOptions& options) {
+    return parse_text_value(
+        field,
+        std::string_view(reinterpret_cast<const char*>(bytes.data()), bytes.length()),
+        options);
 }
 
 using RowIndex = std::unordered_map<std::string, std::size_t>;
@@ -2372,7 +2421,7 @@ Row parse_text_row(const Buffer& payload,
     row.shared_index_by_name = std::move(row_index);
     row.values.reserve(fields.size());
     for (std::size_t i = 0; i < fields.size(); ++i) {
-        auto bytes = cursor.read_lenenc_buffer();
+        auto bytes = cursor.read_lenenc_view();
         if (!bytes) {
             row.values.emplace_back(std::monostate{});
         } else {
@@ -2528,16 +2577,16 @@ Value parse_binary_value(PacketCursor& cursor, const Field& field, const Connect
         case GEOMETRY:
         case VECTOR:
         case BIT: {
-            const auto bytes = cursor.read_lenenc_buffer();
+            const auto bytes = cursor.read_lenenc_view();
             if (!bytes) return std::monostate{};
             return parse_text_value(field, *bytes, options);
         }
         case NULL_TYPE:
             return std::monostate{};
         default: {
-            const auto bytes = cursor.read_lenenc_buffer();
+            const auto bytes = cursor.read_lenenc_view();
             if (!bytes) return std::monostate{};
-            return PacketCursor::decode_buffer(*bytes, field.encoding.empty() ? "utf8" : field.encoding);
+            return PacketCursor::decode_view(*bytes, field.encoding.empty() ? "utf8" : field.encoding);
         }
     }
 }
@@ -4783,6 +4832,8 @@ private:
 
     void close_transport() noexcept {
         std::error_code ec;
+        transport_read_buffer_.clear();
+        transport_read_offset_ = 0;
         if (tls_stream_) {
             try {
                 ctx_.restart();
@@ -4805,52 +4856,91 @@ private:
         drain_ready_handlers(ctx_);
     }
 
-    std::vector<uint8_t> read_exact(std::size_t length) {
-        std::vector<uint8_t> data(length);
+    std::size_t read_some_into(uint8_t* data, std::size_t length) {
+        ctx_.restart();
+        std::error_code ec;
+        std::size_t bytes = 0;
+        bool completed = false;
+        bool timed_out = false;
+        auto timer = arm_operation_timer(timed_out, completed);
+        if (tls_stream_) {
+            tls_stream_->asyncReadSome(data, length, [&](std::error_code error, std::size_t n) {
+                ec = error;
+                bytes = n;
+                completed = true;
+                if (timer) {
+                    std::error_code ignored;
+                    timer->cancel(ignored);
+                }
+                ctx_.stop();
+            });
+        } else {
+            socket_.asyncReadSome(data, length, [&](std::error_code error, std::size_t n) {
+                ec = error;
+                bytes = n;
+                completed = true;
+                if (timer) {
+                    std::error_code ignored;
+                    timer->cancel(ignored);
+                }
+                ctx_.stop();
+            });
+        }
+        ctx_.run();
+        if (timed_out) {
+            throw Error("mysql2 operation timed out after " + std::to_string(operation_timeout_ms_) + "ms");
+        }
+        if (ec) {
+            throw Error("socket read failed: " + ec.message());
+        }
+        if (bytes == 0) {
+            throw Error("socket read ended before the requested packet bytes were available");
+        }
+        return bytes;
+    }
+
+    void refill_transport_read_buffer() {
+        transport_read_buffer_.resize(kTransportReadBufferSize);
+        const auto bytes = read_some_into(transport_read_buffer_.data(), transport_read_buffer_.size());
+        transport_read_buffer_.resize(bytes);
+        transport_read_offset_ = 0;
+    }
+
+    void read_exact_into(uint8_t* data, std::size_t length) {
         std::size_t offset = 0;
         while (offset < length) {
-            ctx_.restart();
-            std::error_code ec;
-            std::size_t bytes = 0;
-            bool completed = false;
-            bool timed_out = false;
-            auto timer = arm_operation_timer(timed_out, completed);
+            const auto available = transport_read_buffer_.size() - transport_read_offset_;
+            if (available > 0) {
+                const auto to_copy = std::min<std::size_t>(available, length - offset);
+                std::memcpy(data + offset, transport_read_buffer_.data() + transport_read_offset_, to_copy);
+                transport_read_offset_ += to_copy;
+                offset += to_copy;
+                if (transport_read_offset_ == transport_read_buffer_.size()) {
+                    transport_read_buffer_.clear();
+                    transport_read_offset_ = 0;
+                }
+                continue;
+            }
+
             const auto remaining = length - offset;
-            if (tls_stream_) {
-                tls_stream_->asyncReadSome(data.data() + offset, remaining, [&](std::error_code error, std::size_t n) {
-                    ec = error;
-                    bytes = n;
-                    completed = true;
-                    if (timer) {
-                        std::error_code ignored;
-                        timer->cancel(ignored);
-                    }
-                    ctx_.stop();
-                });
-            } else {
-                socket_.asyncRead(data.data() + offset, remaining, [&](std::error_code error, std::size_t n) {
-                    ec = error;
-                    bytes = n;
-                    completed = true;
-                    if (timer) {
-                        std::error_code ignored;
-                        timer->cancel(ignored);
-                    }
-                    ctx_.stop();
-                });
+            if (remaining >= kTransportReadBufferSize) {
+                offset += read_some_into(data + offset, remaining);
+                continue;
             }
-            ctx_.run();
-            if (timed_out) {
-                throw Error("mysql2 operation timed out after " + std::to_string(operation_timeout_ms_) + "ms");
-            }
-            if (ec) {
-                throw Error("socket read failed: " + ec.message());
-            }
-            if (bytes == 0) {
-                throw Error("socket read ended before the requested packet bytes were available");
-            }
-            offset += bytes;
+
+            refill_transport_read_buffer();
         }
+    }
+
+    std::vector<uint8_t> read_exact(std::size_t length) {
+        std::vector<uint8_t> data(length);
+        read_exact_into(data.data(), data.size());
+        return data;
+    }
+
+    Buffer read_exact_buffer(std::size_t length) {
+        auto data = Buffer::allocUnsafe(length);
+        read_exact_into(data.data(), data.length());
         return data;
     }
 
@@ -4908,24 +4998,23 @@ private:
     }
 
     PacketFrame read_uncompressed_packet() {
+        std::array<uint8_t, kPacketHeaderLength> header{};
+        read_exact_into(header.data(), header.size());
+        const uint32_t length = static_cast<uint32_t>(header[0] | (header[1] << 8) | (header[2] << 16));
+        const uint8_t first_sequence = header[3];
+        auto first_payload = length > 0 ? read_exact_buffer(length) : Buffer{};
+        if (length < kMaxPacketPayloadLength) {
+            return {first_sequence, std::move(first_payload)};
+        }
+
         std::vector<Buffer> parts;
-        uint8_t first_sequence = 0;
-        bool first = true;
+        parts.push_back(std::move(first_payload));
         while (true) {
-            const auto header = read_exact(kPacketHeaderLength);
-            const uint32_t length = static_cast<uint32_t>(header[0] | (header[1] << 8) | (header[2] << 16));
-            const uint8_t sequence = header[3];
-            if (first) {
-                first_sequence = sequence;
-                first = false;
-            }
-            auto payload = Buffer{};
-            if (length > 0) {
-                const auto bytes = read_exact(length);
-                payload = buffer_from_bytes(bytes);
-            }
+            read_exact_into(header.data(), header.size());
+            const uint32_t next_length = static_cast<uint32_t>(header[0] | (header[1] << 8) | (header[2] << 16));
+            auto payload = next_length > 0 ? read_exact_buffer(next_length) : Buffer{};
             parts.push_back(std::move(payload));
-            if (length < kMaxPacketPayloadLength) {
+            if (next_length < kMaxPacketPayloadLength) {
                 break;
             }
         }
@@ -4967,15 +5056,16 @@ private:
     }
 
     PacketFrame read_compressed_packet() {
+        auto frame = read_normal_packet_from_compressed_stream();
+        const uint8_t first_sequence = frame.sequence_id;
+        if (frame.payload.length() < kMaxPacketPayloadLength) {
+            return frame;
+        }
+
         std::vector<Buffer> parts;
-        uint8_t first_sequence = 0;
-        bool first = true;
+        parts.push_back(std::move(frame.payload));
         while (true) {
             const auto frame = read_normal_packet_from_compressed_stream();
-            if (first) {
-                first_sequence = frame.sequence_id;
-                first = false;
-            }
             parts.push_back(std::move(frame.payload));
             if (parts.back().length() < kMaxPacketPayloadLength) {
                 break;
@@ -5010,11 +5100,11 @@ private:
     }
 
     void append_next_compressed_payload() {
-        const auto header = read_exact(kCompressedPacketHeaderLength);
+        std::array<uint8_t, kCompressedPacketHeaderLength> header{};
+        read_exact_into(header.data(), header.size());
         const uint32_t compressed_length = static_cast<uint32_t>(header[0] | (header[1] << 8) | (header[2] << 16));
         const uint32_t uncompressed_length = static_cast<uint32_t>(header[4] | (header[5] << 8) | (header[6] << 16));
-        const auto bytes = compressed_length > 0 ? read_exact(compressed_length) : std::vector<uint8_t>{};
-        Buffer payload = buffer_from_bytes(bytes);
+        Buffer payload = compressed_length > 0 ? read_exact_buffer(compressed_length) : Buffer{};
         if (uncompressed_length != 0) {
             payload = zlib::inflateSync(payload, zlib::Options{});
             if (payload.length() != uncompressed_length) {
@@ -5267,6 +5357,8 @@ private:
     uint32_t server_capability_flags_ = 0;
     uint32_t client_flags_ = 0;
     uint8_t compressed_sequence_id_ = 0;
+    std::vector<uint8_t> transport_read_buffer_;
+    std::size_t transport_read_offset_ = 0;
     std::vector<uint8_t> compressed_plain_buffer_;
     std::size_t compressed_plain_offset_ = 0;
     std::unordered_map<std::string, PreparedStatement> statement_cache_;
