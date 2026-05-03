@@ -60,3 +60,35 @@ from `polycpp_mysql2`.
 Keep benchmark results out of correctness claims. They are environment-sensitive
 and should be compared only on the same machine, build type, database server,
 network path, and benchmark parameters.
+
+## Optional upstream mysql2 JavaScript comparison
+
+`mysql2_js_benchmark.mjs` runs the same workload names through upstream
+`mysql2/promise`. Install the npm package in a temporary working directory and
+run the script from there so repo checkout state stays clean:
+
+```bash
+mkdir -p /tmp/mysql2-js-bench
+npm install --prefix /tmp/mysql2-js-bench mysql2@3.22.3
+cd /tmp/mysql2-js-bench
+
+MYSQL2_TEST_HOST=127.0.0.1 \
+MYSQL2_TEST_PORT=3306 \
+MYSQL2_TEST_USER=root \
+MYSQL2_TEST_PASSWORD=secret \
+MYSQL2_TEST_DATABASE=polycpp_test \
+MYSQL2_BENCHMARK_ITERATIONS=1000 \
+MYSQL2_BENCHMARK_ROWS=1000 \
+node /data/work/lib/mysql2/benchmarks/mysql2_js_benchmark.mjs
+```
+
+When running from Docker, use the same database container network namespace as
+the C++ benchmark:
+
+```bash
+docker run --rm --network container:polycpp-mysql2-bench \
+  -v /data/work/lib/mysql2:/work \
+  -w /work \
+  node:24-bookworm-slim \
+  bash -lc 'mkdir -p /tmp/mysql2-js-bench && npm install --prefix /tmp/mysql2-js-bench mysql2@3.22.3 >/dev/null && cd /tmp/mysql2-js-bench && MYSQL2_TEST_HOST=127.0.0.1 MYSQL2_TEST_PORT=3306 MYSQL2_TEST_USER=root MYSQL2_TEST_PASSWORD=polycpp MYSQL2_TEST_DATABASE=polycpp_test MYSQL2_BENCHMARK_ITERATIONS=1000 MYSQL2_BENCHMARK_ROWS=1000 node /work/benchmarks/mysql2_js_benchmark.mjs'
+```
