@@ -84,6 +84,7 @@ Pool
 Next steps
 ----------
 
+- :doc:`../tutorials/api-concepts` for the class map and API selection guide.
 - :doc:`../tutorials/index` for task-oriented walkthroughs.
 - :doc:`../guides/index` for focused operational recipes.
 - :doc:`../guides/connection-configuration` for URI, timeout, compression,

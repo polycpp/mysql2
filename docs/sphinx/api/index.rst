@@ -3,6 +3,10 @@ API Reference
 
 The public API lives in ``include/polycpp/mysql2/mysql2.hpp``.
 
+This page is a compact symbol-oriented reference. If you are choosing which
+class owns a workflow, start with :doc:`../tutorials/api-concepts`; it explains
+the class model and API selection path before listing symbols.
+
 Core types
 ----------
 

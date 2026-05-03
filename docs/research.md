@@ -209,3 +209,9 @@ The C++ supported slice maps core connection, query, query attributes, prepared 
 - polycpp modules to use: `Buffer`, `Promise`, `events`, `stream`, `url`, `zlib`, `crypto`, `io`, `TcpSocket`, `PipeSocket`, `StreamSocket`, `TcpAcceptor`, `PipeAcceptor`, `StreamAcceptor`, `ssl`, TLS, and the `iconv-lite` companion
 - missing polycpp primitives: none for query row or binlog typed object streams
 - versioning note: port versioning is independent from upstream npm versioning; upstream basis is recorded separately and does not imply parity
+
+## Documentation expansion research, 2026-05-03
+
+- reviewed upstream mysql2 documentation entry points: repository README, generated docs homepage, documentation index, API/configuration index, and SSL guide.
+- upstream documentation shape: quick first query, prepared statements, pooling, pool clusters, Promise wrappers, query attributes, connection reset, SSL, named placeholders, LOCAL INFILE, and server-side examples are documented as separate task surfaces.
+- C++ documentation action: keep task tutorials topic-focused, but add a class/API concept guide first because this port has explicit C++ ownership classes, typed values, typed streams, RAII pool handles, and adapted server/binlog surfaces that JavaScript users would otherwise infer from dynamic objects.
