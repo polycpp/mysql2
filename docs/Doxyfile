@@ -14,8 +14,10 @@ EXCLUDE_PATTERNS       = */detail/* */internal/*
 
 STRIP_FROM_PATH        = ../include
 
-# Favor public symbols; pick up everything declared in headers.
-EXTRACT_ALL            = NO
+# Favor public symbols; pick up everything declared in headers.  The API page
+# is generated from public declarations, so undocumented fields/methods must
+# still appear as signatures instead of rendering empty type shells.
+EXTRACT_ALL            = YES
 EXTRACT_PRIVATE        = NO
 EXTRACT_STATIC         = YES
 EXTRACT_LOCAL_CLASSES  = NO

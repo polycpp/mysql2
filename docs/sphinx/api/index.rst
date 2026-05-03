@@ -128,3 +128,4 @@ Generated namespace reference
 
 .. doxygennamespace:: polycpp::mysql2
    :members:
+   :undoc-members:

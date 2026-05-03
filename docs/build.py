@@ -14,7 +14,7 @@ def main() -> None:
     docs_dir = Path(__file__).resolve().parent
     (docs_dir / "build/doxygen/xml").mkdir(parents=True, exist_ok=True)
     run(["doxygen", "Doxyfile"], docs_dir)
-    run(["sphinx-build", "-b", "html", "-W", "--keep-going", "sphinx", "build/html"], docs_dir)
+    run(["sphinx-build", "-E", "-b", "html", "-W", "--keep-going", "sphinx", "build/html"], docs_dir)
     print()
     print("Open docs/build/html/index.html in a browser.")
 

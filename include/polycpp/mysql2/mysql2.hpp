@@ -23,6 +23,7 @@
 namespace polycpp::mysql2 {
 
 using Buffer = polycpp::buffer::Buffer;
+using LocalInfileHandler = std::function<std::vector<Buffer>(const std::string& path)>;
 
 class Error : public polycpp::Error {
 public:
@@ -85,7 +86,7 @@ struct ConnectionOptions {
     std::size_t max_prepared_statements = 16000;
     std::unordered_map<std::string, std::string> connect_attributes;
     // Memory-backed LOCAL INFILE upload hook. Returning empty chunks is allowed.
-    std::function<std::vector<Buffer>(const std::string& path)> local_infile_handler;
+    LocalInfileHandler local_infile_handler;
     SslOptions ssl;
 };
 
