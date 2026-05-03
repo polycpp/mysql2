@@ -16,8 +16,8 @@ Guide Map
      - Covers
      - Use it for
    * - :doc:`testing`
-     - Unit tests, real database e2e tests, TLS e2e, focused binaries, and
-       Docker-oriented reproduction notes.
+     - Unit tests, loopback server-mode tests, real database e2e tests, TLS
+       e2e, replication gates, focused binaries, and Docker reproduction notes.
      - Verifying behavior locally or in CI.
    * - :doc:`connection-configuration`
      - Direct options, URI parameters, timeouts, compression, LOCAL INFILE,
@@ -38,12 +38,12 @@ Guide Map
        events, row streams, and JSON streams.
      - Using Node-like control surfaces through C++/polycpp primitives.
    * - :doc:`tls`
-     - Verified TLS, development-only insecure TLS, client certificates, and
-       cleartext auth plugin constraints.
+     - Verified TLS, bundled CA profiles, development-only insecure TLS,
+       client certificates, and cleartext auth plugin constraints.
      - Connecting securely or testing TLS-sensitive auth paths.
    * - :doc:`type-mapping`
-     - ``Value`` alternatives, binary fields, large numbers, decimals, and date
-       time policy.
+     - ``Value`` alternatives, row lookup, binary fields, large numbers,
+       decimals, date/time policy, binlog temporal values, and JSON conversion.
      - Understanding C++ row value conversions.
    * - :doc:`raw-row-scans`
      - When to use raw scans, lifetime rules, numeric parsing, error behavior,
