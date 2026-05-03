@@ -7,3 +7,4 @@ How-to Guides
    testing
    tls
    type-mapping
+   raw-row-scans

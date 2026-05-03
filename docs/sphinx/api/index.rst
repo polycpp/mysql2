@@ -40,6 +40,11 @@ Core types
 ``QueryResult``, ``OkPacket``, ``Field``, ``Row``, ``Value``
     Result metadata and typed row values.
 
+``RawRowView``, ``RawValueView``
+    Callback-scoped packet byte views returned by ``Connection::query_each_raw``
+    for high-throughput one-pass text-result scans. The byte views must not be
+    retained after the callback returns.
+
 Free functions
 --------------
 

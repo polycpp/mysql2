@@ -324,6 +324,9 @@ conn.query_each_raw(query_options, [](const polycpp::mysql2::RawRowView& row) {
 });
 ```
 
+Use `query_each_raw(...)` only for one-pass scans where packet-backed bytes are
+enough. Copy `RawValueView::bytes` before storing it beyond the callback.
+
 Formatting helpers:
 
 ```cpp

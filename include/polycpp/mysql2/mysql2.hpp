@@ -157,12 +157,21 @@ struct Row {
     JsonObject to_json_object(const std::vector<Field>& fields) const;
 };
 
+/// Callback-scoped raw text-protocol field bytes.
+///
+/// `bytes` points into the current MySQL packet and is valid only while the
+/// `query_each_raw` callback is executing. Copy it into `std::string`,
+/// `Buffer`, or an application-owned arena before storing it.
 struct RawValueView {
     bool is_null = false;
-    // Packet-backed bytes are valid only during the query_each_raw callback.
     std::string_view bytes;
 };
 
+/// Callback-scoped raw text-protocol row view for scan workloads.
+///
+/// `fields` describes the result metadata and `values` contains one entry per
+/// field. Both references are owned by the connection internals and must not be
+/// retained after the `query_each_raw` callback returns.
 struct RawRowView {
     RawRowView(const std::vector<Field>& fields, const std::vector<RawValueView>& values);
 
@@ -472,6 +481,7 @@ using VoidCallback = std::function<void(std::exception_ptr)>;
 using OkCallback = std::function<void(std::exception_ptr, OkPacket)>;
 using QueryCallback = std::function<void(std::exception_ptr, QueryResult)>;
 using QueryAllCallback = std::function<void(std::exception_ptr, std::vector<QueryResult>)>;
+/// Callback used by `Connection::query_each_raw` for one-pass raw row scans.
 using RawRowCallback = std::function<void(const RawRowView&)>;
 using PrepareCallback = std::function<void(std::exception_ptr, PreparedStatement)>;
 using BinlogEventsCallback = std::function<void(std::exception_ptr, std::vector<BinlogEvent>)>;
@@ -535,7 +545,14 @@ public:
     Promise<std::vector<QueryResult>> query_all_promise(const std::string& sql);
     Promise<std::vector<QueryResult>> query_all_promise(const std::string& sql, const QueryAttributes& attributes);
     Promise<std::vector<QueryResult>> query_all_promise(QueryOptions options);
+    /// Execute one text query and invoke `callback` for each raw row.
+    ///
+    /// This scan API avoids constructing `Row`/`Value` objects. Raw bytes are
+    /// valid only during the callback. If the callback throws before EOF, the
+    /// connection closes the transport to avoid reusing a partially-drained
+    /// protocol stream.
     void query_each_raw(const std::string& sql, RawRowCallback callback);
+    /// Execute one text query with options and invoke `callback` for each raw row.
     void query_each_raw(const QueryOptions& options, RawRowCallback callback);
     RowStream query_stream(const std::string& sql);
     RowStream query_stream(const QueryOptions& options);

@@ -107,3 +107,23 @@ Transactions
    conn.commit();
 
 Use ``rollback`` on error paths.
+
+High-volume scans
+-----------------
+
+For one-pass reads where callback-scoped raw packet bytes are enough, use
+``query_each_raw`` instead of materializing ``QueryResult`` rows:
+
+.. code-block:: cpp
+
+   std::size_t rows = 0;
+   conn.query_each_raw("SELECT id FROM users", [&](const auto& row) {
+       const auto& id = row.at("id");
+       if (!id.is_null) {
+           // id.bytes is valid only during this callback.
+       }
+       ++rows;
+   });
+
+See :doc:`raw-row-scans` for a complete tutorial and
+:doc:`/guides/raw-row-scans` for lifetime and parsing rules.
