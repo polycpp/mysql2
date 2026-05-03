@@ -23,6 +23,7 @@ MYSQL2_TEST_PASSWORD=secret \
 MYSQL2_TEST_DATABASE=polycpp_test \
 MYSQL2_BENCHMARK_ITERATIONS=1000 \
 MYSQL2_BENCHMARK_ROWS=1000 \
+MYSQL2_BENCHMARK_FETCH_REPEATS=50 \
 build/bench_mysql2
 ```
 
@@ -56,10 +57,17 @@ from `polycpp_mysql2`.
 - `text_select_1`: repeated `SELECT 1` text protocol queries.
 - `prepared_add`: repeated prepared statement execute/fetch for `SELECT ? + ?`.
 - `fetch_rows`: one recursive CTE result-set fetch of `MYSQL2_BENCHMARK_ROWS` rows.
+- `fetch_rows_materialized`: one recursive CTE result-set fetch plus explicit
+  application-side materialization into an integer vector/array and checksum.
+  Fetch workloads repeat `MYSQL2_BENCHMARK_FETCH_REPEATS` times and report total
+  rows processed.
 
 Keep benchmark results out of correctness claims. They are environment-sensitive
 and should be compared only on the same machine, build type, database server,
 network path, and benchmark parameters.
+
+See `docs/performance-analysis.md` for the current bulk-row fetch investigation
+and optimization candidates.
 
 ## Optional upstream mysql2 JavaScript comparison
 
@@ -79,6 +87,7 @@ MYSQL2_TEST_PASSWORD=secret \
 MYSQL2_TEST_DATABASE=polycpp_test \
 MYSQL2_BENCHMARK_ITERATIONS=1000 \
 MYSQL2_BENCHMARK_ROWS=1000 \
+MYSQL2_BENCHMARK_FETCH_REPEATS=50 \
 node /data/work/lib/mysql2/benchmarks/mysql2_js_benchmark.mjs
 ```
 
@@ -90,5 +99,5 @@ docker run --rm --network container:polycpp-mysql2-bench \
   -v /data/work/lib/mysql2:/work \
   -w /work \
   node:24-bookworm-slim \
-  bash -lc 'mkdir -p /tmp/mysql2-js-bench && npm install --prefix /tmp/mysql2-js-bench mysql2@3.22.3 >/dev/null && cd /tmp/mysql2-js-bench && MYSQL2_TEST_HOST=127.0.0.1 MYSQL2_TEST_PORT=3306 MYSQL2_TEST_USER=root MYSQL2_TEST_PASSWORD=polycpp MYSQL2_TEST_DATABASE=polycpp_test MYSQL2_BENCHMARK_ITERATIONS=1000 MYSQL2_BENCHMARK_ROWS=1000 node /work/benchmarks/mysql2_js_benchmark.mjs'
+  bash -lc 'mkdir -p /tmp/mysql2-js-bench && npm install --prefix /tmp/mysql2-js-bench mysql2@3.22.3 >/dev/null && cd /tmp/mysql2-js-bench && MYSQL2_TEST_HOST=127.0.0.1 MYSQL2_TEST_PORT=3306 MYSQL2_TEST_USER=root MYSQL2_TEST_PASSWORD=polycpp MYSQL2_TEST_DATABASE=polycpp_test MYSQL2_BENCHMARK_ITERATIONS=1000 MYSQL2_BENCHMARK_ROWS=1000 MYSQL2_BENCHMARK_FETCH_REPEATS=50 node /work/benchmarks/mysql2_js_benchmark.mjs'
 ```

@@ -30,6 +30,7 @@ function optionsFromEnv() {
     charset: 'utf8mb4',
     iterations: envInt('MYSQL2_BENCHMARK_ITERATIONS', 1000),
     fetchRows: envInt('MYSQL2_BENCHMARK_ROWS', 1000),
+    fetchRepeats: envInt('MYSQL2_BENCHMARK_FETCH_REPEATS', 50),
   };
 }
 
@@ -88,12 +89,30 @@ async function main() {
 
     const fetchSql = `WITH RECURSIVE seq(n) AS (SELECT 1 UNION ALL SELECT n + 1 FROM seq WHERE n < ${options.fetchRows}) SELECT n FROM seq`;
     const fetchMs = await measureMs(async () => {
-      const [rows] = await connection.query(fetchSql);
-      if (rows.length !== options.fetchRows) {
-        throw new Error(`mysql2_js fetch row count mismatch: ${rows.length}`);
+      for (let repeat = 0; repeat < options.fetchRepeats; repeat += 1) {
+        const [rows] = await connection.query(fetchSql);
+        if (rows.length !== options.fetchRows) {
+          throw new Error(`mysql2_js fetch row count mismatch: ${rows.length}`);
+        }
       }
     });
-    printResult('mysql2_js', 'fetch_rows', options.fetchRows, fetchMs);
+    printResult('mysql2_js', 'fetch_rows', options.fetchRows * options.fetchRepeats, fetchMs);
+
+    const materializeMs = await measureMs(async () => {
+      for (let repeat = 0; repeat < options.fetchRepeats; repeat += 1) {
+        const [rows] = await connection.query(fetchSql);
+        let sum = 0;
+        const values = new Array(rows.length);
+        for (let i = 0; i < rows.length; i += 1) {
+          values[i] = rows[i].n;
+          sum += values[i];
+        }
+        if (values.length !== options.fetchRows || sum <= 0) {
+          throw new Error(`mysql2_js materialized row count mismatch: ${values.length}`);
+        }
+      }
+    });
+    printResult('mysql2_js', 'fetch_rows_materialized', options.fetchRows * options.fetchRepeats, materializeMs);
   } finally {
     await connection.end();
   }

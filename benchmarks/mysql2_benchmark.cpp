@@ -1,4 +1,5 @@
 #include <chrono>
+#include <charconv>
 #include <cstdlib>
 #include <iomanip>
 #include <iostream>
@@ -30,6 +31,7 @@ struct Options {
     std::string database;
     int iterations = 1000;
     int fetch_rows = 1000;
+    int fetch_repeats = 50;
 };
 
 const char* env(const char* name) {
@@ -50,6 +52,7 @@ Options options_from_env() {
     if (env("MYSQL2_TEST_DATABASE")) options.database = env("MYSQL2_TEST_DATABASE");
     options.iterations = env_int("MYSQL2_BENCHMARK_ITERATIONS", options.iterations);
     options.fetch_rows = env_int("MYSQL2_BENCHMARK_ROWS", options.fetch_rows);
+    options.fetch_repeats = env_int("MYSQL2_BENCHMARK_FETCH_REPEATS", options.fetch_repeats);
     return options;
 }
 
@@ -103,12 +106,32 @@ void run_polycpp(const Options& options) {
     const auto fetch_sql = "WITH RECURSIVE seq(n) AS (SELECT 1 UNION ALL SELECT n + 1 FROM seq WHERE n < " +
         std::to_string(options.fetch_rows) + ") SELECT n FROM seq";
     const auto fetch_ms = measure_ms([&] {
-        const auto result = connection.query(fetch_sql);
-        if (static_cast<int>(result.rows.size()) != options.fetch_rows) {
-            throw std::runtime_error("polycpp fetch row count mismatch");
+        for (int repeat = 0; repeat < options.fetch_repeats; ++repeat) {
+            const auto result = connection.query(fetch_sql);
+            if (static_cast<int>(result.rows.size()) != options.fetch_rows) {
+                throw std::runtime_error("polycpp fetch row count mismatch");
+            }
         }
     });
-    print_result("polycpp_mysql2", "fetch_rows", options.fetch_rows, fetch_ms);
+    print_result("polycpp_mysql2", "fetch_rows", options.fetch_rows * options.fetch_repeats, fetch_ms);
+
+    const auto materialize_ms = measure_ms([&] {
+        for (int repeat = 0; repeat < options.fetch_repeats; ++repeat) {
+            const auto result = connection.query(fetch_sql);
+            std::vector<int64_t> values;
+            values.reserve(result.rows.size());
+            int64_t sum = 0;
+            for (const auto& row : result.rows) {
+                const auto value = std::get<int64_t>(row.values.at(0));
+                values.push_back(value);
+                sum += value;
+            }
+            if (static_cast<int>(values.size()) != options.fetch_rows || sum <= 0) {
+                throw std::runtime_error("polycpp materialized row count mismatch");
+            }
+        }
+    });
+    print_result("polycpp_mysql2", "fetch_rows_materialized", options.fetch_rows * options.fetch_repeats, materialize_ms);
 }
 
 #if defined(POLYCPP_MYSQL2_HAS_NATIVE_C_API)
@@ -158,6 +181,37 @@ void native_query(MYSQL* mysql, const std::string& sql) {
     } else if (mysql_field_count(mysql) != 0) {
         throw std::runtime_error(std::string("mysql_store_result failed: ") + mysql_error(mysql));
     }
+}
+
+std::vector<int64_t> native_query_int64_vector(MYSQL* mysql, const std::string& sql) {
+    if (mysql_query(mysql, sql.c_str()) != 0) {
+        throw std::runtime_error(std::string("mysql_query failed: ") + mysql_error(mysql));
+    }
+    MYSQL_RES* result = mysql_store_result(mysql);
+    if (!result) {
+        throw std::runtime_error(std::string("mysql_store_result failed: ") + mysql_error(mysql));
+    }
+
+    std::vector<int64_t> values;
+    values.reserve(static_cast<std::size_t>(mysql_num_rows(result)));
+    MYSQL_ROW row = nullptr;
+    while ((row = mysql_fetch_row(result)) != nullptr) {
+        if (!row[0]) {
+            mysql_free_result(result);
+            throw std::runtime_error("native materialize expected non-null numeric value");
+        }
+        int64_t value = 0;
+        const char* first = row[0];
+        const char* last = row[0] + std::char_traits<char>::length(row[0]);
+        const auto parsed = std::from_chars(first, last, value);
+        if (parsed.ec != std::errc{} || parsed.ptr != last) {
+            mysql_free_result(result);
+            throw std::runtime_error("native materialize failed to parse numeric value");
+        }
+        values.push_back(value);
+    }
+    mysql_free_result(result);
+    return values;
 }
 
 void run_native(const Options& options) {
@@ -216,8 +270,24 @@ void run_native(const Options& options) {
 
     const auto fetch_sql = "WITH RECURSIVE seq(n) AS (SELECT 1 UNION ALL SELECT n + 1 FROM seq WHERE n < " +
         std::to_string(options.fetch_rows) + ") SELECT n FROM seq";
-    const auto fetch_ms = measure_ms([&] { native_query(connection.get(), fetch_sql); });
-    print_result("native_c_api", "fetch_rows", options.fetch_rows, fetch_ms);
+    const auto fetch_ms = measure_ms([&] {
+        for (int repeat = 0; repeat < options.fetch_repeats; ++repeat) {
+            native_query(connection.get(), fetch_sql);
+        }
+    });
+    print_result("native_c_api", "fetch_rows", options.fetch_rows * options.fetch_repeats, fetch_ms);
+
+    const auto materialize_ms = measure_ms([&] {
+        for (int repeat = 0; repeat < options.fetch_repeats; ++repeat) {
+            const auto values = native_query_int64_vector(connection.get(), fetch_sql);
+            int64_t sum = 0;
+            for (const auto value : values) sum += value;
+            if (static_cast<int>(values.size()) != options.fetch_rows || sum <= 0) {
+                throw std::runtime_error("native materialized row count mismatch");
+            }
+        }
+    });
+    print_result("native_c_api", "fetch_rows_materialized", options.fetch_rows * options.fetch_repeats, materialize_ms);
 }
 
 #endif
